@@ -15,3 +15,5 @@ class Target(NamedTuple):
 
     name: str
     base: Optional[str] = None
+    # Custom --header pairs, carried so every request to this server sends them. Never mutated.
+    headers: dict = {}

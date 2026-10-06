@@ -16,6 +16,7 @@ class FakeServer:
     def __init__(self):
         self.routes = {}
         self.requests = []
+        self.header_logs = []
         handler = self._handler()
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.base = f"http://127.0.0.1:{self._server.server_address[1]}"
@@ -37,6 +38,7 @@ class FakeServer:
                 except ValueError:
                     payload = raw.decode()
                 server.requests.append((method, self.path, payload, self.headers.get("Authorization")))
+                server.header_logs.append((method, path, dict(self.headers)))
                 answer = server.routes.get((method, path))
                 if answer is None:
                     status, body = 404, {"error": "not found"}

@@ -131,21 +131,30 @@ def _recorded_studio_bases(tried: list):
     yield from unsloth_bridge.recorded_studio_bases(tried)
 
 
-def find_studio_server(timeout: float = 3.0) -> Optional[str]:
+def find_studio_server(timeout: float = 3.0, headers: Optional[dict] = None) -> Optional[str]:
     import urllib.request
 
+    named = os.environ.get("UNSLOTH_STUDIO_URL")
     base = os.environ.get("UNSLOTH_STUDIO_URL", "http://127.0.0.1:8888").rstrip("/")
     candidates = _loopback_candidate_bases(base)
-    if not os.environ.get("UNSLOTH_STUDIO_URL"):
+    if not named:
         candidates = itertools.chain(candidates, _recorded_studio_bases(candidates))
+    # Custom --header pairs go only to the base the user named; the default port and the
+    # pid-record bases stay credential-free probes.
+    probe_headers = {"User-Agent": _USER_AGENT}
+    probe = urllib.request.urlopen
+    if named and headers:
+        probe_headers.update(headers)
+        # Those pairs can carry a credential, and urllib forwards it verbatim to the next host on a
+        # 3xx (an oauth2-proxy or Cloudflare Access front redirects to its IdP). Same reason the
+        # rest of this module refuses redirects.
+        probe = urlopen_no_redirect
     # Try the concrete loopback addresses in order and return the first that answers, so the rest of
     # the flow talks to that exact address.
     for candidate in candidates:
-        request = urllib.request.Request(
-            f"{candidate}/api/health", headers = {"User-Agent": _USER_AGENT}
-        )
+        request = urllib.request.Request(f"{candidate}/api/health", headers = probe_headers)
         try:
-            with urllib.request.urlopen(request, timeout = timeout) as response:
+            with probe(request, timeout = timeout) as response:
                 # A live port is not Studio: a stranger answering every path would get our key.
                 body = json.loads(response.read(65536).decode() or "{}")
                 if body.get("service") == _STUDIO_SERVICE_MARKER:

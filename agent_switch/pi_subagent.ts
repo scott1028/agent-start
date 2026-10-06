@@ -31,6 +31,8 @@ const approve = config.approve === true;
 const contextWindow = positiveInt(config.contextWindow, 32768);
 const maxTokens = positiveInt(config.maxTokens, Math.min(Math.floor(contextWindow / 4), 8192));
 const samplingParams = (config.samplingParams ?? {}) as Record<string, unknown>;
+const headers = (config.headers ?? {}) as Record<string, string>;
+const hasCustomAuthorization = Object.keys(headers).some((name) => name.toLowerCase() === "authorization");
 let activeAgents = 0;
 const waitingAgents: Array<() => boolean> = [];
 
@@ -284,16 +286,19 @@ async function runLocalAgent(
 }
 
 export default function localSubagent(pi: ExtensionAPI): void {
-	if (!model || !baseUrl || !apiKey || !configPath) {
+	if (!model || !baseUrl || !configPath || !apiKey) {
 		throw new Error("The local subagent configuration is incomplete.");
 	}
 
 	pi.registerProvider(provider, {
 		name: "agent-switch",
 		baseUrl,
+		// pi refuses prompts without an apiKey, so it stays; with a custom Authorization header the
+		// SDK would merge two, so pi's own Bearer (authHeader) is dropped and only the custom one is sent.
 		apiKey,
+		...(hasCustomAuthorization ? {} : { authHeader: true }),
+		...(Object.keys(headers).length > 0 ? { headers } : {}),
 		api: "openai-completions",
-		authHeader: true,
 		models: [
 			{
 				id: model,

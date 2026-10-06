@@ -44,14 +44,14 @@ def root_url(url: str) -> str:
     return base[: -len("/v1")] if base.endswith("/v1") else base
 
 
-def detect(base: str, key: Optional[str] = None) -> Optional[str]:
+def detect(base: str, key: Optional[str] = None, headers: Optional[dict] = None) -> Optional[str]:
     """The provider serving `base`, or None when nothing answers there."""
     try:
-        status, _ = request_json("GET", f"{base}/v1/models", key, timeout = 3)
+        status, _ = request_json("GET", f"{base}/v1/models", key, timeout = 3, headers = headers)
     except OSError:
         return None
     for name in _DETECT_ORDER:
-        if _MODULES[name].fingerprint(base, key):
+        if _MODULES[name].fingerprint(base, key, headers):
             return name
     return "openai" if status in (200, 401, 403) else None
 
@@ -60,23 +60,24 @@ def resolve_target(
     url: Optional[str],
     provider: Optional[str],
     key: Optional[str] = None,
+    headers: Optional[dict] = None,
 ) -> Optional[Target]:
     """The target named by --url/--provider; None when neither was given."""
     if url:
         base = root_url(url)
         if provider:
-            return Target(provider, base)
+            return Target(provider, base, headers or {})
         # With the key: a server behind auth hides the listings that tell providers apart.
-        name = detect(base, key)
+        name = detect(base, key, headers)
         if name is None:
             raise ProviderError(f"Couldn't reach a model server at {url}.")
-        return Target(name, base)
+        return Target(name, base, headers or {})
     if provider == "unsloth":
-        return Target("unsloth")
+        return Target("unsloth", None, headers or {})
     if provider == "openai":
         raise ProviderError("--provider openai has no usual port; pass the server with --url.")
     if provider:
-        return Target(provider, _MODULES[provider].DEFAULT_URL)
+        return Target(provider, _MODULES[provider].DEFAULT_URL, headers or {})
     return None
 
 
@@ -117,8 +118,8 @@ def connect(
 ) -> tuple:
     """(base, key, entry) for a non-Unsloth target; entry is {"id", "context_length"}."""
     module = _MODULES[target.name]
-    base, key = target.base, api_key or None
-    entries = module.models(base, key)
+    base, key, headers = target.base, api_key or None, target.headers
+    entries = module.models(base, key, headers)
     if model:
         match = _find(entries, model, module)
         stale_window = (
@@ -128,8 +129,8 @@ def connect(
             and match.get("context_length") != context_length
         )
         if match is None or not match["loaded"] or stale_window:
-            loaded_id = module.load(base, key, model, context_length if module.SETS_CONTEXT else None)
-            entries = module.models(base, key)
+            loaded_id = module.load(base, key, model, context_length if module.SETS_CONTEXT else None, headers)
+            entries = module.models(base, key, headers)
             match = _find(entries, loaded_id, module)
             if match is None or not match["loaded"]:
                 raise ProviderError(f"{module.LABEL} didn't report {model} as loaded.")
@@ -158,7 +159,7 @@ def connect(
             "Pass the server's real window with --context-length <tokens>."
         )
     for path in needs:
-        if not endpoint_exists(base, path, key):
+        if not endpoint_exists(base, path, key, headers):
             raise ProviderError(f"{module.LABEL} at {base} has no {_NEEDS.get(path, path)}.")
     return base, key or NO_KEY, {"id": match["id"], "context_length": int(window)}
 

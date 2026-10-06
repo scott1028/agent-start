@@ -19,9 +19,9 @@ SUPPORTED_FIELDS = frozenset({"temperature", "top_p", "presence_penalty", "reaso
 _ALIAS_PREFIX = "agent-switch/"
 
 
-def fingerprint(base: str, key: Optional[str] = None) -> bool:
-    version = get_json(base, "/api/version", key, timeout = 3)
-    ps = get_json(base, "/api/ps", key, timeout = 3)
+def fingerprint(base: str, key: Optional[str] = None, headers: Optional[dict] = None) -> bool:
+    version = get_json(base, "/api/version", key, timeout = 3, headers = headers)
+    ps = get_json(base, "/api/ps", key, timeout = 3, headers = headers)
     return isinstance(version, dict) and "version" in version and isinstance(ps, dict)
 
 
@@ -31,9 +31,9 @@ def canonical(model: str) -> str:
     return model if ":" in last else f"{model}:latest"
 
 
-def models(base: str, key: Optional[str]) -> list:
-    listed = require_json(LABEL, base, "/v1/models", key)
-    ps = require_json(LABEL, base, "/api/ps", key)
+def models(base: str, key: Optional[str], headers: Optional[dict] = None) -> list:
+    listed = require_json(LABEL, base, "/v1/models", key, headers)
+    ps = require_json(LABEL, base, "/api/ps", key, headers)
     running = {}
     for item in (ps or {}).get("models") or []:
         for name in {item.get("name"), item.get("model")} - {None}:
@@ -54,7 +54,7 @@ def _not_found(model: str, body) -> ProviderError:
     )
 
 
-def load(base: str, key: Optional[str], model: str, context_length: Optional[int]) -> str:
+def load(base: str, key: Optional[str], model: str, context_length: Optional[int], headers: Optional[dict] = None) -> str:
     name = canonical(model)
     if context_length:
         # The OpenAI API cannot carry num_ctx, so an alias with it baked in keeps the window even
@@ -66,13 +66,14 @@ def load(base: str, key: Optional[str], model: str, context_length: Optional[int
             key,
             {"model": alias, "from": name, "parameters": {"num_ctx": context_length}, "stream": False},
             timeout = 600,
+            headers = headers,
         )
         if status == 404:
             raise _not_found(model, body)
         if status != 200:
             raise ProviderError(f"{LABEL} couldn't set up {model} with {context_length} tokens: {error_detail(body)}")
         name = alias
-    status, body = request_json("POST", f"{base}/api/generate", key, {"model": name}, timeout = 900)
+    status, body = request_json("POST", f"{base}/api/generate", key, {"model": name}, timeout = 900, headers = headers)
     if status == 404:
         raise _not_found(model, body)
     if status != 200:

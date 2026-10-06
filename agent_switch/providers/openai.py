@@ -24,8 +24,8 @@ def _window(model: dict) -> Optional[int]:
     return meta.get("n_ctx") if isinstance(meta, dict) and isinstance(meta.get("n_ctx"), int) else None
 
 
-def models(base: str, key: Optional[str]) -> list:
-    listing = require_json(LABEL, base, "/v1/models", key)
+def models(base: str, key: Optional[str], headers: Optional[dict] = None) -> list:
+    listing = require_json(LABEL, base, "/v1/models", key, headers)
     return [
         {"id": m["id"], "loaded": True, "context_length": _window(m)}
         for m in (listing or {}).get("data") or []
@@ -33,6 +33,6 @@ def models(base: str, key: Optional[str]) -> list:
     ]
 
 
-def load(base: str, key: Optional[str], model: str, context_length: Optional[int]) -> str:
-    served = ", ".join(m["id"] for m in models(base, key)) or "nothing"
+def load(base: str, key: Optional[str], model: str, context_length: Optional[int], headers: Optional[dict] = None) -> str:
+    served = ", ".join(m["id"] for m in models(base, key, headers)) or "nothing"
     raise ProviderError(f"The server at {base} serves {served}; it has no way to load {model}.")

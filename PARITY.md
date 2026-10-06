@@ -95,6 +95,7 @@ How each item was checked:
 - [v] Endpoint check: claude needs `/v1/messages`, codex needs `/v1/responses` (tests, live)
 - [v] Request bodies translated per server; unsupported fields warned and dropped (tests)
 - [v] Unsloth-only flags refused for other servers (tests)
+- [v] `--header NAME=VALUE` (repeatable): custom HTTP headers on agent-switch's own requests and on every agent's requests, including the subagent bridges; an `Authorization` header here replaces the built-in Bearer `<api-key>` (tests; claude token precedence and pi header merge verified live on claude 2.1.291 and pi 1.0.4); an Unsloth Studio target carries them too: an `Authorization` header there stands in for `--api-key` (no Studio key is minted), while Studio's own API-key listing, minting and identity check and the auto-start server's progress polls never carry them, and probing for an unnamed server never sends them (tests)
 - [v] All four agents complete a turn on llama-server; the user's own agent config files are unchanged afterwards (live)
 
 ## Not ported (with reason)

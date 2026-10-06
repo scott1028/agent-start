@@ -17,26 +17,26 @@ SUPPORTED_FIELDS = frozenset({"temperature", "top_p", "top_k", "repetition_penal
 RENAMED_FIELDS = {"repetition_penalty": "repeat_penalty"}
 
 
-def _v1_models(base: str, key: Optional[str]):
-    listing = get_json(base, "/api/v1/models", key, timeout = 3)
+def _v1_models(base: str, key: Optional[str], headers: Optional[dict] = None):
+    listing = get_json(base, "/api/v1/models", key, timeout = 3, headers = headers)
     return listing.get("models") if isinstance(listing, dict) and isinstance(listing.get("models"), list) else None
 
 
-def _v0_models(base: str, key: Optional[str]):
-    listing = get_json(base, "/api/v0/models", key, timeout = 3)
+def _v0_models(base: str, key: Optional[str], headers: Optional[dict] = None):
+    listing = get_json(base, "/api/v0/models", key, timeout = 3, headers = headers)
     data = listing.get("data") if isinstance(listing, dict) else None
     if isinstance(data, list) and all(isinstance(m, dict) and "state" in m for m in data):
         return data
     return None
 
 
-def fingerprint(base: str, key: Optional[str] = None) -> bool:
-    return _v1_models(base, key) is not None or _v0_models(base, key) is not None
+def fingerprint(base: str, key: Optional[str] = None, headers: Optional[dict] = None) -> bool:
+    return _v1_models(base, key, headers) is not None or _v0_models(base, key, headers) is not None
 
 
-def models(base: str, key: Optional[str]) -> list:
-    require_json(LABEL, base, "/v1/models", key)
-    listing = _v1_models(base, key)
+def models(base: str, key: Optional[str], headers: Optional[dict] = None) -> list:
+    require_json(LABEL, base, "/v1/models", key, headers)
+    listing = _v1_models(base, key, headers)
     entries = []
     if listing is not None:
         for model in listing:
@@ -55,7 +55,7 @@ def models(base: str, key: Optional[str]) -> list:
             if not instances:
                 entries.append({"id": model["key"], "loaded": False, "context_length": None})
         return entries
-    for model in _v0_models(base, key) or []:
+    for model in _v0_models(base, key, headers) or []:
         if model.get("type", "llm") not in ("llm", "vlm") or not model.get("id"):
             continue
         loaded = model.get("state") == "loaded"
@@ -69,8 +69,8 @@ def models(base: str, key: Optional[str]) -> list:
     return entries
 
 
-def load(base: str, key: Optional[str], model: str, context_length: Optional[int]) -> str:
-    if _v1_models(base, key) is None:
+def load(base: str, key: Optional[str], model: str, context_length: Optional[int], headers: Optional[dict] = None) -> str:
+    if _v1_models(base, key, headers) is None:
         raise ProviderError(
             f"This {LABEL} has no load API. Load {model} with `lms load {model}`"
             + (f" --context-length {context_length}" if context_length else "")
@@ -79,7 +79,7 @@ def load(base: str, key: Optional[str], model: str, context_length: Optional[int
     payload = {"model": model}
     if context_length:
         payload["context_length"] = context_length
-    status, body = request_json("POST", f"{base}/api/v1/models/load", key, payload, timeout = 900)
+    status, body = request_json("POST", f"{base}/api/v1/models/load", key, payload, timeout = 900, headers = headers)
     if status != 200:
         raise ProviderError(f"{LABEL} couldn't load {model}: {error_detail(body)}")
     instance = body.get("instance_id") if isinstance(body, dict) else None

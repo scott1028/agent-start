@@ -11,6 +11,6 @@ from agent_switch.providers.utils import get_json
 LABEL = "Unsloth"
 
 
-def fingerprint(base: str, key: Optional[str] = None) -> bool:
-    health = get_json(base, "/api/health", timeout = 3)
+def fingerprint(base: str, key: Optional[str] = None, headers: Optional[dict] = None) -> bool:
+    health = get_json(base, "/api/health", timeout = 3, headers = headers)
     return isinstance(health, dict) and health.get("service") == _STUDIO_SERVICE_MARKER

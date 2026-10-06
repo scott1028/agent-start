@@ -16,16 +16,16 @@ SUPPORTED_FIELDS = None
 TEMPLATE_KWARGS = True
 
 
-def fingerprint(base: str, key: Optional[str] = None) -> bool:
-    listing = get_json(base, "/v1/models", key, timeout = 3)
+def fingerprint(base: str, key: Optional[str] = None, headers: Optional[dict] = None) -> bool:
+    listing = get_json(base, "/v1/models", key, timeout = 3, headers = headers)
     data = listing.get("data") if isinstance(listing, dict) else None
     return isinstance(data, list) and any(
         isinstance(m, dict) and ("max_model_len" in m or m.get("owned_by") == "vllm") for m in data
     )
 
 
-def models(base: str, key: Optional[str]) -> list:
-    listing = require_json(LABEL, base, "/v1/models", key)
+def models(base: str, key: Optional[str], headers: Optional[dict] = None) -> list:
+    listing = require_json(LABEL, base, "/v1/models", key, headers)
     return [
         {"id": m["id"], "loaded": True, "context_length": m.get("max_model_len")}
         for m in (listing or {}).get("data") or []
@@ -33,6 +33,6 @@ def models(base: str, key: Optional[str]) -> list:
     ]
 
 
-def load(base: str, key: Optional[str], model: str, context_length: Optional[int]) -> str:
-    served = ", ".join(m["id"] for m in models(base, key)) or "nothing"
+def load(base: str, key: Optional[str], model: str, context_length: Optional[int], headers: Optional[dict] = None) -> str:
+    served = ", ".join(m["id"] for m in models(base, key, headers)) or "nothing"
     raise ProviderError(f"{LABEL} at {base} serves {served} and can't load {model}; restart it with that model.")

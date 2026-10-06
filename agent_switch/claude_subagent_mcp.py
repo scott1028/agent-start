@@ -141,8 +141,9 @@ def run_local_agent(
     key = _required_env("AGENT_SWITCH_CLAUDE_SUBAGENT_API_KEY")
     model = _required_env("AGENT_SWITCH_CLAUDE_SUBAGENT_MODEL")
     window = int(os.environ.get("AGENT_SWITCH_CLAUDE_SUBAGENT_CONTEXT_WINDOW", "0") or 0)
+    headers = json.loads(os.environ.get("AGENT_SWITCH_CLAUDE_SUBAGENT_HEADERS") or "{}")
     entry = {"id": model, "context_length": window}
-    local_env = _claude_local_env(base, key, entry)
+    local_env = _claude_local_env(base, key, entry, headers = headers)
     child_env = dict(os.environ)
     settings = os.environ.get(_CLAUDE_SUBAGENT_SETTINGS_ENV)
     settings = _agent_config_path(Path(settings), ["claude"]) if settings else None
@@ -184,6 +185,7 @@ def run_local_agent(
         _SUBAGENT_PLAN_INSTRUCTIONS if read_only else _SUBAGENT_INSTRUCTIONS,
         f"Task: {task}",
     ]
+    # A custom Authorization only wins if no token, inherited or ours, can outrank it; local_env pins the token empty.
     bridged, wsl_names = _wsl_shim_env(command, local_env, _CLAUDE_ENV_UNSET)
     if wsl_names:
         from agent_switch.start import _merge_wslenv

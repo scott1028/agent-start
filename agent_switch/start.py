@@ -43,6 +43,7 @@ from agent_switch import providers
 from agent_switch.providers import unsloth_bridge
 from agent_switch.providers.types import ProviderError, Target
 from agent_switch.providers.unsloth_bridge import _studio_token, verify_studio_identity
+from agent_switch.providers.utils import get_has_custom_authorization
 
 start_app = typer.Typer(
     help = "Start a coding agent against a local model server: Unsloth, Ollama, LM Studio, "
@@ -329,6 +330,14 @@ _KEY_OPTION = typer.Option(
     "remembered per server. Otherwise pass one with --api-key (or AGENT_SWITCH_API_KEY, "
     "UNSLOTH_API_KEY); it is remembered for next time.",
 )
+_HEADER_OPTION = typer.Option(
+    None,
+    "--header",
+    metavar = "NAME=VALUE",
+    rich_help_panel = _PANEL_SESSION,
+    help = "Add an HTTP header to every request sent to the model server; repeat the flag "
+    "for more. An Authorization header here replaces the built-in Bearer <api-key>.",
+)
 _LAUNCH_OPTION = typer.Option(
     True,
     "--launch/--no-launch",
@@ -367,6 +376,27 @@ _AS_SUBAGENT_OPTION = typer.Option(
     rich_help_panel = _PANEL_SESSION,
     help = "Keep the coding agent's current model and add Unsloth as a local subagent.",
 )
+
+_HEADER_NAME_TOKEN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")  # RFC 7230 tchar
+_HEADER_VALUE_TEXT = re.compile(r"[\t\x20-\x7e]*")  # RFC 7230 field VCHAR + SP + HTAB
+
+
+def parse_headers(values: Optional[list]) -> dict:
+    """Validate and merge repeated --header NAME=VALUE pairs; a later name wins, case-insensitively."""
+    headers = {}
+    for value in values or []:
+        name, separator, header_value = value.partition("=")
+        if not separator:
+            _fail(f"--header needs NAME=VALUE, got {value!r}.")
+        if not _HEADER_NAME_TOKEN.fullmatch(name):
+            _fail(f"--header name {name!r} has characters an HTTP header name cannot carry.")
+        if "\r" in header_value or "\n" in header_value:
+            _fail(f"--header value for {name!r} cannot carry a line break.")
+        if not _HEADER_VALUE_TEXT.fullmatch(header_value):
+            _fail(f"--header value for {name!r} has characters an HTTP header value cannot carry.")
+        headers = {k: v for k, v in headers.items() if k.lower() != name.lower()}
+        headers[name] = header_value
+    return headers
 
 # Per-agent CLI flag for "run tools without prompting". OpenCode (native --auto is command-scoped, handled below) is absent from this prefix map.
 _YOLO_COMMAND_FLAGS = {
@@ -743,7 +773,10 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> str:
 def _fail_request(exc: Exception, error: str) -> NoReturn:
     """Fail with `error` plus whatever the server or the transport gave as a reason."""
     if isinstance(exc, urllib.error.HTTPError):
-        _fail(f"{error}: {_http_error_detail(exc)}")
+        hint = ""
+        if getattr(exc, "custom_authorization", False):
+            hint = " (the Authorization header passed with --header was rejected)"
+        _fail(f"{error}: {_http_error_detail(exc)}{hint}")
     _fail(f"{error}: {getattr(exc, 'reason', None) or exc}")
 
 
@@ -754,16 +787,29 @@ def _http_json(
     payload = None,
     timeout = 30,
     error = None,
+    *,
+    internal_auth: bool = False,
 ):
-    """On a failed request: raise if `error` is None, else fail with `error` plus the reason."""
+    """On a failed request: raise if `error` is None, else fail with `error` plus the reason.
+
+    `internal_auth` marks a request that authenticates with an agent-switch credential: Studio's
+    owner JWT for its API-key calls, or the start key of a server this command launched. The user's
+    custom --header pairs belong to the model API and must not replace those.
+    """
+    custom = {} if internal_auth else _active_target.headers
+    request_headers = {"Content-Type": "application/json", "User-Agent": _USER_AGENT}
+    # A custom Authorization header replaces the Bearer <token> auth; sending both would duplicate it.
+    if not get_has_custom_authorization(custom):
+        request_headers["Authorization"] = f"Bearer {token}"
+    request_headers.update(custom)
+    if payload is not None:
+        # A JSON body keeps its Content-Type whatever --header carries, in any case spelling.
+        request_headers = {n: v for n, v in request_headers.items() if n.lower() != "content-type"}
+        request_headers["Content-Type"] = "application/json"
     request = urllib.request.Request(
         url,
         data = None if payload is None else json.dumps(payload).encode(),
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "User-Agent": _USER_AGENT,
-        },
+        headers = request_headers,
         method = method,
     )
     try:
@@ -773,6 +819,13 @@ def _http_json(
         # A padded /load or /unload commits its 200 early, so a late failure arrives in-band; raise it as the HTTPError handled below.
         return raise_for_deferred_error(url, body)
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
+        # Mark an auth rejection of a custom Authorization so every handler below names --header.
+        if (
+            isinstance(exc, urllib.error.HTTPError)
+            and exc.code in (401, 403)
+            and get_has_custom_authorization(custom)
+        ):
+            exc.custom_authorization = True
         if error is None:
             raise
         _fail_request(exc, error)
@@ -922,9 +975,19 @@ def _normalized_variant(value: object) -> str:
 class _ModelDownloadProgress:
     """Best-effort polling of the model download endpoints."""
 
-    def __init__(self, base: str, key: str, model: str, variant: Optional[str]) -> None:
+    def __init__(
+        self,
+        base: str,
+        key: str,
+        model: str,
+        variant: Optional[str],
+        internal_auth: bool = False,
+    ) -> None:
         self._base = base
         self._key = key
+        # A server this command launched reports progress against its start key, which the user's
+        # custom --header pairs must not replace.
+        self._internal_auth = internal_auth
         self._model = model
         self._variant = variant or ""
         self._expected_bytes = 0
@@ -962,6 +1025,7 @@ class _ModelDownloadProgress:
                         f"{self._base}/api/hub/gguf-variants?{params}",
                         self._key,
                         timeout = 10,
+                        internal_auth = self._internal_auth,
                     )
                 except urllib.error.HTTPError as exc:
                     if exc.code != 404:
@@ -972,6 +1036,7 @@ class _ModelDownloadProgress:
                         f"{self._base}/api/models/gguf-variants?{params}",
                         self._key,
                         timeout = 10,
+                        internal_auth = self._internal_auth,
                     )
                 self._variant = self._variant or str(info.get("default_variant") or "")
                 wanted = _normalized_variant(self._variant)
@@ -994,7 +1059,9 @@ class _ModelDownloadProgress:
         self._listed_at = now
         try:
             url = f"{self._base}{self._progress_prefix}/active-downloads"
-            listing = _http_json("GET", url, self._key, timeout = 10)
+            listing = _http_json(
+                "GET", url, self._key, timeout = 10, internal_auth = self._internal_auth
+            )
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 self._listed_at = float("inf")  # Older server: no load-owned jobs to find.
@@ -1022,7 +1089,7 @@ class _ModelDownloadProgress:
         else:
             params = urlencode({"repo_id": repo})
             url = f"{self._base}{self._progress_prefix}/download-progress?{params}"
-        return _http_json("GET", url, self._key, timeout = 10)
+        return _http_json("GET", url, self._key, timeout = 10, internal_auth = self._internal_auth)
 
     def poll(self) -> None:
         if not self._configured:
@@ -1331,6 +1398,7 @@ def _start_studio_server(
                         marker.group(1),
                         model,
                         load.gguf_variant,
+                        internal_auth = True,
                     )
             if progress is not None:
                 progress.poll()
@@ -1400,7 +1468,10 @@ def _require_studio(
         )
         if _value is not None
     ]
-    base = find_studio_server()
+    # Only the health probe is restricted: find_studio_server() sends the pairs to a base the user
+    # named and stays credential-free on the default port and the pid-record bases. The Studio it
+    # finds then carries them on every request, like an explicit --api-key does.
+    base = find_studio_server(headers = _active_target.headers)
     if base is not None:
         if _pinned:
             typer.echo(
@@ -1649,6 +1720,11 @@ def _agent_api_key(
     *,
     auto_started: bool = False,
 ) -> str:
+    # A custom Authorization from --header is the credential every request to this server actually
+    # sends, so no Studio key is needed here: replaying or minting below would validate a credential
+    # that is never used. Every agent lets that Authorization win over this placeholder key.
+    if get_has_custom_authorization(_active_target.headers):
+        return providers.NO_KEY
     cache = _key_cache_path()
     if explicit:
         if not auto_started or _key_accepted(base, explicit):
@@ -1690,7 +1766,11 @@ def _agent_api_key(
     owned = {
         entry.get("key_prefix")
         for entry in _http_json(
-            "GET", f"{base}/api/auth/api-keys", token, error = "Couldn't list API keys"
+            "GET",
+            f"{base}/api/auth/api-keys",
+            token,
+            error = "Couldn't list API keys",
+            internal_auth = True,
         ).get("api_keys", [])
     }
     for key in _cached_keys(cache, base, "minted"):
@@ -1704,6 +1784,7 @@ def _agent_api_key(
         token,
         {"name": "Coding agents (unsloth start)"},
         error = "Couldn't create an API key",
+        internal_auth = True,
     )["key"]
     _remember_key(cache, base, key, "minted")
     return key
@@ -2537,6 +2618,7 @@ def _preflight_agent_gguf(
     *,
     serve: bool = True,
     launch: bool = True,
+    target: Target = Target("unsloth"),
 ) -> None:
     # Hub-listing preflight for the auto-start path only: with a server running, identifiers
     # resolve against its cwd/cache/token, so _attach_gguf_check asks the server instead.
@@ -2545,10 +2627,15 @@ def _preflight_agent_gguf(
     # possible its "no running server" error comes first, without a hub probe.
     if not (serve and launch and model):
         return
+    # _require_studio only sees a --url/--provider target after _connect exports it, so the base
+    # below would be some other server's. Defer those targets to the post-connect check, which
+    # also asks the server with the custom pairs rather than probing it without them.
+    if target.base:
+        return
     expected = os.environ.get("UNSLOTH_STUDIO_URL", "http://127.0.0.1:8888").rstrip("/")
     if not is_loopback_url(expected) or urlparse(expected).scheme != "http":
         return
-    if find_studio_server() is not None:
+    if find_studio_server(headers = target.headers) is not None:
         return
     repo, _ = _split_repo_variant(model)
     # A bare foo.gguf naming no local file is a shorthand, not a path: the load
@@ -2905,12 +2992,16 @@ def _claude_local_env(
     key: str,
     entry: dict,
     extra_body: Optional[dict] = None,
+    headers: Optional[dict] = None,
 ) -> dict:
     """Build the local endpoint, cache, display, and compaction environment."""
     model_id = entry["id"]
-    env = {
-        "ANTHROPIC_BASE_URL": base,
-        "ANTHROPIC_AUTH_TOKEN": key,
+    env = {"ANTHROPIC_BASE_URL": base}
+    # claude outranks ANTHROPIC_CUSTOM_HEADERS with ANTHROPIC_AUTH_TOKEN for Authorization (verified on 2.1.291),
+    # so a custom Authorization only wins when the token is pinned empty; the settings overlay applies it
+    # after the process env and user settings, which is where an inherited or user-set token would come back.
+    env["ANTHROPIC_AUTH_TOKEN"] = "" if get_has_custom_authorization(headers or {}) else key
+    env.update({
         "ANTHROPIC_MODEL": model_id,
         "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
         # Per-tool countdown reminders change the system prefix on local models.
@@ -2918,7 +3009,9 @@ def _claude_local_env(
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
         "CLAUDE_CODE_NO_FLICKER": "1",
-    }
+    })
+    if headers:
+        env["ANTHROPIC_CUSTOM_HEADERS"] = "\n".join(f"{name}: {value}" for name, value in headers.items())
     window = entry.get("context_length") or entry.get("max_context_length")
     if window:
         # claude assumes 200k for a model id it does not recognize, and clamps AUTO_COMPACT_WINDOW to [100k, that]. MAX_CONTEXT_TOKENS sets the window itself.
@@ -2930,22 +3023,30 @@ def _claude_local_env(
     return env
 
 
-def _codex_provider_table(base: str) -> str:
-    return (
+def _codex_provider_table(base: str, headers: Optional[dict] = None) -> str:
+    table = (
         f"{_PROVIDER_HEADER}\n"
         'name = "agent-switch"\n'
         f"base_url = {json.dumps(base + '/v1')}\n"
-        f'env_key = "{_CODEX_ENV_KEY}"\n'
+    )
+    # A custom Authorization header replaces the Bearer <env_key> auth; keeping both would send two.
+    if not get_has_custom_authorization(headers or {}):
+        table += f'env_key = "{_CODEX_ENV_KEY}"\n'
+    table += (
         'wire_api = "responses"\n'
         "requires_openai_auth = false\n"
         f"stream_idle_timeout_ms = {_CODEX_STREAM_IDLE_TIMEOUT_MS}\n"
     )
+    if headers:
+        pairs = ", ".join(f"{json.dumps(name)} = {json.dumps(value)}" for name, value in headers.items())
+        table += f"http_headers = {{ {pairs} }}\n"
+    return table
 
 
 _CODEX_PROVIDER_TABLES = (_PROVIDER_HEADER, _PROVIDER_HEADER[:-1] + ".")
 
 
-def _merge_codex_config(existing: str, base: str) -> str:
+def _merge_codex_config(existing: str, base: str, headers: Optional[dict] = None) -> str:
     chunks = re.split(r"(?m)^(?=\[)", existing)  # preamble, then one chunk per table
     if not re.search(r"(?m)^\s*oss_provider\s*=", chunks[0]):
         if chunks[0] and not chunks[0].endswith("\n"):
@@ -2956,7 +3057,7 @@ def _merge_codex_config(existing: str, base: str) -> str:
         text += "\n"
     if not text.endswith("\n\n"):
         text += "\n"
-    return text + _codex_provider_table(base)
+    return text + _codex_provider_table(base, headers)
 
 
 # Keep custom-model behavior aligned with Codex's own unknown-model fallback. This Apache-2.0 prompt is copied from openai/codex rust-v0.144.0 models-manager/prompt.md.
@@ -3048,14 +3149,17 @@ def write_codex_config(
     model: dict,
     home: Path,
     reasoning_effort: Optional[str] = None,
+    headers: Optional[dict] = None,
 ) -> None:
     home.mkdir(parents = True, exist_ok = True)
 
     config = home / "config.toml"
     existing = config.read_text(encoding = "utf-8") if config.exists() else ""
-    merged = _merge_codex_config(existing, base)
+    merged = _merge_codex_config(existing, base, headers)
     if merged != existing:
         config.write_text(merged, encoding = "utf-8")
+        # http_headers can carry a secret Authorization, so keep the file owner-only like the JSON configs.
+        config.chmod(0o600)
         typer.echo(f"Updated {config}")
 
     # oss_provider here too: codex --oss picks the provider from it, and the profile layer must beat a user-set value ("ollama") in config.toml.
@@ -3097,10 +3201,11 @@ def write_codex_subagent_bridge(
     *,
     yolo: bool,
     reasoning_effort: Optional[str] = None,
+    headers: Optional[dict] = None,
 ) -> Path:
     """Write private config for an explicit local Codex child launched through MCP."""
     child_home = home / "child"
-    write_codex_config(base, model, child_home, reasoning_effort)
+    write_codex_config(base, model, child_home, reasoning_effort, headers)
     path = home / "subagent.json"
     _write_private_json(
         path,
@@ -3463,7 +3568,8 @@ def write_claude_subagent_plugin(path: Path, server_env: dict) -> Path:
                 server_env.get("AGENT_SWITCH_CLAUDE_SUBAGENT_CONTEXT_WINDOW", "0") or 0
             ),
         }
-        local_env = _claude_local_env(base, key, entry)
+        headers = json.loads(server_env.get("AGENT_SWITCH_CLAUDE_SUBAGENT_HEADERS") or "{}")
+        local_env = _claude_local_env(base, key, entry, headers = headers)
         if "CLAUDE_CODE_EXTRA_BODY" in server_env:
             local_env["CLAUDE_CODE_EXTRA_BODY"] = server_env["CLAUDE_CODE_EXTRA_BODY"]
         settings = _write_claude_settings(plugin, model_id, local_env)
@@ -4215,23 +4321,30 @@ def _resolve_target(
     url: Optional[str],
     provider: Optional[str],
     api_key: Optional[str] = None,
+    headers: Optional[dict] = None,
 ) -> Target:
     """The server to use: --url/--provider, else a running Unsloth, else the one other local server."""
     global _active_target
     if url and not api_key:
         api_key = next(iter(_cached_keys(_provider_key_cache_path(), providers.root_url(url), "saved")), None)
     try:
-        target = providers.resolve_target(url, provider, api_key)
+        target = providers.resolve_target(url, provider, api_key, headers)
     except ProviderError as exc:
         _fail(str(exc))
     if target is None:
-        # Unsloth first, as `unsloth start` would; with none running, the usual local ports.
-        found = [] if find_studio_server() is not None else providers.scan_local_servers()
+        # Unsloth first, as `unsloth start` would; with none running, the usual local ports. A named
+        # UNSLOTH_STUDIO_URL plus --header stays on Unsloth even when it did not answer: scanning the
+        # local ports instead would hand those pairs to another server, and _require_studio reports
+        # the named base.
+        named = headers and os.environ.get("UNSLOTH_STUDIO_URL")
+        found = [] if named or find_studio_server() is not None else providers.scan_local_servers()
         if len(found) > 1:
             listed = "\n".join(f"  {providers.label(t.name)} at {t.base}" for t in found)
             _fail(f"Found several model servers:\n{listed}\nPick one with --url (or --provider).")
         # No server at all stays on Unsloth, which can auto-start one for --model.
         target = found[0] if found else _UNSLOTH
+        if headers:
+            target = target._replace(headers = headers)
     _active_target = target
     return target
 
@@ -4617,6 +4730,7 @@ def _opencode_provider(
     model: dict,
     max_tokens: Optional[int] = None,
     request_body: Optional[dict] = None,
+    headers: Optional[dict] = None,
 ) -> dict:
     model_entry = {"name": model["id"]}
     window = model.get("context_length") or model.get("max_context_length")
@@ -4625,7 +4739,12 @@ def _opencode_provider(
         output = opencode_output_limit(window, max_tokens)
         # Without a limit OpenCode assumes context 0 and never compacts. Without input it compacts at context - output and ignores compaction.reserved.
         model_entry["limit"] = {"context": window, "input": window, "output": output}
-    provider_options = {"baseURL": f"{base}/v1", "apiKey": key}
+    provider_options = {"baseURL": f"{base}/v1"}
+    # A custom Authorization header replaces the SDK's Bearer <apiKey>; keeping both would send two.
+    if not get_has_custom_authorization(headers or {}):
+        provider_options["apiKey"] = key
+    if headers:
+        provider_options["headers"] = dict(headers)
     if request_body:
         # OpenCode 1.x sends model options, reading the effort only as reasoningEffort; 2.x sends only the provider body.
         model_entry["options"] = {
@@ -4652,6 +4771,7 @@ def write_opencode_config(
     as_subagent: bool = False,
     max_tokens: Optional[int] = None,
     request_body: Optional[dict] = None,
+    headers: Optional[dict] = None,
 ) -> dict:
     config = _read_json_object(path)
     if config is None:
@@ -4670,7 +4790,7 @@ def write_opencode_config(
         reserved = opencode_compaction_reserved(window, opencode_output_limit(window, max_tokens))
     # Keep the provider definition in this private session file. The launch path adjusts effective provider filters in the higher-priority inline overlay.
     _subdict(config, "provider")[_OPENCODE_PROVIDER] = _opencode_provider(
-        base, key, model, max_tokens, request_body
+        base, key, model, max_tokens, request_body, headers
     )
     # Normal mode pins this as the session model. Subagent mode leaves the user's main/small models alone and exposes the local model to @unsloth and /models.
     opencode_model = f"{_OPENCODE_PROVIDER}/{model['id']}"
@@ -4728,6 +4848,16 @@ def write_opencode_config(
     return session_permission
 
 
+def _pi_header_values(headers: dict) -> dict:
+    """Pi resolves $NAME and !command in header values; doubling $ keeps literal values intact,
+    and a leading ! is prefixed with $ so pi's $! escape makes it literal instead of a shell command."""
+    escaped = {}
+    for name, value in headers.items():
+        value = value.replace("$", "$$")
+        escaped[name] = f"${value}" if value.startswith("!") else value
+    return escaped
+
+
 def write_pi_config(
     base: str,
     key: str,
@@ -4736,6 +4866,7 @@ def write_pi_config(
     *,
     max_tokens: Optional[int] = None,
     request_body: Optional[dict] = None,
+    headers: Optional[dict] = None,
 ) -> None:
     config = _read_json_object(path)
     if config is None:
@@ -4758,12 +4889,16 @@ def write_pi_config(
         provider_model["maxTokens"] = max_tokens
     if request_body:
         provider_model["samplingParams"] = request_body
-    _subdict(config, "providers")[_PI_PROVIDER] = {
+    provider_entry = {
         "api": "openai-completions",
         "baseUrl": f"{base}/v1",
+        # pi refuses the prompt without an apiKey ("No API key found for ..."); its OpenAI SDK merges
+        # the custom Authorization over the Bearer later (case-insensitively), so one header wins.
         "apiKey": key,
+        **({"headers": _pi_header_values(headers)} if headers else {}),
         "models": [provider_model],
     }
+    _subdict(config, "providers")[_PI_PROVIDER] = provider_entry
     if json.dumps(config, sort_keys = True) != before:
         _write_private_json(path, config)
         typer.echo(f"Updated {path}")
@@ -5029,6 +5164,7 @@ def write_pi_subagent_config(
     approve: bool = False,
     max_tokens: Optional[int] = None,
     request_body: Optional[dict] = None,
+    headers: Optional[dict] = None,
 ) -> None:
     """Write private bootstrap data for the bundled Pi extension."""
     window = model.get("context_length") or model.get("max_context_length")
@@ -5042,6 +5178,7 @@ def write_pi_subagent_config(
             "contextWindow": window,
             "maxTokens": _agent_output_limit(window, max_tokens),
             "approve": approve,
+            **({"headers": _pi_header_values(headers)} if headers else {}),
             **({"samplingParams": request_body} if request_body else {}),
         },
     )
@@ -5052,6 +5189,7 @@ def claude(
     ctx: typer.Context,
     model: Optional[str] = _MODEL_OPTION,
     api_key: Optional[str] = _KEY_OPTION,
+    header: Optional[list[str]] = _HEADER_OPTION,
     launch: bool = _LAUNCH_OPTION,
     gguf_variant: Optional[str] = _GGUF_VARIANT_OPTION,
     max_seq_length: int = _CONTEXT_OPTION,
@@ -5079,7 +5217,8 @@ def claude(
     """Point Claude Code at a local model server and start it."""
     # Route a leading `org/name` positional to --model; forward the rest to the agent.
     model, ctx.args[:] = _consume_positional_model(model, ctx.args)
-    target = _resolve_target(url, provider, api_key)
+    headers = parse_headers(header)
+    target = _resolve_target(url, provider, api_key, headers)
     install_hint = (
         "irm https://claude.ai/install.ps1 | iex"
         if os.name == "nt"
@@ -5087,7 +5226,7 @@ def claude(
     )
     # Before the install prompt: _install_agent runs a remote installer, and this can refuse outright, so asking first fetches a tool the run cannot use.
     if target.name == "unsloth":
-        _preflight_agent_gguf(_CLAUDE_GGUF_AGENT, model, serve = serve, launch = launch)
+        _preflight_agent_gguf(_CLAUDE_GGUF_AGENT, model, serve = serve, launch = launch, target = target)
     _require_agent_for_launch("claude", install_hint, launch)
     server_options = ServerOptions(
         enable_tools = enable_tools,
@@ -5141,6 +5280,8 @@ def claude(
         }
         if window:
             server_env["AGENT_SWITCH_CLAUDE_SUBAGENT_CONTEXT_WINDOW"] = str(int(window))
+        if headers:
+            server_env["AGENT_SWITCH_CLAUDE_SUBAGENT_HEADERS"] = json.dumps(headers)
         if server_options.request_body():
             server_env["CLAUDE_CODE_EXTRA_BODY"] = json.dumps(server_options.request_body())
         with _session_config("claude-subagent", launch, persist = persist) as config:
@@ -5167,7 +5308,7 @@ def claude(
             )
         return
 
-    env = _claude_local_env(base, key, entry, server_options.request_body())
+    env = _claude_local_env(base, key, entry, server_options.request_body(), headers)
     # Claude Code auto-compacts against its native context window; the local env above supplies the loaded model's real window and a 90% threshold instead. --yolo (or its aliases) maps to Claude's own --dangerously-skip-permissions. IS_SANDBOX is left unset on purpose: Claude refuses bypass mode as root unless a sandbox is detected, and we do not want to falsely claim one on the user's host. claude keeps its history in ~/.claude/projects, which --settings/env never relocate, so a session already survives exit; resume it with `claude --continue` or `--resume <id>` passed through.
     with _session_config("claude", launch, persist = persist) as config:
         settings = _write_claude_settings(config, model_id, env)
@@ -5193,6 +5334,7 @@ def codex(
     ctx: typer.Context,
     model: Optional[str] = _MODEL_OPTION,
     api_key: Optional[str] = _KEY_OPTION,
+    header: Optional[list[str]] = _HEADER_OPTION,
     launch: bool = _LAUNCH_OPTION,
     gguf_variant: Optional[str] = _GGUF_VARIANT_OPTION,
     max_seq_length: int = _CONTEXT_OPTION,
@@ -5220,11 +5362,12 @@ def codex(
     """Point OpenAI Codex at a local model server and start it."""
     # Route a leading `org/name` positional to --model; forward the rest to the agent.
     model, ctx.args[:] = _consume_positional_model(model, ctx.args)
-    target = _resolve_target(url, provider, api_key)
+    headers = parse_headers(header)
+    target = _resolve_target(url, provider, api_key, headers)
     install_hint = _npm_install_hint("@openai/codex")
     # Before the install prompt: _install_agent runs a remote installer, and this can refuse outright, so asking first fetches a tool the run cannot use.
     if target.name == "unsloth":
-        _preflight_agent_gguf(_CODEX_GGUF_AGENT, model, serve = serve, launch = launch)
+        _preflight_agent_gguf(_CODEX_GGUF_AGENT, model, serve = serve, launch = launch, target = target)
     _require_agent_for_launch("codex", install_hint, launch)
     codex_effort = _codex_reasoning_effort(reasoning, reasoning_effort)
     if codex_effort and not _agent_version_at_least("codex", _CODEX_REASONING_REQUEST_MIN_VERSION):
@@ -5279,6 +5422,7 @@ def codex(
                 home,
                 yolo = yolo,
                 reasoning_effort = codex_effort,
+                headers = headers,
             )
             parent_home = write_codex_parent_overlay(home / "parent")
             command = [
@@ -5308,7 +5452,7 @@ def codex(
         *ctx.args,
     ]
     with _session_config("codex", launch, persist = persist) as home:
-        write_codex_config(base, entry, home, codex_effort)
+        write_codex_config(base, entry, home, codex_effort, headers)
         env = {_CODEX_ENV_KEY: key, "CODEX_HOME": str(home)}
         _run(
             base,
@@ -5326,6 +5470,7 @@ def opencode(
     ctx: typer.Context,
     model: Optional[str] = _MODEL_OPTION,
     api_key: Optional[str] = _KEY_OPTION,
+    header: Optional[list[str]] = _HEADER_OPTION,
     launch: bool = _LAUNCH_OPTION,
     gguf_variant: Optional[str] = _GGUF_VARIANT_OPTION,
     max_seq_length: int = _CONTEXT_OPTION,
@@ -5354,7 +5499,8 @@ def opencode(
     """Point OpenCode at a local model server and start it."""
     # Route a leading `org/name` positional to --model; forward the rest to the agent.
     model, ctx.args[:] = _consume_positional_model(model, ctx.args)
-    target = _resolve_target(url, provider, api_key)
+    headers = parse_headers(header)
+    target = _resolve_target(url, provider, api_key, headers)
     command_name, opencode_v2 = _opencode_command()
     install_hint = _npm_install_hint("@opencode-ai/cli@beta" if opencode_v2 else "opencode-ai")
     _require_agent_for_launch(command_name, install_hint, launch)
@@ -5418,6 +5564,7 @@ def opencode(
                 as_subagent = True,
                 max_tokens = max_tokens,
                 request_body = server_options.request_body(),
+                headers = headers,
             )
             env = {
                 "OPENCODE_CONFIG": str(config_path),
@@ -5485,6 +5632,7 @@ def opencode(
             yolo = yolo and not native_auto,
             max_tokens = max_tokens,
             request_body = server_options.request_body(),
+            headers = headers,
         )
         # A project's own opencode.json outranks OPENCODE_CONFIG, so the session model pin would silently lose to a repo config; carry it in OPENCODE_CONFIG_CONTENT, which outranks project config, while the API key stays in the private file. Only the config fallback carries a permission: native --auto omits it (auto-approve asks, keep explicit denies) and a non-yolo session omits it too, honoring project rules. V1 filters are ordinary overlays, so scope that session to our provider; V2 turns filters into security policies where global/project rules intentionally win, so keep those policies intact and tell the user above that they must allow our provider. small_model is opencode's separate model for lightweight tasks; pin it to the session model too, or a user/project small_model on another (now filtered) provider would resolve a not-found error mid-session.
         inline_config: dict = {
@@ -5509,6 +5657,7 @@ def pi(
     ctx: typer.Context,
     model: Optional[str] = _MODEL_OPTION,
     api_key: Optional[str] = _KEY_OPTION,
+    header: Optional[list[str]] = _HEADER_OPTION,
     launch: bool = _LAUNCH_OPTION,
     gguf_variant: Optional[str] = _GGUF_VARIANT_OPTION,
     max_seq_length: int = _CONTEXT_OPTION,
@@ -5537,7 +5686,8 @@ def pi(
     """Point Pi (coding agent) at a local model server and start it."""
     # Route a leading `org/name` positional to --model; forward the rest to the agent.
     model, ctx.args[:] = _consume_positional_model(model, ctx.args)
-    target = _resolve_target(url, provider, api_key)
+    headers = parse_headers(header)
+    target = _resolve_target(url, provider, api_key, headers)
     install_hint = _npm_install_hint(
         "@earendil-works/pi-coding-agent",
         ignore_scripts = True,
@@ -5593,6 +5743,7 @@ def pi(
                 approve = yolo,
                 max_tokens = max_tokens,
                 request_body = server_options.request_body(),
+                headers = headers,
             )
             command = [
                 "pi",
@@ -5636,6 +5787,7 @@ def pi(
             pi_agent_dir / "models.json",
             max_tokens = max_tokens,
             request_body = server_options.request_body(),
+            headers = headers,
         )
         write_pi_user_resources(pi_agent_dir, home)
         env = {"HOME": str(home), "PI_CODING_AGENT_DIR": str(pi_agent_dir)}

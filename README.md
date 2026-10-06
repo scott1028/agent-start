@@ -63,6 +63,17 @@ agent-switch pi --url http://127.0.0.1:8000/v1 --no-launch   # print the env and
 agent-switch claude --as-subagent                    # keep Claude's cloud model, add a local subagent
 ```
 
+`--header NAME=VALUE` (repeat the flag) adds an HTTP header to every request sent to the
+model server, e.g. for a gateway that needs its own auth:
+`agent-switch codex --url https://gateway.example/v1 --header "Authorization=...gateway token..."`.
+An `Authorization` header there replaces the built-in `Bearer <api-key>`.
+It applies to every server, Unsloth Studio included: there an `Authorization` header also stands in
+for `--api-key`, so no Studio key is minted. Studio's own API-key listing, minting and identity check
+never carry these headers, and neither do the download-progress polls of a server this command has
+just started, which use that server's own start key. A server that only answers when they are present
+must be named with `--url`, `--provider unsloth` or `UNSLOTH_STUDIO_URL`; they are never sent while
+agent-switch probes for an unnamed server.
+
 Arguments agent-switch does not know are passed to the agent unchanged, e.g.
 `agent-switch claude -p "..."` or `agent-switch codex exec "..."`.
 

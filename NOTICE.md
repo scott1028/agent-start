@@ -8,8 +8,8 @@ Copyright 2026-present the Unsloth AI Inc. team, licensed AGPL-3.0-only, at comm
 
 | agent-switch file | Source in unsloth | Changes |
 |---|---|---|
-| `agent_switch/start.py` | `unsloth_cli/commands/start.py` | Removed the hermes, openclaw and dsh agents and `--app`; renamed agent-facing ids to neutral names; Unsloth-internal imports go through `providers/unsloth_bridge.py`; `_connect` dispatches to a provider |
-| `agent_switch/_inference.py` | `unsloth_cli/_inference.py` | Only the HTTP and server-discovery helpers |
+| `agent_switch/start.py` | `unsloth_cli/commands/start.py` | Removed the hermes, openclaw and dsh agents and `--app`; renamed agent-facing ids to neutral names; Unsloth-internal imports go through `providers/unsloth_bridge.py`; `_connect` dispatches to a provider; `--header NAME=VALUE` adds custom headers to its own requests |
+| `agent_switch/_inference.py` | `unsloth_cli/_inference.py` | Only the HTTP and server-discovery helpers; `find_studio_server()` takes custom headers, used only for a base the user named, and refuses redirects when it sends them |
 | `agent_switch/claude_subagent_mcp.py` | `unsloth_cli/claude_subagent_mcp.py` | Imports and names |
 | `agent_switch/codex_subagent_mcp.py` | `unsloth_cli/codex_subagent_mcp.py` | Imports and names |
 | `agent_switch/pi_subagent.ts` | `unsloth_cli/pi_subagent.ts` | Names |

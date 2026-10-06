@@ -1412,6 +1412,8 @@ def fake_studio(tmp_path, monkeypatch):
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         calls.append((method, url, payload))
         if url.endswith("/api/inference/loaded-models"):
@@ -1434,7 +1436,7 @@ def fake_studio(tmp_path, monkeypatch):
             }
         raise AssertionError(f"unexpected request: {method} {url}")
 
-    monkeypatch.setattr(start, "find_studio_server", lambda: BASE)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: BASE)
     # Identity handshake has its own tests; trust the loopback server here.
     monkeypatch.setattr(start, "verify_studio_identity", lambda base: True)
     # Hub listing unavailable: the Codex preflight defers to the stubbed post-connect check.
@@ -1505,10 +1507,12 @@ def test_connect_prints_the_running_models_load_warning(fake_studio, monkeypatch
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if url.endswith("/api/inference/status"):
             return {"is_gguf": True, "model_identifier": MODEL["id"], "memory_warning": notice}
-        return http_json(method, url, token, payload, timeout, error)
+        return http_json(method, url, token, payload, timeout, error, internal_auth = internal_auth)
 
     monkeypatch.setattr(start, "_http_json", with_warning)
     result = CliRunner().invoke(start.start_app, ["claude", "--no-launch", "--model", MODEL["id"]])
@@ -1528,6 +1532,8 @@ def test_connect_skips_the_load_warning_of_another_active_model(fake_studio, mon
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if url.endswith("/api/inference/status"):
             return {
@@ -1536,7 +1542,7 @@ def test_connect_skips_the_load_warning_of_another_active_model(fake_studio, mon
                 "model_identifier": "unsloth/Other-GGUF",
                 "memory_warning": "Not enough disk space to download BF16, so Q4_1 was loaded instead.",
             }
-        return http_json(method, url, token, payload, timeout, error)
+        return http_json(method, url, token, payload, timeout, error, internal_auth = internal_auth)
 
     monkeypatch.setattr(start, "_http_json", other_model_warns)
     result = CliRunner().invoke(start.start_app, ["claude", "--no-launch", "--model", MODEL["id"]])
@@ -2345,6 +2351,8 @@ def test_resolve_model_matches_loaded_canonical_case_after_load(monkeypatch, cap
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         calls.append((method, url, payload))
         if url.endswith("/api/inference/loaded-models"):
@@ -2388,6 +2396,8 @@ def test_resolve_model_matches_snapshot_path_by_public_id(monkeypatch):
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if url.endswith("/api/inference/loaded-models"):
             return {"data": [{"id": "abc123"}] if state["loaded"] else []}
@@ -2450,6 +2460,8 @@ def test_resolve_model_loads_when_catalog_hit_is_not_loaded(monkeypatch):
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         calls.append((method, url))
         if url.endswith("/api/inference/loaded-models"):
@@ -2483,6 +2495,8 @@ def test_resolve_model_does_not_attach_if_catalog_stays_unloaded(monkeypatch):
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if url.endswith("/api/inference/loaded-models"):
             return {
@@ -2516,6 +2530,8 @@ def test_resolve_model_attaches_to_loaded_catalog_hit_without_reload(monkeypatch
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         calls.append((method, url))
         if url.endswith("/api/inference/loaded-models"):
@@ -2565,6 +2581,8 @@ def test_resolve_model_remote_studio_does_not_casefold_attach(monkeypatch):
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         calls.append((method, url))
         if url.endswith("/api/inference/loaded-models"):
@@ -2712,7 +2730,7 @@ def test_https_loopback_never_auto_serves(fake_studio, monkeypatch):
     # `unsloth run` serves plain HTTP; auto-serving behind an https:// target would poll
     # the wrong scheme until the startup timeout. Keep the plain "no server" error.
     monkeypatch.setenv("UNSLOTH_STUDIO_URL", "https://127.0.0.1:8443")
-    monkeypatch.setattr(start, "find_studio_server", lambda: None)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
     started = {"called": False}
     monkeypatch.setattr(
         start, "_start_studio_server", lambda *a, **k: started.__setitem__("called", True)
@@ -2771,6 +2789,8 @@ def test_connect_skips_cached_keys_the_server_rejects(fake_studio, tmp_path, mon
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if url.endswith("/api/inference/loaded-models") and token == "sk-unsloth-stale":
             raise urllib.error.HTTPError(url, 401, "Unauthorized", None, None)
@@ -2799,6 +2819,8 @@ def test_connect_saved_key_server_outage_surfaces_not_reminted(fake_studio, tmp_
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if url.endswith("/api/inference/loaded-models") and token == "sk-unsloth-saved":
             raise urllib.error.HTTPError(url, 503, "Service Unavailable", None, None)
@@ -2858,6 +2880,8 @@ def _fake_path_resident(
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if url.endswith("/api/inference/loaded-models"):
             if state["after"] == "unreachable":
@@ -2988,6 +3012,8 @@ def test_connect_model_flag_matches_canonical_id(fake_studio, monkeypatch):
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if url.endswith("/api/inference/load"):
             return {"model": canonical, "display_name": canonical}
@@ -3089,7 +3115,7 @@ def test_start_positional_model_routes_to_model_on_auto_serve(fake_studio, monke
     # `unsloth start claude unsloth/Model-GGUF` (no --model): the positional becomes the
     # model; the GGUF variant is left unset so the server's own quant preference selects it.
     monkeypatch.setenv("UNSLOTH_STUDIO_URL", "http://127.0.0.1:8888")
-    monkeypatch.setattr(start, "find_studio_server", lambda: None)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
     captured = {}
     fake = SimpleNamespace(pid = 1, poll = lambda: None)
 
@@ -3120,7 +3146,7 @@ def test_start_local_gguf_path_keeps_no_default_variant(fake_studio, monkeypatch
     # A local GGUF dir/path ending in -GGUF must NOT get a forced default quant: the dir
     # may only hold a different quant, and pre-PR the server picked whatever was available.
     monkeypatch.setenv("UNSLOTH_STUDIO_URL", "http://127.0.0.1:8888")
-    monkeypatch.setattr(start, "find_studio_server", lambda: None)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
     local = tmp_path / "Qwen3-1.7B-GGUF"
     local.mkdir()
     captured = {}
@@ -3306,7 +3332,7 @@ def test_require_studio_warns_on_sampling_pin_when_reusing_server(monkeypatch, c
     # Attaching to an already-running server can't apply UNSLOTH_SAMPLING_* pins (only
     # _start_studio_server forwards them), so a sampling flag on the attach path must warn
     # instead of being silently dropped while the command "succeeds".
-    monkeypatch.setattr(start, "find_studio_server", lambda: BASE)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: BASE)
     base, server = start._require_studio(
         "unsloth/M-GGUF",
         start.LoadOptions(),
@@ -3324,7 +3350,7 @@ def test_require_studio_warns_on_sampling_pin_when_reusing_server(monkeypatch, c
 
 
 def test_require_studio_no_warning_without_server_flags(monkeypatch, capsys):
-    monkeypatch.setattr(start, "find_studio_server", lambda: BASE)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: BASE)
     base, server = start._require_studio(
         "unsloth/M-GGUF",
         start.LoadOptions(),
@@ -3336,7 +3362,7 @@ def test_require_studio_no_warning_without_server_flags(monkeypatch, capsys):
 
 
 def test_require_studio_warns_on_tool_flags_when_reusing_server(monkeypatch, capsys):
-    monkeypatch.setattr(start, "find_studio_server", lambda: BASE)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: BASE)
     base, server = start._require_studio(
         "unsloth/M-GGUF",
         start.LoadOptions(),
@@ -3402,6 +3428,39 @@ def test_opencode_session_temperature_needs_the_capability(fake_studio, tmp_path
         assert result.exit_code == 0, result.output
         provider = json.loads(config_path.read_text())["provider"][start._OPENCODE_PROVIDER]
         assert provider["models"][MODEL["id"]].get("temperature") is capability
+
+
+def test_unsloth_session_carries_the_custom_header_to_the_agent(fake_studio, tmp_path, monkeypatch):
+    # A custom Authorization now wins over the Studio key on agent-switch's own requests too, so the
+    # agent config must carry it, drop the apiKey it no longer sends, and mint no Studio key at all.
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(
+        start.start_app, ["opencode", "--no-launch", "--header", "Authorization=Bearer gateway-token"]
+    )
+    assert result.exit_code == 0, result.output
+    assert not [call for call in fake_studio if call[1].endswith("/api/auth/api-keys")]
+    provider = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())["provider"][
+        start._OPENCODE_PROVIDER
+    ]
+    assert provider["options"]["headers"] == {"Authorization": "Bearer gateway-token"}
+    assert "apiKey" not in provider["options"]
+
+
+def test_unsloth_provider_flag_carries_the_custom_header(fake_studio, tmp_path, monkeypatch):
+    # `--provider unsloth` names the target without a URL; it must carry the pairs like --url does,
+    # not mint a Studio key the agent never sends.
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(
+        start.start_app,
+        ["opencode", "--no-launch", "--provider", "unsloth", "--header", "Authorization=Bearer gateway-token"],
+    )
+    assert result.exit_code == 0, result.output
+    assert not [call for call in fake_studio if call[1].endswith("/api/auth/api-keys")]
+    provider = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())["provider"][
+        start._OPENCODE_PROVIDER
+    ]
+    assert provider["options"]["headers"] == {"Authorization": "Bearer gateway-token"}
+    assert "apiKey" not in provider["options"]
 
 
 def test_pi_subagent_carries_the_session_flags(fake_studio, tmp_path, monkeypatch):
@@ -3483,7 +3542,7 @@ def test_opencode_v1_reads_the_effort_as_reasoning_effort_option(
 def test_spawned_server_keeps_only_what_the_agent_cannot_send(
     agent, server_keeps, fake_studio, monkeypatch
 ):
-    monkeypatch.setattr(start, "find_studio_server", lambda: None)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
     started = {}
     fake = SimpleNamespace(pid = 999, poll = lambda: None)
 
@@ -3519,7 +3578,7 @@ def test_require_studio_warns_when_the_started_server_pins_reasoning(
     monkeypatch, capsys, reasoning, warns
 ):
     monkeypatch.setenv("UNSLOTH_STUDIO_URL", "http://127.0.0.1:8888")
-    monkeypatch.setattr(start, "find_studio_server", lambda: None)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
     monkeypatch.setattr(
         start, "_start_studio_server", lambda base, model, load, server: (base, None)
     )
@@ -3537,7 +3596,7 @@ def test_require_studio_warns_when_a_flag_drops_an_inherited_pin(monkeypatch, ca
     else:
         monkeypatch.delenv("UNSLOTH_SAMPLING_TEMPERATURE", raising = False)
     monkeypatch.setenv("UNSLOTH_SAMPLING_TOP_P", "0.5")
-    monkeypatch.setattr(start, "find_studio_server", lambda: None)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
     monkeypatch.setattr(
         start, "_start_studio_server", lambda base, model, load, server: (base, None)
     )
@@ -3560,7 +3619,7 @@ def test_require_studio_warns_when_a_flag_drops_an_inherited_pin(monkeypatch, ca
 def test_require_studio_warns_on_explicit_reasoning_when_reusing_server(
     monkeypatch, capsys, reasoning, carried
 ):
-    monkeypatch.setattr(start, "find_studio_server", lambda: BASE)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: BASE)
     base, server = start._require_studio(
         "unsloth/M-GGUF",
         start.LoadOptions(),
@@ -3627,7 +3686,7 @@ def test_start_studio_server_overrides_inherited_reasoning_effort(monkeypatch):
 
 
 def test_require_studio_warns_on_explicit_reasoning_effort_when_reusing_server(monkeypatch, capsys):
-    monkeypatch.setattr(start, "find_studio_server", lambda: BASE)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: BASE)
     base, server = start._require_studio(
         "unsloth/M-GGUF",
         start.LoadOptions(),
@@ -3644,7 +3703,7 @@ def test_require_studio_warns_on_explicit_reasoning_effort_when_reusing_server(m
 def test_start_claude_sends_sampling_flags_itself(fake_studio, monkeypatch):
     # Claude sends the flags itself, so the server it starts is left at its defaults.
     monkeypatch.setenv("UNSLOTH_STUDIO_URL", "http://127.0.0.1:8888")
-    monkeypatch.setattr(start, "find_studio_server", lambda: None)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
     captured = {}
     fake = SimpleNamespace(pid = 1, poll = lambda: None)
 
@@ -3838,7 +3897,7 @@ def test_connect_no_model_loaded_errors(fake_studio, monkeypatch):
     monkeypatch.setattr(
         start,
         "_http_json",
-        lambda method, url, token, payload = None, timeout = 30, error = None: (
+        lambda method, url, token, *rest, **_: (
             {"key": "sk-unsloth-feedfacefeedface"}
             if url.endswith("/api/auth/api-keys")
             else {"object": "list", "data": []}
@@ -3861,6 +3920,8 @@ def test_connect_requested_model_not_loaded_fails(fake_studio, monkeypatch):
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if url.endswith("/api/inference/load"):
             return {}
@@ -3887,6 +3948,8 @@ def test_connect_gguf_only_agents_reject_non_gguf_model(fake_studio, monkeypatch
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if url.endswith("/api/inference/status"):
             return {"is_gguf": False, "model_identifier": "unsloth/Qwen3-0.6B"}
@@ -3906,7 +3969,7 @@ def test_connect_gguf_only_agents_reject_non_gguf_model(fake_studio, monkeypatch
 def test_connect_nonloopback_keyless_refuses_to_send_credential(fake_studio, monkeypatch):
     # A server known only by URL + health check is unverified: keyless connect
     # must refuse and make no request at all.
-    monkeypatch.setattr(start, "find_studio_server", lambda: "http://studio.evil.example:8888")
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: "http://studio.evil.example:8888")
     result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
     assert result.exit_code == 1
     assert "Settings → API" in result.output
@@ -3916,7 +3979,7 @@ def test_connect_nonloopback_keyless_refuses_to_send_credential(fake_studio, mon
 
 def test_connect_nonloopback_explicit_key_is_allowed(fake_studio, monkeypatch):
     # User named both server and key, so it's their choice; only auto-send is blocked.
-    monkeypatch.setattr(start, "find_studio_server", lambda: "http://studio.example:8888")
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: "http://studio.example:8888")
     result = CliRunner().invoke(
         start.start_app,
         ["opencode", "--no-launch", "--api-key", "sk-unsloth-deadbeefdeadbeef"],
@@ -3928,7 +3991,7 @@ def test_connect_nonloopback_replays_saved_key(fake_studio, tmp_path, monkeypatc
     # A key saved for a remote (non-loopback) Unsloth is replayed on keyless runs;
     # auto-minting stays blocked for non-loopback.
     remote = "http://studio.example:8888"
-    monkeypatch.setattr(start, "find_studio_server", lambda: remote)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: remote)
     (tmp_path / "agent_api_key.json").write_text(
         json.dumps({"servers": {remote: {"saved": ["sk-unsloth-deadbeefdeadbeef"]}}})
     )
@@ -4006,7 +4069,7 @@ def test_is_loopback_url(url, loopback):
 
 
 def test_connect_no_studio_errors(fake_studio, monkeypatch):
-    monkeypatch.setattr(start, "find_studio_server", lambda: None)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
     result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
     assert result.exit_code == 1
     assert "No running Unsloth server" in result.output
@@ -4099,8 +4162,8 @@ def test_start_studio_server_polls_progress_from_early_key(monkeypatch):
     class FakeProgress:
         downloaded_bytes = 0
 
-        def __init__(self, base, key, model, variant):
-            created.append((base, key, model, variant, "created"))
+        def __init__(self, base, key, model, variant, internal_auth = False):
+            created.append((base, key, model, variant, internal_auth, "created"))
 
         def poll(self):
             created.append("poll")
@@ -4129,7 +4192,7 @@ def test_start_studio_server_polls_progress_from_early_key(monkeypatch):
     )
 
     assert (returned_base, server.pid) == (BASE, 4321)
-    assert (BASE, "sk-unsloth-early", "owner/model-GGUF", "Q4_K_M", "created") in created
+    assert (BASE, "sk-unsloth-early", "owner/model-GGUF", "Q4_K_M", True, "created") in created
     assert created.count("poll") == 2
     assert created[-2:] == ["complete", "close"]
     assert not any(isinstance(event, tuple) and "server ready" in event[-1] for event in created)
@@ -4176,7 +4239,7 @@ def test_start_studio_server_follows_the_port_the_child_bound(monkeypatch, tmp_p
     class FakeProgress:
         downloaded_bytes = 0
 
-        def __init__(self, base, *_args):
+        def __init__(self, base, *_args, **_kwargs):
             progress_bases.append(base)
 
         def poll(self):
@@ -4228,7 +4291,7 @@ def test_start_studio_server_reads_the_port_the_child_reported_once(monkeypatch)
     class FakeProgress:
         downloaded_bytes = 0
 
-        def __init__(self, base, *_args):
+        def __init__(self, base, *_args, **_kwargs):
             progress_bases.append(base)
 
         def poll(self):
@@ -4267,6 +4330,8 @@ def test_load_model_with_progress_uses_selected_gguf_size(monkeypatch, capsys):
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         calls.append((method, url, payload))
         if url.endswith("/api/inference/load"):
@@ -4665,7 +4730,7 @@ def test_resolve_model_failed_load_stays_quiet_when_model_gone(monkeypatch, caps
 
 
 def test_auto_serves_when_no_server_then_keeps_server(fake_studio, monkeypatch):
-    monkeypatch.setattr(start, "find_studio_server", lambda: None)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
     started = {}
     fake = SimpleNamespace(pid = 999, poll = lambda: None)
 
@@ -4704,7 +4769,7 @@ def test_auto_serves_when_no_server_then_keeps_server(fake_studio, monkeypatch):
 
 
 def test_auto_served_session_uses_the_port_the_server_bound(fake_studio, monkeypatch):
-    monkeypatch.setattr(start, "find_studio_server", lambda: None)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
     bound = "http://127.0.0.1:8889"
     fake = SimpleNamespace(pid = 999, poll = lambda: None)
     launched = {}
@@ -4727,7 +4792,7 @@ def test_auto_served_session_uses_the_port_the_server_bound(fake_studio, monkeyp
 
 
 def test_auto_served_agent_launch_failure_stops_server(fake_studio, monkeypatch):
-    monkeypatch.setattr(start, "find_studio_server", lambda: None)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
     stopped = []
     fake = SimpleNamespace(pid = 999, poll = lambda: None)
 
@@ -4754,7 +4819,7 @@ def test_auto_served_agent_launch_failure_stops_server(fake_studio, monkeypatch)
 
 
 def test_auto_served_server_exit_is_not_reported_as_running(fake_studio, monkeypatch):
-    monkeypatch.setattr(start, "find_studio_server", lambda: None)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
     fake = SimpleNamespace(pid = 999, poll = lambda: 1)
 
     def fake_start(*_args):
@@ -4851,7 +4916,7 @@ def test_startup_failure_output_redacts_minted_key(monkeypatch, tmp_path, capsys
 def test_codex_preflight_failure_tears_down_auto_served(fake_studio, monkeypatch):
     # Listing unavailable, so the post-connect check decides and must still tear down.
     monkeypatch.setattr(start, "_hub_gguf_files", lambda repo: None)
-    monkeypatch.setattr(start, "find_studio_server", lambda: None)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
     started = {}
     fake = SimpleNamespace(pid = 999, poll = lambda: None)
 
@@ -4878,6 +4943,8 @@ def test_codex_preflight_failure_tears_down_auto_served(fake_studio, monkeypatch
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if url.endswith("/api/inference/status"):
             return {"is_gguf": False, "model_identifier": "transformers-model"}
@@ -4894,7 +4961,7 @@ def test_codex_preflight_failure_tears_down_auto_served(fake_studio, monkeypatch
 
 
 def test_no_serve_preserves_error(fake_studio, monkeypatch):
-    monkeypatch.setattr(start, "find_studio_server", lambda: None)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
     started = {"called": False}
     monkeypatch.setattr(
         start, "_start_studio_server", lambda *a, **k: started.__setitem__("called", True)
@@ -4908,7 +4975,7 @@ def test_no_serve_preserves_error(fake_studio, monkeypatch):
 
 
 def test_no_launch_never_serves(fake_studio, monkeypatch):
-    monkeypatch.setattr(start, "find_studio_server", lambda: None)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
     started = {"called": False}
     monkeypatch.setattr(
         start, "_start_studio_server", lambda *a, **k: started.__setitem__("called", True)
@@ -4922,7 +4989,7 @@ def test_no_launch_never_serves(fake_studio, monkeypatch):
 
 
 def test_no_server_no_model_hints_model_flag(fake_studio, monkeypatch):
-    monkeypatch.setattr(start, "find_studio_server", lambda: None)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
     result = CliRunner().invoke(start.start_app, ["claude"])
     assert result.exit_code == 1
     assert "--model" in result.output
@@ -4951,7 +5018,7 @@ def test_auto_serve_normalizes_portless_url(fake_studio, monkeypatch):
     # A portless UNSLOTH_STUDIO_URL must launch AND poll :8888 (what unsloth run binds),
     # not port 80, or readiness never matches and we hit the startup timeout.
     monkeypatch.setenv("UNSLOTH_STUDIO_URL", "http://127.0.0.1")
-    monkeypatch.setattr(start, "find_studio_server", lambda: None)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
     started = {}
     fake = SimpleNamespace(pid = 999, poll = lambda: None)
 
@@ -6738,6 +6805,8 @@ def test_agent_api_key_auto_started_rejected_env_key_falls_back(fake_studio, tmp
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if url.endswith("/api/inference/loaded-models") and token == "sk-unsloth-other-server":
             raise urllib.error.HTTPError(url, 401, "Unauthorized", None, None)
@@ -7125,7 +7194,7 @@ def test_native_resume_flag_passes_through_unchanged(fake_studio, monkeypatch):
 
 def _fake_hub_listing(monkeypatch, files_by_repo):
     monkeypatch.delenv("UNSLOTH_STUDIO_URL", raising = False)
-    monkeypatch.setattr(start, "find_studio_server", lambda: None)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
     calls = []
 
     def fake(repo):
@@ -7208,7 +7277,7 @@ def test_hub_gguf_files_unknown_on_error_or_empty_listing(monkeypatch):
 
 def test_codex_rejects_non_gguf_model_before_connect(monkeypatch):
     monkeypatch.delenv("UNSLOTH_STUDIO_URL", raising = False)
-    monkeypatch.setattr(start, "find_studio_server", lambda: None)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
     monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/codex")
     monkeypatch.setattr(start, "_hub_gguf_files", lambda repo: [])
     monkeypatch.setattr(
@@ -7307,7 +7376,7 @@ def test_codex_preflight_defers_to_running_server(monkeypatch):
     # With a server running, identifiers resolve against its cwd/cache/token, so the attach
     # check asks it rather than guessing here.
     calls = _fake_hub_listing(monkeypatch, {"mlx-community/Qwen3-0.6B-4bit": []})
-    monkeypatch.setattr(start, "find_studio_server", lambda: "http://127.0.0.1:8888")
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: "http://127.0.0.1:8888")
     start._preflight_agent_gguf(start._CODEX_GGUF_AGENT, "mlx-community/Qwen3-0.6B-4bit")
     assert calls == []
 
@@ -7322,6 +7391,8 @@ def _fake_variants(monkeypatch, responses):
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         urls.append(url)
         if isinstance(responses, Exception):
@@ -7426,7 +7497,7 @@ def test_codex_preflight_defers_bare_names_to_attached_server(monkeypatch):
     # A bare name may be a directory under the attached server's cwd, invisible here, so
     # only the auto-start path may canonicalize it.
     calls = _fake_hub_listing(monkeypatch, {"unsloth/Qwen3-0.6B": []})
-    monkeypatch.setattr(start, "find_studio_server", lambda: "http://127.0.0.1:8888")
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: "http://127.0.0.1:8888")
     monkeypatch.setattr(start, "verify_studio_identity", lambda base: True)
     start._preflight_agent_gguf(start._CODEX_GGUF_AGENT, "Qwen3-0.6B")
     assert calls == []
@@ -7453,6 +7524,8 @@ def test_codex_attach_rejects_before_load(fake_studio, monkeypatch):
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if "/api/models/gguf-variants" in url:
             return {"variants": []}
@@ -7478,6 +7551,8 @@ def test_codex_attach_rejects_unavailable_variant_before_load(fake_studio, monke
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if "/api/models/gguf-variants" in url:
             return {"variants": [{"quant": "Q4_K_M"}]}
@@ -7507,6 +7582,8 @@ def test_codex_attach_reuses_resident_model_without_preload_probe(fake_studio, m
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if "/api/models/gguf-variants" in url:
             probes.append(url)
@@ -7561,6 +7638,8 @@ def test_codex_attach_check_direct_variant_always_asks_the_server(monkeypatch):
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         probes.append(url)
         return {
@@ -7810,6 +7889,8 @@ def test_codex_attach_check_follows_bare_names_the_server_calls_remote(monkeypat
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         urls.append(url)
         if "unsloth" in url:
@@ -7874,6 +7955,8 @@ def test_codex_attach_check_probes_missing_bare_gguf_shorthands(tmp_path, monkey
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         urls.append(url)
         return {"variants": []}
@@ -8032,6 +8115,8 @@ def test_codex_preload_gate_checks_direct_path_identity(fake_studio, monkeypatch
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if url.endswith("/api/inference/loaded-models"):
             return {"data": [{"id": "foo-Q4_K_M", "loaded": True}]}
@@ -8067,6 +8152,8 @@ def test_codex_preload_gate_runs_for_a_settings_reload(fake_studio, monkeypatch)
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if "/api/models/gguf-variants" in url:
             probed.append(url)
@@ -8094,6 +8181,8 @@ def test_codex_preload_gate_runs_for_a_mistyped_resident_variant(fake_studio, mo
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if url.endswith("/api/inference/status"):
             return {"is_gguf": True, "gguf_variant": "Q4_K_M"}
@@ -8122,6 +8211,8 @@ def test_codex_preload_gate_defers_to_the_resident_model(fake_studio, monkeypatc
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if url.endswith("/api/inference/status"):
             return {"is_gguf": True, "gguf_variant": "Q4_K_M"}
@@ -8149,6 +8240,8 @@ def test_codex_preload_gate_still_runs_for_a_different_variant(fake_studio, monk
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if url.endswith("/api/inference/status"):
             return {"is_gguf": True, "gguf_variant": "Q4_K_M"}
@@ -8221,6 +8314,8 @@ def test_codex_attach_check_defers_when_loopback_is_not_this_machine(monkeypatch
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         probes.append(url)
         return {"variants": [{"quant": "Q4_K_M"}]}
@@ -8420,6 +8515,8 @@ def test_codex_attach_check_normalizes_shorthand_after_raw_probe(monkeypatch, ca
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         urls.append(url)
         if "repo_id=Qwen3-0.6B" in url and "unsloth" not in url:
@@ -8444,6 +8541,8 @@ def test_codex_attach_check_trusts_raw_server_dir_answer(monkeypatch):
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         urls.append(url)
         return {"variants": [{"quant": "Q4_K_M"}]}
@@ -8467,6 +8566,8 @@ def test_codex_attach_check_rejects_live_empty_raw_shorthand(monkeypatch, tmp_pa
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         urls.append(url)
         if "unsloth" in url:
@@ -8488,6 +8589,8 @@ def test_codex_attach_check_defers_shorthand_when_canonical_probe_errors(monkeyp
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         raise urllib.error.HTTPError(url, 404, "nope", None, None)
 
@@ -8630,6 +8733,8 @@ def test_claude_preload_gate_rejects_before_an_evicting_load(fake_studio, monkey
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if "/api/models/gguf-variants" in url:
             probed.append(url)
@@ -8650,7 +8755,7 @@ def test_claude_post_connect_failure_tears_down_auto_served(fake_studio, monkeyp
     # Listing unavailable: the check falls back to post-connect and must still tear down an
     # auto-started server instead of leaving it to atexit.
     monkeypatch.setattr(start, "_hub_gguf_files", lambda repo: None)
-    monkeypatch.setattr(start, "find_studio_server", lambda: None)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
     started = {}
     fake = SimpleNamespace(pid = 999, poll = lambda: None)
 
@@ -8677,6 +8782,8 @@ def test_claude_post_connect_failure_tears_down_auto_served(fake_studio, monkeyp
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if url.endswith("/api/inference/status"):
             return {"is_gguf": False, "model_identifier": "transformers-model"}
@@ -8703,6 +8810,8 @@ def test_claude_post_connect_failure_spares_an_attached_server(fake_studio, monk
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if url.endswith("/api/inference/status"):
             return {"is_gguf": False, "model_identifier": "transformers-model"}
@@ -8855,7 +8964,7 @@ def test_require_gguf_does_not_swallow_a_bug(monkeypatch):
 def test_an_unreadable_status_leaves_the_auto_served_server_alone(fake_studio, monkeypatch, agent):
     # The regression: a 500 from get_status used to reject, then shut down a loaded GGUF.
     monkeypatch.setattr(start, "_hub_gguf_files", lambda repo: None)
-    monkeypatch.setattr(start, "find_studio_server", lambda: None)
+    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
     started = {}
     fake = SimpleNamespace(pid = 999, poll = lambda: None)
 
@@ -8884,6 +8993,8 @@ def test_an_unreadable_status_leaves_the_auto_served_server_alone(fake_studio, m
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if url.endswith("/api/inference/status"):
             raise urllib.error.HTTPError(url, 500, "Failed to get status", None, None)
@@ -8909,6 +9020,8 @@ def test_a_status_body_without_is_gguf_still_launches(fake_studio, monkeypatch, 
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         if url.endswith("/api/inference/status"):
             return {"model_identifier": MODEL["id"]}
@@ -8965,6 +9078,8 @@ class _LoadServer:
         payload = None,
         timeout = 30,
         error = None,
+        *,
+        internal_auth = False,
     ):
         self.urls.append(url)
         if url.endswith("/active-downloads"):
