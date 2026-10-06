@@ -376,6 +376,19 @@ _AS_SUBAGENT_OPTION = typer.Option(
     rich_help_panel = _PANEL_SESSION,
     help = "Keep the coding agent's current model and add Unsloth as a local subagent.",
 )
+_COMPACT_AT_OPTION = typer.Option(
+    None,
+    "--compact-at",
+    min = 0.5,
+    max = 0.95,
+    rich_help_panel = _PANEL_SESSION,
+    help = (
+        "Fraction of the context window that triggers the agent's auto-compaction: "
+        "0.85 starts it once 85% of the context is used. Applies to Claude Code, Codex, "
+        "OpenCode and Pi; Claude Code scales its own effective window, so there the ratio "
+        "can only pull its built-in trigger earlier. Unset keeps each agent's current behavior."
+    ),
+)
 
 _HEADER_NAME_TOKEN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")  # RFC 7230 tchar
 _HEADER_VALUE_TEXT = re.compile(r"[\t\x20-\x7e]*")  # RFC 7230 field VCHAR + SP + HTAB
@@ -2987,12 +3000,22 @@ def _claude_local_command(model_id: str, settings: str, yolo: bool, passthrough:
     ]
 
 
+def _check_compact_at(compact_at: Optional[float], model: dict) -> None:
+    """--compact-at scales off the server-reported window; without one there is nothing to scale."""
+    if compact_at is not None and not (model.get("context_length") or model.get("max_context_length")):
+        typer.echo(
+            "Warning: the server did not report the model's context length, so --compact-at is ignored.",
+            err = True,
+        )
+
+
 def _claude_local_env(
     base: str,
     key: str,
     entry: dict,
     extra_body: Optional[dict] = None,
     headers: Optional[dict] = None,
+    compact_at: Optional[float] = None,
 ) -> dict:
     """Build the local endpoint, cache, display, and compaction environment."""
     model_id = entry["id"]
@@ -3017,7 +3040,9 @@ def _claude_local_env(
         # claude assumes 200k for a model id it does not recognize, and clamps AUTO_COMPACT_WINDOW to [100k, that]. MAX_CONTEXT_TOKENS sets the window itself.
         env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(int(window))
         env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(int(window))
-        env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = "90"
+        env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = (
+            str(int(round(compact_at * 100))) if compact_at is not None else "90"
+        )
     if extra_body:
         env["CLAUDE_CODE_EXTRA_BODY"] = json.dumps(extra_body)
     return env
@@ -3150,6 +3175,7 @@ def write_codex_config(
     home: Path,
     reasoning_effort: Optional[str] = None,
     headers: Optional[dict] = None,
+    compact_at: Optional[float] = None,
 ) -> None:
     home.mkdir(parents = True, exist_ok = True)
 
@@ -3185,6 +3211,8 @@ def write_codex_config(
     window = model.get("context_length") or model.get("max_context_length")
     if window:
         profile_text += f"model_context_window = {int(window)}\n"
+        if compact_at is not None:
+            profile_text += f"model_auto_compact_token_limit = {int(int(window) * compact_at)}\n"
     if reasoning_effort:
         profile_text += f"model_reasoning_effort = {json.dumps(reasoning_effort)}\n"
     profile = home / f"{_CODEX_PROFILE}.config.toml"
@@ -3202,10 +3230,11 @@ def write_codex_subagent_bridge(
     yolo: bool,
     reasoning_effort: Optional[str] = None,
     headers: Optional[dict] = None,
+    compact_at: Optional[float] = None,
 ) -> Path:
     """Write private config for an explicit local Codex child launched through MCP."""
     child_home = home / "child"
-    write_codex_config(base, model, child_home, reasoning_effort, headers)
+    write_codex_config(base, model, child_home, reasoning_effort, headers, compact_at)
     path = home / "subagent.json"
     _write_private_json(
         path,
@@ -3569,7 +3598,9 @@ def write_claude_subagent_plugin(path: Path, server_env: dict) -> Path:
             ),
         }
         headers = json.loads(server_env.get("AGENT_SWITCH_CLAUDE_SUBAGENT_HEADERS") or "{}")
-        local_env = _claude_local_env(base, key, entry, headers = headers)
+        compact_at_raw = server_env.get("AGENT_SWITCH_CLAUDE_SUBAGENT_COMPACT_AT")
+        compact_at = float(compact_at_raw) if compact_at_raw else None
+        local_env = _claude_local_env(base, key, entry, headers = headers, compact_at = compact_at)
         if "CLAUDE_CODE_EXTRA_BODY" in server_env:
             local_env["CLAUDE_CODE_EXTRA_BODY"] = server_env["CLAUDE_CODE_EXTRA_BODY"]
         settings = _write_claude_settings(plugin, model_id, local_env)
@@ -4700,7 +4731,15 @@ def _agent_output_limit(window: int, max_tokens: Optional[int]) -> int:
     return output
 
 
-def opencode_compaction_reserved(window: int, output: int) -> int:
+def _get_compaction_reserve(window: int, ratio: float) -> int:
+    return max(1, int(window * (1 - ratio)))
+
+
+def opencode_compaction_reserved(window: int, output: int, ratio: Optional[float] = None) -> int:
+    if ratio is not None:
+        # An explicit ratio is honored exactly; the default's output cap and 8192 floor
+        # would block the earlier compaction the flag is asked for.
+        return _get_compaction_reserve(window, ratio)
     return max(1, min(output, max(window // 10, 8192)))
 
 
@@ -4772,6 +4811,7 @@ def write_opencode_config(
     max_tokens: Optional[int] = None,
     request_body: Optional[dict] = None,
     headers: Optional[dict] = None,
+    compact_at: Optional[float] = None,
 ) -> dict:
     config = _read_json_object(path)
     if config is None:
@@ -4787,7 +4827,9 @@ def write_opencode_config(
     reserved = None
     if window:
         window = int(window)
-        reserved = opencode_compaction_reserved(window, opencode_output_limit(window, max_tokens))
+        reserved = opencode_compaction_reserved(
+            window, opencode_output_limit(window, max_tokens), compact_at
+        )
     # Keep the provider definition in this private session file. The launch path adjusts effective provider filters in the higher-priority inline overlay.
     _subdict(config, "provider")[_OPENCODE_PROVIDER] = _opencode_provider(
         base, key, model, max_tokens, request_body, headers
@@ -4902,6 +4944,35 @@ def write_pi_config(
     if json.dumps(config, sort_keys = True) != before:
         _write_private_json(path, config)
         typer.echo(f"Updated {path}")
+
+
+def write_pi_compaction(agent_dir: Path, model: dict, compact_at: Optional[float]) -> None:
+    """Scale Pi's auto-compaction trigger to --compact-at in the session settings."""
+    path = agent_dir / "settings.json"
+    settings = _read_json_object(path)
+    if settings is None:
+        return  # write_pi_user_resources already warned
+    window = model.get("context_length") or model.get("max_context_length")
+    before = json.dumps(settings, sort_keys = True)
+    if compact_at is not None and window:
+        # Pi compacts once the context exceeds contextWindow - reserveTokens.
+        settings["compaction"] = {
+            "enabled": True,
+            "reserveTokens": _get_compaction_reserve(int(window), compact_at),
+        }
+    else:
+        # Undo a --compact-at block an earlier run left in a persisted session; compaction
+        # is not a key this session inherits from the user, so this exact shape is ours.
+        compaction = settings.get("compaction")
+        if (
+            isinstance(compaction, dict)
+            and compaction.keys() == {"enabled", "reserveTokens"}
+            and compaction["enabled"] is True
+            and isinstance(compaction["reserveTokens"], int)
+        ):
+            settings.pop("compaction", None)
+    if json.dumps(settings, sort_keys = True) != before:
+        _write_private_json(path, settings)
 
 
 def _link_user_dir(source: Path, target: Path) -> bool:
@@ -5207,6 +5278,7 @@ def claude(
     min_p: Optional[float] = _MIN_P_OPTION,
     repetition_penalty: Optional[float] = _REPETITION_PENALTY_OPTION,
     presence_penalty: Optional[float] = _PRESENCE_PENALTY_OPTION,
+    compact_at: Optional[float] = _COMPACT_AT_OPTION,
     serve: bool = _SERVE_OPTION,
     url: Optional[str] = _URL_OPTION,
     provider: Optional[ProviderName] = _PROVIDER_OPTION,
@@ -5264,6 +5336,7 @@ def claude(
         _shutdown_auto_served()
         raise
     model_id = entry["id"]
+    _check_compact_at(compact_at, entry)
     if as_subagent:
         subagent_id = (
             _subagent_model_id(base, key, entry, model, gguf_variant)
@@ -5280,6 +5353,8 @@ def claude(
         }
         if window:
             server_env["AGENT_SWITCH_CLAUDE_SUBAGENT_CONTEXT_WINDOW"] = str(int(window))
+        if compact_at is not None:
+            server_env["AGENT_SWITCH_CLAUDE_SUBAGENT_COMPACT_AT"] = str(compact_at)
         if headers:
             server_env["AGENT_SWITCH_CLAUDE_SUBAGENT_HEADERS"] = json.dumps(headers)
         if server_options.request_body():
@@ -5308,7 +5383,7 @@ def claude(
             )
         return
 
-    env = _claude_local_env(base, key, entry, server_options.request_body(), headers)
+    env = _claude_local_env(base, key, entry, server_options.request_body(), headers, compact_at)
     # Claude Code auto-compacts against its native context window; the local env above supplies the loaded model's real window and a 90% threshold instead. --yolo (or its aliases) maps to Claude's own --dangerously-skip-permissions. IS_SANDBOX is left unset on purpose: Claude refuses bypass mode as root unless a sandbox is detected, and we do not want to falsely claim one on the user's host. claude keeps its history in ~/.claude/projects, which --settings/env never relocate, so a session already survives exit; resume it with `claude --continue` or `--resume <id>` passed through.
     with _session_config("claude", launch, persist = persist) as config:
         settings = _write_claude_settings(config, model_id, env)
@@ -5352,6 +5427,7 @@ def codex(
     min_p: Optional[float] = _MIN_P_OPTION,
     repetition_penalty: Optional[float] = _REPETITION_PENALTY_OPTION,
     presence_penalty: Optional[float] = _PRESENCE_PENALTY_OPTION,
+    compact_at: Optional[float] = _COMPACT_AT_OPTION,
     serve: bool = _SERVE_OPTION,
     url: Optional[str] = _URL_OPTION,
     provider: Optional[ProviderName] = _PROVIDER_OPTION,
@@ -5407,6 +5483,7 @@ def codex(
     except BaseException:
         _shutdown_auto_served()
         raise
+    _check_compact_at(compact_at, entry)
     if as_subagent:
         subagent_id = (
             _subagent_model_id(base, key, entry, model, gguf_variant)
@@ -5423,6 +5500,7 @@ def codex(
                 yolo = yolo,
                 reasoning_effort = codex_effort,
                 headers = headers,
+                compact_at = compact_at,
             )
             parent_home = write_codex_parent_overlay(home / "parent")
             command = [
@@ -5452,7 +5530,7 @@ def codex(
         *ctx.args,
     ]
     with _session_config("codex", launch, persist = persist) as home:
-        write_codex_config(base, entry, home, codex_effort, headers)
+        write_codex_config(base, entry, home, codex_effort, headers, compact_at)
         env = {_CODEX_ENV_KEY: key, "CODEX_HOME": str(home)}
         _run(
             base,
@@ -5489,6 +5567,7 @@ def opencode(
     repetition_penalty: Optional[float] = _REPETITION_PENALTY_OPTION,
     presence_penalty: Optional[float] = _PRESENCE_PENALTY_OPTION,
     max_tokens: Optional[int] = _MAX_TOKENS_OPTION,
+    compact_at: Optional[float] = _COMPACT_AT_OPTION,
     serve: bool = _SERVE_OPTION,
     url: Optional[str] = _URL_OPTION,
     provider: Optional[ProviderName] = _PROVIDER_OPTION,
@@ -5530,12 +5609,18 @@ def opencode(
         server_options = server_options,
         target = target,
     )
+    _check_compact_at(compact_at, entry)
     if opencode_v2:
         typer.echo(
             f"OpenCode V2 provider policies must allow '{_OPENCODE_PROVIDER}'.",
             err = True,
         )
     if as_subagent:
+        if compact_at is not None:
+            typer.echo(
+                "Warning: --compact-at does not apply with --as-subagent for OpenCode; ignoring it.",
+                err = True,
+            )
         subagent_id = (
             _subagent_model_id(base, key, entry, model, gguf_variant)
             if target.name == "unsloth"
@@ -5633,6 +5718,7 @@ def opencode(
             max_tokens = max_tokens,
             request_body = server_options.request_body(),
             headers = headers,
+            compact_at = compact_at,
         )
         # A project's own opencode.json outranks OPENCODE_CONFIG, so the session model pin would silently lose to a repo config; carry it in OPENCODE_CONFIG_CONTENT, which outranks project config, while the API key stays in the private file. Only the config fallback carries a permission: native --auto omits it (auto-approve asks, keep explicit denies) and a non-yolo session omits it too, honoring project rules. V1 filters are ordinary overlays, so scope that session to our provider; V2 turns filters into security policies where global/project rules intentionally win, so keep those policies intact and tell the user above that they must allow our provider. small_model is opencode's separate model for lightweight tasks; pin it to the session model too, or a user/project small_model on another (now filtered) provider would resolve a not-found error mid-session.
         inline_config: dict = {
@@ -5676,6 +5762,7 @@ def pi(
     min_p: Optional[float] = _MIN_P_OPTION,
     repetition_penalty: Optional[float] = _REPETITION_PENALTY_OPTION,
     presence_penalty: Optional[float] = _PRESENCE_PENALTY_OPTION,
+    compact_at: Optional[float] = _COMPACT_AT_OPTION,
     serve: bool = _SERVE_OPTION,
     url: Optional[str] = _URL_OPTION,
     provider: Optional[ProviderName] = _PROVIDER_OPTION,
@@ -5725,7 +5812,13 @@ def pi(
         server_options = server_options,
         target = target,
     )
+    _check_compact_at(compact_at, entry)
     if as_subagent:
+        if compact_at is not None:
+            typer.echo(
+                "Warning: --compact-at does not apply with --as-subagent for Pi; ignoring it.",
+                err = True,
+            )
         subagent_id = (
             _subagent_model_id(base, key, entry, model, gguf_variant)
             if target.name == "unsloth"
@@ -5790,6 +5883,7 @@ def pi(
             headers = headers,
         )
         write_pi_user_resources(pi_agent_dir, home)
+        write_pi_compaction(pi_agent_dir, entry, compact_at)
         env = {"HOME": str(home), "PI_CODING_AGENT_DIR": str(pi_agent_dir)}
         if os.name == "nt" or os.environ.get("WSL_DISTRO_NAME"):
             # Node resolves ~/.pi via USERPROFILE (then HOMEDRIVE + HOMEPATH) on Windows, not HOME. Set them whenever Pi may run as a Windows process: native Windows, or a /mnt Windows shim launched from WSL, where the WSLENV bridge then translates the path. Otherwise the Windows process falls back to the user's real %USERPROFILE%\\.pi. splitdrive yields no drive off a POSIX path, so HOMEDRIVE/HOMEPATH stay unset there.

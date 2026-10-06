@@ -97,6 +97,7 @@ How each item was checked:
 - [v] Unsloth-only flags refused for other servers (tests)
 - [v] `--header NAME=VALUE` (repeatable): custom HTTP headers on agent-switch's own requests and on every agent's requests, including the subagent bridges; an `Authorization` header here replaces the built-in Bearer `<api-key>` (tests; claude token precedence and pi header merge verified live on claude 2.1.291 and pi 1.0.4); an Unsloth Studio target carries them too: an `Authorization` header there stands in for `--api-key` (no Studio key is minted), while Studio's own API-key listing, minting and identity check and the auto-start server's progress polls never carry them, and probing for an unnamed server never sends them (tests)
 - [v] All four agents complete a turn on llama-server; the user's own agent config files are unchanged afterwards (live)
+- [v] `--compact-at <fraction, 0.5-0.95>`: scale each agent's auto-compaction trigger off the reported window — Codex `model_auto_compact_token_limit`, OpenCode `compaction.reserved` and Pi `compaction.reserveTokens` take the exact ratio; Claude `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` scales Claude's own effective window and can only lower its built-in trigger; unset keeps each agent's own behavior; ignored with a warning when no window is known, and with `--as-subagent` for OpenCode/Pi (tests)
 
 ## Not ported (with reason)
 

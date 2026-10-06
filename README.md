@@ -81,6 +81,12 @@ The context window comes from the server: Ollama `/api/ps`, LM Studio's loaded i
 llama-server `meta.n_ctx`, vLLM `max_model_len`, or Unsloth. A generic server that reports none
 needs `--context-length`.
 
+`--compact-at 0.85` starts the agent's auto-compaction once 85% of that window is used, scaled
+per agent (Claude Code, Codex, OpenCode and Pi); accepted range 0.5–0.95, and leaving it unset
+keeps each agent's own behavior. Claude Code applies the fraction to its own effective window
+(the window minus its output reserve), so there it can only pull the built-in trigger earlier,
+never later.
+
 ## Develop
 
 ```sh

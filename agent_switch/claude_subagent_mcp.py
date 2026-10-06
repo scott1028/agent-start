@@ -142,8 +142,10 @@ def run_local_agent(
     model = _required_env("AGENT_SWITCH_CLAUDE_SUBAGENT_MODEL")
     window = int(os.environ.get("AGENT_SWITCH_CLAUDE_SUBAGENT_CONTEXT_WINDOW", "0") or 0)
     headers = json.loads(os.environ.get("AGENT_SWITCH_CLAUDE_SUBAGENT_HEADERS") or "{}")
+    compact_at_raw = os.environ.get("AGENT_SWITCH_CLAUDE_SUBAGENT_COMPACT_AT")
+    compact_at = float(compact_at_raw) if compact_at_raw else None
     entry = {"id": model, "context_length": window}
-    local_env = _claude_local_env(base, key, entry, headers = headers)
+    local_env = _claude_local_env(base, key, entry, headers = headers, compact_at = compact_at)
     child_env = dict(os.environ)
     settings = os.environ.get(_CLAUDE_SUBAGENT_SETTINGS_ENV)
     settings = _agent_config_path(Path(settings), ["claude"]) if settings else None
