@@ -7,7 +7,7 @@ Out of scope for v1 (stays on `unsloth start`): the hermes, openclaw and dsh age
 How each item was checked:
 
 - **tests**: the ported upstream tests (`tests/test_*.py`) pass.
-- **diff**: `tests/parity/compare_no_launch.py` matches `unsloth start --no-launch` (34/34 cases).
+- **diff**: `tests/parity/compare_no_launch.py` matches `unsloth start --no-launch` (33/34 cases on this host; the harness tolerates up to two expected divergences in the sampling-pin warning wording — the pi one only applies to hosts with pi < 0.84).
 - **live**: run on this Linux host against a real server.
 - **sim**: Windows/WSL behavior, checked only by tests that fake the platform; not run on a real Windows or WSL machine.
 
@@ -15,9 +15,9 @@ How each item was checked:
 
 - [v] Positional `org/name(:variant)` is routed to `--model`; the rest passes through to the agent (tests, diff)
 - [v] `--` separator is preserved when forwarding (`_PassthroughCommand`) (tests, diff)
-- [v] `--model/-m`, `--gguf-variant`, `--max-seq-length/--context-length`, `--load-in-4bit/--no-load-in-4bit`, `--tensor-parallel`, `--gpu-memory-mode` (tests, diff)
-- [v] `--serve/--no-serve` auto-starts `unsloth run` for `--model` when no server is found (tests)
-- [v] `--enable-tools/--disable-tools`, tool-call healing and nudging flags for an auto-started server (tests)
+- [v] `--model/-m`, `--max-seq-length/--context-length` (tests, diff). Divergence: `--gguf-variant`, `--load-in-4bit/--no-load-in-4bit`, `--tensor-parallel` and `--gpu-memory-mode` are removed; attaching loads with the server's defaults plus the `org/name(:variant)` shorthand and `--context-length`
+- [v] Divergence: `--serve/--no-serve` is removed — agent-switch never starts a server (tests)
+- [v] Divergence: `--enable-tools/--disable-tools` and the tool-call healing/nudging flags are removed with auto-start (tests)
 - [v] `--reasoning on|off|auto`, `--reasoning-effort` (tests, diff)
 - [v] Sampling pins: `--temperature`, `--top-p`, `--top-k`, `--min-p`, `--repetition-penalty`, `--presence-penalty` (tests, diff)
 - [v] `--max-tokens` (opencode, pi) (tests, diff)
@@ -31,11 +31,11 @@ How each item was checked:
 ## Unsloth server handling
 
 - [v] Discovery: `UNSLOTH_STUDIO_URL`, loopback candidates, pid records, service marker check (tests, live)
-- [v] Auto-start: port follow, early key marker, download progress, no-progress timeout, teardown on failure, server kept after a good session (tests)
-- [v] Server-wide pins only reach a server this command starts; warnings when attaching (tests, diff)
+- [v] Divergence: no auto-start — `unsloth run` is never spawned; a missing server is reported with hints to start one or point elsewhere (tests)
+- [v] Sampling/reasoning pins the agent cannot send itself are warned and ignored; there is no server-wide pin (tests, diff)
 - [v] API key: explicit, saved per server, identity-verified loopback mint, minted-key replay, remote refusal (tests; shared cache replay live)
-- [v] Model resolution: attach, load with knobs, eviction notices, inferred resident reload, trust_remote_code refusal, already_loaded reuse (tests)
-- [v] GGUF preflight and attach check for claude and codex (tests)
+- [v] Model resolution: attach, load with the `:variant` shorthand and `--context-length`, the `--no-model-load` attach-only gate, eviction notices, inferred resident reload, trust_remote_code refusal, already_loaded reuse (tests)
+- [v] GGUF attach check for claude and codex; the pre-launch preflight went with auto-start (tests)
 - [v] Subagent model id pins the GGUF variant (tests, diff)
 - [v] Memory warning passthrough (tests)
 
@@ -48,7 +48,7 @@ How each item was checked:
 - [v] WSL: Windows shim detection, WSLENV bridging, path translation (tests; sim)
 - [v] Ctrl+C cancels a turn, not the wrapper; signal exit codes become 128+N (tests)
 - [v] Ephemeral session homes: lock, heartbeat, stale reclamation, Windows short home for codex (tests; removal live)
-- [v] Post-session notices (server still running, agent exit code) (tests)
+- [v] Post-session notices (agent exit code) (tests)
 
 ## claude
 
@@ -94,8 +94,8 @@ How each item was checked:
 - [v] Generic OpenAI-compatible server: reported window, else `--context-length` required (tests)
 - [v] Endpoint check: claude needs `/v1/messages`, codex needs `/v1/responses` (tests, live)
 - [v] Request bodies translated per server; unsupported fields warned and dropped (tests)
-- [v] Unsloth-only flags refused for other servers (tests)
-- [v] `--header NAME=VALUE` (repeatable): custom HTTP headers on agent-switch's own requests and on every agent's requests, including the subagent bridges; an `Authorization` header here replaces the built-in Bearer `<api-key>` (tests; claude token precedence and pi header merge verified live on claude 2.1.291 and pi 1.0.4); an Unsloth Studio target carries them too: an `Authorization` header there stands in for `--api-key` (no Studio key is minted), while Studio's own API-key listing, minting and identity check and the auto-start server's progress polls never carry them, and probing for an unnamed server never sends them (tests)
+- [v] `--model-load/--no-model-load` (default on): with `--no-model-load` agent-switch never loads, reloads or unloads a model on any provider — `--model` must already be loaded there (Unsloth attach gate on id/path/variant/settings, Ollama resident ctx-alias attach, llama-server router and LM Studio v1 probes fall back to the server's own precise error) (tests)
+- [v] `--header NAME=VALUE` (repeatable): custom HTTP headers on agent-switch's own requests and on every agent's requests, including the subagent bridges; an `Authorization` header here replaces the built-in Bearer `<api-key>` (tests; claude token precedence and pi header merge verified live on claude 2.1.291 and pi 1.0.4); an Unsloth Studio target carries them too: an `Authorization` header there stands in for `--api-key` (no Studio key is minted), while Studio's own API-key listing, minting and identity check never carry them, and probing for an unnamed server never sends them (tests)
 - [v] All four agents complete a turn on llama-server; the user's own agent config files are unchanged afterwards (live)
 - [v] `--compact-at <fraction, 0.5-0.95>`: scale each agent's auto-compaction trigger off the reported window — Codex `model_auto_compact_token_limit`, OpenCode `compaction.reserved` and Pi `compaction.reserveTokens` take the exact ratio; Claude `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` scales Claude's own effective window and can only lower its built-in trigger; unset keeps each agent's own behavior; ignored with a warning when no window is known, and with `--as-subagent` for OpenCode/Pi (tests)
 

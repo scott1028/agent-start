@@ -15,7 +15,6 @@ import shlex
 import shutil
 import signal
 import sys
-import threading
 import time
 import urllib.error
 import urllib.parse
@@ -1238,7 +1237,7 @@ def test_subagent_model_id_preserves_explicit_variant(monkeypatch):
         lambda *args, **kwargs: pytest.fail("explicit variant should not need status"),
     )
     assert (
-        start._subagent_model_id(BASE, "key", MODEL, MODEL["id"], "UD-Q4_K_XL")
+        start._subagent_model_id(BASE, "key", MODEL, MODEL["id"] + ":UD-Q4_K_XL")
         == MODEL["id"] + ":UD-Q4_K_XL"
     )
 
@@ -1249,7 +1248,7 @@ def test_subagent_model_id_uses_loaded_variant(monkeypatch):
         "_http_json",
         lambda *args, **kwargs: {"is_gguf": True, "gguf_variant": "Q5_K_M"},
     )
-    assert start._subagent_model_id(BASE, "key", MODEL, None, None) == MODEL["id"] + ":Q5_K_M"
+    assert start._subagent_model_id(BASE, "key", MODEL, None) == MODEL["id"] + ":Q5_K_M"
 
 
 def test_subagent_model_id_warns_when_status_unavailable(monkeypatch, capsys):
@@ -1257,7 +1256,7 @@ def test_subagent_model_id_warns_when_status_unavailable(monkeypatch, capsys):
         raise OSError("connection refused")
 
     monkeypatch.setattr(start, "_http_json", raise_error)
-    assert start._subagent_model_id(BASE, "key", MODEL, None, None) == MODEL["id"]
+    assert start._subagent_model_id(BASE, "key", MODEL, None) == MODEL["id"]
     assert "could not verify the loaded GGUF variant" in capsys.readouterr().err
 
 
@@ -2416,7 +2415,9 @@ def test_resolve_model_matches_snapshot_path_by_public_id(monkeypatch):
 
 def test_subagent_model_id_warns_when_a_path_load_cannot_pin_the_quant(capsys):
     """A path is advertised as a bare basename, so the quant cannot be recorded."""
-    model_id = start._subagent_model_id(BASE, "sk-test", {"id": "abc123"}, None, "UD-Q4_K_XL")
+    model_id = start._subagent_model_id(
+        BASE, "sk-test", {"id": "abc123"}, "some/model-dir:UD-Q4_K_XL"
+    )
 
     assert model_id == "abc123"
     assert "cannot pin the UD-Q4_K_XL quant" in capsys.readouterr().err
@@ -2424,7 +2425,8 @@ def test_subagent_model_id_warns_when_a_path_load_cannot_pin_the_quant(capsys):
 
 def test_subagent_model_id_pins_the_quant_for_repo_ids(capsys):
     model_id = start._subagent_model_id(
-        BASE, "sk-test", {"id": "unsloth/gemma-4-E4B-it-GGUF"}, None, "UD-Q4_K_XL"
+        BASE, "sk-test", {"id": "unsloth/gemma-4-E4B-it-GGUF"},
+        "unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL",
     )
 
     assert model_id == "unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL"
@@ -2726,21 +2728,6 @@ def test_opencode_inline_config_omits_permission_without_yolo(fake_studio):
     assert "permission" not in inline
 
 
-def test_https_loopback_never_auto_serves(fake_studio, monkeypatch):
-    # `unsloth run` serves plain HTTP; auto-serving behind an https:// target would poll
-    # the wrong scheme until the startup timeout. Keep the plain "no server" error.
-    monkeypatch.setenv("UNSLOTH_STUDIO_URL", "https://127.0.0.1:8443")
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
-    started = {"called": False}
-    monkeypatch.setattr(
-        start, "_start_studio_server", lambda *a, **k: started.__setitem__("called", True)
-    )
-    result = CliRunner().invoke(start.start_app, ["claude", "--model", "unsloth/Qwen3-1.7B-GGUF"])
-    assert result.exit_code == 1
-    assert "No running Unsloth server" in result.output
-    assert started["called"] is False
-
-
 def test_connect_key_minted_once_then_cached(fake_studio, tmp_path):
     CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
     CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
@@ -2964,20 +2951,16 @@ def test_connect_model_path_failed_same_name_load_reports_eviction(
 
 
 def test_connect_model_flag_forwards_load_options(fake_studio):
-    # The model-load knobs mirrored from `unsloth run` reach /api/inference/load.
+    # The remaining load knobs (variant shorthand + context length) reach /api/inference/load.
     result = CliRunner().invoke(
         start.start_app,
         [
             "claude",
             "--no-launch",
             "--model",
-            "unsloth/Qwen3-4B-GGUF",
-            "--gguf-variant",
-            "UD-Q4_K_XL",
+            "unsloth/Qwen3-4B-GGUF:UD-Q4_K_XL",
             "--context-length",
             "8192",
-            "--no-load-in-4bit",
-            "--tensor-parallel",
         ],
     )
     assert result.exit_code == 0, result.output
@@ -2990,8 +2973,6 @@ def test_connect_model_flag_forwards_load_options(fake_studio):
                 "model_path": "unsloth/Qwen3-4B-GGUF",
                 "gguf_variant": "UD-Q4_K_XL",
                 "max_seq_length": 8192,
-                "load_in_4bit": False,
-                "tensor_parallel": True,
             },
         )
     ]
@@ -3111,273 +3092,6 @@ def test_start_separator_preserves_model_shaped_agent_argument(fake_studio):
     assert command[-2:] == ["--", "--continue"]
 
 
-def test_start_positional_model_routes_to_model_on_auto_serve(fake_studio, monkeypatch):
-    # `unsloth start claude unsloth/Model-GGUF` (no --model): the positional becomes the
-    # model; the GGUF variant is left unset so the server's own quant preference selects it.
-    monkeypatch.setenv("UNSLOTH_STUDIO_URL", "http://127.0.0.1:8888")
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
-    captured = {}
-    fake = SimpleNamespace(pid = 1, poll = lambda: None)
-
-    def fake_start(
-        base,
-        model,
-        load,
-        server_options = None,
-    ):
-        captured["model"] = model
-        captured["load"] = load
-        captured["server_options"] = server_options
-        start._auto_served_server = fake
-        return base, fake
-
-    monkeypatch.setattr(start, "_start_studio_server", fake_start)
-    monkeypatch.setattr(start, "_shutdown_server", lambda server: None)
-    monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/claude")
-    monkeypatch.setattr(start.subprocess, "run", lambda command, env: SimpleNamespace(returncode = 0))
-
-    result = CliRunner().invoke(start.start_app, ["claude", "unsloth/gemma-4-E2B-it-GGUF"])
-    assert result.exit_code == 0, result.output
-    assert captured["model"] == "unsloth/gemma-4-E2B-it-GGUF"
-    assert captured["load"].gguf_variant is None
-
-
-def test_start_local_gguf_path_keeps_no_default_variant(fake_studio, monkeypatch, tmp_path):
-    # A local GGUF dir/path ending in -GGUF must NOT get a forced default quant: the dir
-    # may only hold a different quant, and pre-PR the server picked whatever was available.
-    monkeypatch.setenv("UNSLOTH_STUDIO_URL", "http://127.0.0.1:8888")
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
-    local = tmp_path / "Qwen3-1.7B-GGUF"
-    local.mkdir()
-    captured = {}
-    fake = SimpleNamespace(pid = 1, poll = lambda: None)
-
-    def fake_start(
-        base,
-        model,
-        load,
-        server_options = None,
-    ):
-        captured["load"] = load
-        start._auto_served_server = fake
-        return base, fake
-
-    monkeypatch.setattr(start, "_start_studio_server", fake_start)
-    monkeypatch.setattr(start, "_shutdown_server", lambda server: None)
-    monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/claude")
-    monkeypatch.setattr(start.subprocess, "run", lambda command, env: SimpleNamespace(returncode = 0))
-
-    result = CliRunner().invoke(start.start_app, ["claude", "--model", str(local)])
-    assert result.exit_code == 0, result.output
-    assert captured["load"].gguf_variant is None
-
-
-def test_start_studio_server_forwards_tool_flags_via_command_and_env(monkeypatch):
-    captured = {}
-
-    class FakePopen:
-        def __init__(self, command, **kwargs):
-            captured["command"] = command
-            captured["kwargs"] = kwargs
-            self.pid = 1
-
-        def poll(self):
-            return None
-
-    monkeypatch.setattr(start.subprocess, "Popen", FakePopen)
-    monkeypatch.setattr(start, "_studio_healthy", lambda base, timeout = 3.0: True)
-    monkeypatch.setattr(start, "_log_tail", lambda path, lines = 20: "API Key: sk-unsloth-x")
-    monkeypatch.setattr(start.time, "sleep", lambda _s: None)
-    # No inherited kill switches, so the omitted-flag default applies.
-    monkeypatch.delenv("UNSLOTH_DISABLE_TOOL_CALL_HEALING", raising = False)
-    monkeypatch.delenv("UNSLOTH_TOOL_CALL_NUDGE", raising = False)
-
-    # Default start: tools off (passthrough), model-template reasoning, healing + nudging on.
-    start._start_studio_server("http://127.0.0.1:8888", "unsloth/M-GGUF", start.LoadOptions())
-    cmd, env = captured["command"], captured["kwargs"]["env"]
-    assert "--disable-tools" in cmd and "--enable-tools" not in cmd
-    assert "--reasoning" not in cmd
-    assert env["LLAMA_ARG_REASONING"] == "auto"
-    assert "--gpu-memory-mode" not in cmd
-    assert env["UNSLOTH_DISABLE_TOOL_CALL_HEALING"] == "0"
-    assert env["UNSLOTH_TOOL_CALL_NUDGE"] == "1"
-
-    # Flipped: tools on, healing off, nudging off.
-    start._start_studio_server(
-        "http://127.0.0.1:8888",
-        "unsloth/M-GGUF",
-        start.LoadOptions(),
-        start.ServerOptions(
-            enable_tools = True,
-            tool_call_healing = False,
-            tool_call_nudging = False,
-            reasoning = "auto",
-        ),
-    )
-    cmd, env = captured["command"], captured["kwargs"]["env"]
-    assert "--enable-tools" in cmd and "--disable-tools" not in cmd
-    assert "--reasoning" not in cmd
-    assert env["LLAMA_ARG_REASONING"] == "auto"
-    # Unset: the template's own level, and an inherited pin cannot survive.
-    assert env["LLAMA_ARG_REASONING_EFFORT"] == "default"
-    assert env["UNSLOTH_DISABLE_TOOL_CALL_HEALING"] == "1"
-    assert env["UNSLOTH_TOOL_CALL_NUDGE"] == "0"
-
-
-def test_start_studio_server_respects_inherited_tool_call_env(monkeypatch):
-    # With the flags omitted, an operator's pre-exported kill switch must survive into the
-    # child server instead of being overwritten with the start defaults.
-    captured = {}
-
-    class FakePopen:
-        def __init__(self, command, **kwargs):
-            captured["kwargs"] = kwargs
-            self.pid = 1
-
-        def poll(self):
-            return None
-
-    monkeypatch.setattr(start.subprocess, "Popen", FakePopen)
-    monkeypatch.setattr(start, "_studio_healthy", lambda base, timeout = 3.0: True)
-    monkeypatch.setattr(start, "_log_tail", lambda path, lines = 20: "API Key: sk-unsloth-x")
-    monkeypatch.setattr(start.time, "sleep", lambda _s: None)
-    monkeypatch.setenv("UNSLOTH_DISABLE_TOOL_CALL_HEALING", "1")
-    monkeypatch.setenv("UNSLOTH_TOOL_CALL_NUDGE", "0")
-
-    # Flags omitted -> inherited values are preserved.
-    start._start_studio_server("http://127.0.0.1:8888", "unsloth/M-GGUF", start.LoadOptions())
-    env = captured["kwargs"]["env"]
-    assert env["UNSLOTH_DISABLE_TOOL_CALL_HEALING"] == "1"
-    assert env["UNSLOTH_TOOL_CALL_NUDGE"] == "0"
-
-    # An explicit flag still overrides the inherited env.
-    start._start_studio_server(
-        "http://127.0.0.1:8888",
-        "unsloth/M-GGUF",
-        start.LoadOptions(),
-        start.ServerOptions(tool_call_healing = True, tool_call_nudging = True),
-    )
-    env = captured["kwargs"]["env"]
-    assert env["UNSLOTH_DISABLE_TOOL_CALL_HEALING"] == "0"
-    assert env["UNSLOTH_TOOL_CALL_NUDGE"] == "1"
-
-
-def test_start_studio_server_drops_an_inherited_pin_the_agent_overrides(monkeypatch):
-    captured = {}
-
-    class FakePopen:
-        def __init__(self, command, **kwargs):
-            captured["env"] = kwargs["env"]
-            self.pid = 1
-
-        def poll(self):
-            return None
-
-    monkeypatch.setattr(start.subprocess, "Popen", FakePopen)
-    monkeypatch.setattr(start, "_studio_healthy", lambda base, timeout = 3.0: True)
-    monkeypatch.setattr(start, "_log_tail", lambda path, lines = 20: "API Key: sk-unsloth-x")
-    monkeypatch.setattr(start.time, "sleep", lambda _s: None)
-    monkeypatch.setenv("UNSLOTH_SAMPLING_TEMPERATURE", "0.7")
-    monkeypatch.setenv("UNSLOTH_SAMPLING_TOP_P", "0.5")
-    start._start_studio_server(
-        "http://127.0.0.1:8888",
-        "unsloth/M-GGUF",
-        start.LoadOptions(),
-        start.ServerOptions(unpinned = frozenset({"temperature"})),
-    )
-    assert "UNSLOTH_SAMPLING_TEMPERATURE" not in captured["env"]
-    assert captured["env"]["UNSLOTH_SAMPLING_TOP_P"] == "0.5"
-
-
-def test_start_studio_server_forwards_sampling_via_env(monkeypatch):
-    # Sampling pins ride to the child server through UNSLOTH_SAMPLING_*; unset ones stay absent
-    # so the backend keeps the per-model recommendation.
-    captured = {}
-
-    class FakePopen:
-        def __init__(self, command, **kwargs):
-            captured["kwargs"] = kwargs
-            self.pid = 1
-
-        def poll(self):
-            return None
-
-    monkeypatch.setattr(start.subprocess, "Popen", FakePopen)
-    monkeypatch.setattr(start, "_studio_healthy", lambda base, timeout = 3.0: True)
-    monkeypatch.setattr(start, "_log_tail", lambda path, lines = 20: "API Key: sk-unsloth-x")
-    monkeypatch.setattr(start.time, "sleep", lambda _s: None)
-    for _v in ("TEMPERATURE", "TOP_P", "TOP_K", "MIN_P", "REPETITION_PENALTY", "PRESENCE_PENALTY"):
-        monkeypatch.delenv(f"UNSLOTH_SAMPLING_{_v}", raising = False)
-
-    # No sampling flags -> nothing forwarded.
-    start._start_studio_server("http://127.0.0.1:8888", "unsloth/M-GGUF", start.LoadOptions())
-    env = captured["kwargs"]["env"]
-    assert not any(k.startswith("UNSLOTH_SAMPLING_") for k in env)
-
-    # Pins are forwarded; unset ones stay absent.
-    start._start_studio_server(
-        "http://127.0.0.1:8888",
-        "unsloth/M-GGUF",
-        start.LoadOptions(),
-        start.ServerOptions(temperature = 0.3, top_k = 40, min_p = 0.05),
-    )
-    env = captured["kwargs"]["env"]
-    assert env["UNSLOTH_SAMPLING_TEMPERATURE"] == "0.3"
-    assert env["UNSLOTH_SAMPLING_TOP_K"] == "40"
-    assert env["UNSLOTH_SAMPLING_MIN_P"] == "0.05"
-    assert "UNSLOTH_SAMPLING_TOP_P" not in env
-
-
-def test_require_studio_warns_on_sampling_pin_when_reusing_server(monkeypatch, capsys):
-    # Attaching to an already-running server can't apply UNSLOTH_SAMPLING_* pins (only
-    # _start_studio_server forwards them), so a sampling flag on the attach path must warn
-    # instead of being silently dropped while the command "succeeds".
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: BASE)
-    base, server = start._require_studio(
-        "unsloth/M-GGUF",
-        start.LoadOptions(),
-        serve = True,
-        launch = True,
-        server_options = start.ServerOptions(temperature = 0.3, top_k = 40),
-    )
-    assert base == BASE
-    assert server is None  # attach path: we did not start the server
-    err = capsys.readouterr().err
-    assert "already running" in err
-    assert "--temperature" in err and "--top-k" in err
-    # Only the pinned fields are named; an unset one is not.
-    assert "--top-p" not in err
-
-
-def test_require_studio_no_warning_without_server_flags(monkeypatch, capsys):
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: BASE)
-    base, server = start._require_studio(
-        "unsloth/M-GGUF",
-        start.LoadOptions(),
-        serve = True,
-        server_options = start.ServerOptions(),
-    )
-    assert base == BASE and server is None
-    assert capsys.readouterr().err == ""
-
-
-def test_require_studio_warns_on_tool_flags_when_reusing_server(monkeypatch, capsys):
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: BASE)
-    base, server = start._require_studio(
-        "unsloth/M-GGUF",
-        start.LoadOptions(),
-        serve = True,
-        server_options = start.ServerOptions(
-            enable_tools = True, tool_call_healing = False, tool_call_nudging = None
-        ),
-    )
-    assert base == BASE and server is None
-    err = capsys.readouterr().err
-    assert "already running" in err
-    assert "--enable-tools" in err and "--disable-tool-call-healing" in err
-    assert "nudging" not in err
-
-
 _SESSION_FLAGS = ["--temperature", "0.3", "--top-k", "40", "--reasoning", "off"]
 _SESSION_BODY = {"temperature": 0.3, "top_k": 40, "enable_thinking": False}
 
@@ -3480,7 +3194,7 @@ def test_codex_carries_reasoning_and_warns_about_sampling(fake_studio, tmp_path,
     assert result.exit_code == 0, result.output
     profile = (tmp_path / "agents" / "codex" / f"{start._CODEX_PROFILE}.config.toml").read_text()
     assert 'model_reasoning_effort = "none"' in profile
-    assert "cannot send --temperature, --top-k itself" in result.output
+    assert "can't send --temperature, --top-k itself" in result.output
     assert "--reasoning" not in result.output
     result = CliRunner().invoke(start.start_app, ["codex", "--no-launch"])
     assert result.exit_code == 0, result.output
@@ -3492,14 +3206,14 @@ def test_codex_warns_about_reasoning_it_cannot_express(fake_studio, tmp_path, mo
     monkeypatch.chdir(tmp_path)
     result = CliRunner().invoke(start.start_app, ["codex", "--no-launch", "--reasoning", "on"])
     assert result.exit_code == 0, result.output
-    assert "cannot send --reasoning on itself" in result.output
+    assert "can't send --reasoning itself" in result.output
     profile = (tmp_path / "agents" / "codex" / f"{start._CODEX_PROFILE}.config.toml").read_text()
     assert "model_reasoning_effort" not in profile
 
 
 @pytest.mark.parametrize("mode", ["--persist", "--no-launch"])
 @pytest.mark.parametrize("agent, version", [("codex", (0, 144, 0)), ("pi", (0, 83, 0))])
-def test_agent_too_old_to_send_the_flags_keeps_the_server_pin(
+def test_agent_too_old_to_send_the_flags_warns_and_ignores(
     agent, version, mode, fake_studio, tmp_path, monkeypatch
 ):
     monkeypatch.chdir(tmp_path)
@@ -3508,8 +3222,7 @@ def test_agent_too_old_to_send_the_flags_keeps_the_server_pin(
     monkeypatch.setattr(start, "_launch", lambda *args, **kwargs: None)
     result = CliRunner().invoke(start.start_app, [agent, mode, *_SESSION_FLAGS])
     assert result.exit_code == 0, result.output
-    assert "cannot send --temperature, --top-k itself" in result.output
-    assert "cannot send --reasoning off itself" in result.output
+    assert "can't send --temperature, --top-k, --reasoning itself" in result.output
     if agent == "pi":
         models = tmp_path / "agents" / "pi" / ".pi" / "agent" / "models.json"
         provider = json.loads(models.read_text())["providers"]["agent-switch"]
@@ -3533,221 +3246,6 @@ def test_opencode_v1_reads_the_effort_as_reasoning_effort_option(
     provider = provider["provider"][start._OPENCODE_PROVIDER]
     assert provider["models"][MODEL["id"]]["options"] == {"reasoningEffort": "low"}
     assert provider["options"]["body"] == {"reasoning_effort": "low"}
-
-
-@pytest.mark.parametrize(
-    "agent, server_keeps",
-    [("pi", {}), ("codex", {"temperature": 0.3, "top_k": 40})],
-)
-def test_spawned_server_keeps_only_what_the_agent_cannot_send(
-    agent, server_keeps, fake_studio, monkeypatch
-):
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
-    started = {}
-    fake = SimpleNamespace(pid = 999, poll = lambda: None)
-
-    def fake_start(
-        base,
-        model,
-        load,
-        server_options = None,
-    ):
-        started["options"] = server_options
-        start._auto_served_server = fake
-        return base, fake
-
-    monkeypatch.setattr(start, "_start_studio_server", fake_start)
-    monkeypatch.setattr(start, "_shutdown_server", lambda server: None)
-    monkeypatch.setattr(start.shutil, "which", lambda _: f"/usr/local/bin/{agent}")
-    monkeypatch.setattr(start, "_codex_executable_version", lambda executable: (1, 0, 0))
-    monkeypatch.setattr(start.subprocess, "run", lambda command, env: SimpleNamespace(returncode = 0))
-    result = CliRunner().invoke(
-        start.start_app, [agent, "--model", "unsloth/Qwen3-1.7B-GGUF", *_SESSION_FLAGS]
-    )
-    assert result.exit_code == 0, result.output
-    options = started["options"]
-    sampling = {name: getattr(options, name) for name in ("temperature", "top_k")}
-    assert {k: v for k, v in sampling.items() if v is not None} == server_keeps
-    assert options.reasoning is None
-    assert options.unpinned == {"reasoning", *({"temperature", "top_k"} - set(server_keeps))}
-    assert ("applies them to every client" in result.output) == bool(server_keeps)
-
-
-@pytest.mark.parametrize("reasoning, warns", [("on", True), ("auto", False)])
-def test_require_studio_warns_when_the_started_server_pins_reasoning(
-    monkeypatch, capsys, reasoning, warns
-):
-    monkeypatch.setenv("UNSLOTH_STUDIO_URL", "http://127.0.0.1:8888")
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
-    monkeypatch.setattr(
-        start, "_start_studio_server", lambda base, model, load, server: (base, None)
-    )
-    start._require_studio(
-        "unsloth/M-GGUF", serve = True, server_options = start.ServerOptions(reasoning = reasoning)
-    )
-    assert ("every client" in capsys.readouterr().err) is warns
-
-
-@pytest.mark.parametrize("inherited", ["0.7", None])
-def test_require_studio_warns_when_a_flag_drops_an_inherited_pin(monkeypatch, capsys, inherited):
-    monkeypatch.setenv("UNSLOTH_STUDIO_URL", "http://127.0.0.1:8888")
-    if inherited:
-        monkeypatch.setenv("UNSLOTH_SAMPLING_TEMPERATURE", inherited)
-    else:
-        monkeypatch.delenv("UNSLOTH_SAMPLING_TEMPERATURE", raising = False)
-    monkeypatch.setenv("UNSLOTH_SAMPLING_TOP_P", "0.5")
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
-    monkeypatch.setattr(
-        start, "_start_studio_server", lambda base, model, load, server: (base, None)
-    )
-    options = start.ServerOptions(temperature = 0.3, carried = frozenset({"temperature"}))
-    start._require_studio("unsloth/M-GGUF", serve = True, server_options = options)
-    err = capsys.readouterr().err
-    assert ("replace the inherited UNSLOTH_SAMPLING_TEMPERATURE" in err) is bool(inherited)
-    assert "UNSLOTH_SAMPLING_TOP_P" not in err
-
-
-@pytest.mark.parametrize(
-    "reasoning, carried",
-    [
-        ("on", frozenset()),
-        ("off", frozenset()),
-        ("auto", frozenset()),
-        ("auto", start._ALL_REQUEST_FIELDS),
-    ],
-)
-def test_require_studio_warns_on_explicit_reasoning_when_reusing_server(
-    monkeypatch, capsys, reasoning, carried
-):
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: BASE)
-    base, server = start._require_studio(
-        "unsloth/M-GGUF",
-        start.LoadOptions(),
-        serve = True,
-        server_options = start.ServerOptions(reasoning = reasoning, carried = carried),
-    )
-    assert base == BASE and server is None
-    err = capsys.readouterr().err
-    assert "already running" in err
-    assert f"--reasoning {reasoning}" in err
-    assert "unsloth studio stop" in err
-
-
-def test_start_studio_server_forwards_reasoning_effort(monkeypatch):
-    # The level reaches llama-server through its documented env var, so an older
-    # managed build ignores it instead of failing on an unknown flag.
-    captured = {}
-
-    class FakePopen:
-        def __init__(self, command, **kwargs):
-            captured["kwargs"] = kwargs
-            self.pid = 1
-
-        def poll(self):
-            return None
-
-    monkeypatch.setattr(start.subprocess, "Popen", FakePopen)
-    monkeypatch.setattr(start, "_studio_healthy", lambda base, timeout = 3.0: True)
-    monkeypatch.setattr(start, "_log_tail", lambda path, lines = 20: "API Key: sk-unsloth-x")
-    monkeypatch.setattr(start.time, "sleep", lambda _s: None)
-
-    start._start_studio_server(
-        "http://127.0.0.1:8888",
-        "unsloth/M-GGUF",
-        start.LoadOptions(),
-        start.ServerOptions(reasoning_effort = "medium"),
-    )
-    env = captured["kwargs"]["env"]
-    assert env["LLAMA_ARG_REASONING"] == "auto"
-    assert env["LLAMA_ARG_REASONING_EFFORT"] == "medium"
-
-
-def test_start_studio_server_overrides_inherited_reasoning_effort(monkeypatch):
-    # A level exported for some earlier llama-server run must not silently pin a
-    # server started without the flag.
-    monkeypatch.setenv("LLAMA_ARG_REASONING_EFFORT", "high")
-    captured = {}
-
-    class FakePopen:
-        def __init__(self, command, **kwargs):
-            captured["kwargs"] = kwargs
-            self.pid = 1
-
-        def poll(self):
-            return None
-
-    monkeypatch.setattr(start.subprocess, "Popen", FakePopen)
-    monkeypatch.setattr(start, "_studio_healthy", lambda base, timeout = 3.0: True)
-    monkeypatch.setattr(start, "_log_tail", lambda path, lines = 20: "API Key: sk-unsloth-x")
-    monkeypatch.setattr(start.time, "sleep", lambda _s: None)
-
-    start._start_studio_server("http://127.0.0.1:8888", "unsloth/M-GGUF", start.LoadOptions())
-    assert captured["kwargs"]["env"]["LLAMA_ARG_REASONING_EFFORT"] == "default"
-
-
-def test_require_studio_warns_on_explicit_reasoning_effort_when_reusing_server(monkeypatch, capsys):
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: BASE)
-    base, server = start._require_studio(
-        "unsloth/M-GGUF",
-        start.LoadOptions(),
-        serve = True,
-        server_options = start.ServerOptions(reasoning = "on", reasoning_effort = "high"),
-    )
-    assert base == BASE and server is None
-    err = capsys.readouterr().err
-    # Both pins are named, so neither looks like it took.
-    assert "--reasoning on" in err and "--reasoning-effort high" in err
-    assert "unsloth studio stop" in err
-
-
-def test_start_claude_sends_sampling_flags_itself(fake_studio, monkeypatch):
-    # Claude sends the flags itself, so the server it starts is left at its defaults.
-    monkeypatch.setenv("UNSLOTH_STUDIO_URL", "http://127.0.0.1:8888")
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
-    captured = {}
-    fake = SimpleNamespace(pid = 1, poll = lambda: None)
-
-    def fake_start(
-        base,
-        model,
-        load,
-        server_options = None,
-    ):
-        captured["server_options"] = server_options
-        start._auto_served_server = fake
-        return base, fake
-
-    monkeypatch.setattr(start, "_start_studio_server", fake_start)
-    monkeypatch.setattr(start, "_shutdown_server", lambda server: None)
-    monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/claude")
-    monkeypatch.setattr(
-        start.subprocess,
-        "run",
-        lambda command, env: captured.update(env = env) or SimpleNamespace(returncode = 0),
-    )
-
-    result = CliRunner().invoke(
-        start.start_app,
-        [
-            "claude",
-            "--model",
-            "unsloth/gemma-4-E2B-it-GGUF",
-            "--temperature",
-            "0.3",
-            "--top-k",
-            "40",
-            "--reasoning",
-            "on",
-        ],
-    )
-    assert result.exit_code == 0, result.output
-    so = captured["server_options"]
-    assert so.temperature is None and so.top_k is None and so.reasoning is None
-    assert json.loads(captured["env"]["CLAUDE_CODE_EXTRA_BODY"]) == {
-        "temperature": 0.3,
-        "top_k": 40,
-        "enable_thinking": True,
-    }
 
 
 def test_connect_model_bare_id_matches_loaded_without_reload(fake_studio):
@@ -3783,71 +3281,276 @@ def test_connect_model_variant_suffix_defers_to_server_dedup(fake_studio):
     _assert_env_set(result.output, "ANTHROPIC_MODEL", MODEL["id"])
 
 
-def test_connect_load_knobs_reach_server_even_when_id_loaded(fake_studio):
-    # /v1/models can't reveal the active quant, so an id match alone would silently keep
-    # the wrong variant loaded. Explicit knobs must always consult the load endpoint.
+def _status_with(monkeypatch, **fields):
+    # The fake status lacks the runtime fields the --no-model-load gate compares; layer them on.
+    inner = start._http_json
+
+    def http_json(
+        method,
+        url,
+        token,
+        payload = None,
+        timeout = 30,
+        error = None,
+        *,
+        internal_auth = False,
+    ):
+        if url.endswith("/api/inference/status"):
+            return {
+                "is_gguf": True,
+                "model_identifier": MODEL["id"],
+                "active_model": MODEL["id"],
+                **fields,
+            }
+        return inner(method, url, token, payload, timeout, error)
+
+    monkeypatch.setattr(start, "_http_json", http_json)
+
+
+def _no_load_requests(fake_studio):
+    return [c for c in fake_studio if c[1].endswith("/api/inference/load")]
+
+
+def test_no_model_load_keeps_the_default_resident_selection(fake_studio):
+    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch", "--no-model-load"])
+    assert result.exit_code == 0, result.output
+    _assert_env_set(result.output, "ANTHROPIC_MODEL", MODEL["id"])
+    assert _no_load_requests(fake_studio) == []
+
+
+def test_no_model_load_attaches_a_loaded_model(fake_studio):
     result = CliRunner().invoke(
-        start.start_app,
-        ["claude", "--no-launch", "--model", MODEL["id"], "--gguf-variant", "Q8_0"],
+        start.start_app, ["claude", "--no-launch", "--no-model-load", "--model", MODEL["id"]]
     )
     assert result.exit_code == 0, result.output
-    loads = [c for c in fake_studio if c[1].endswith("/api/inference/load")]
-    assert loads == [
-        ("POST", f"{BASE}/api/inference/load", {"model_path": MODEL["id"], "gguf_variant": "Q8_0"})
-    ]
+    assert f"Reusing loaded model: {MODEL['id']}" in result.output
+    assert _no_load_requests(fake_studio) == []
 
 
-@pytest.mark.parametrize(
-    "command_name", ["claude", "codex", "opencode", "pi"]
-)
-def test_start_agents_expose_gpu_memory_mode_option(command_name):
-    import inspect
-
-    command = getattr(start, command_name)
-    opt = inspect.signature(command).parameters["gpu_memory_mode"].default
-    assert set(getattr(opt, "param_decls", None) or []) == {"--gpu-memory-mode"}
-    assert getattr(opt, "default", None) is None
-    assert getattr(opt, "rich_help_panel", None) == start._PANEL_MODEL
+def test_no_model_load_refuses_an_unloaded_model_and_lists_candidates(fake_studio):
+    result = CliRunner().invoke(
+        start.start_app,
+        ["claude", "--no-launch", "--no-model-load", "--model", "unsloth/Qwen3-4B-GGUF"],
+    )
+    assert result.exit_code == 1
+    assert "--no-model-load" in result.output
+    assert MODEL["id"] in result.output
+    assert _no_load_requests(fake_studio) == []
 
 
-@pytest.mark.parametrize(
-    "mode,expected",
-    [
-        ("auto", {"model_path": MODEL["id"], "gpu_memory_mode": "auto"}),
-        (
-            "manual",
-            {
-                "model_path": MODEL["id"],
-                "gpu_memory_mode": "manual",
-                "gpu_layers": -1,
-            },
-        ),
-    ],
-)
-def test_start_gpu_memory_mode_reaches_running_server(fake_studio, mode, expected):
+def test_no_model_load_attaches_a_matching_resident_variant(fake_studio, monkeypatch):
+    _status_with(monkeypatch, gguf_variant = "UD-Q4_K_XL")
+    result = CliRunner().invoke(
+        start.start_app,
+        ["claude", "--no-launch", "--no-model-load", "--model", MODEL["id"] + ":UD-Q4_K_XL"],
+    )
+    assert result.exit_code == 0, result.output
+    assert _no_load_requests(fake_studio) == []
+
+
+def test_no_model_load_refuses_a_different_resident_variant(fake_studio, monkeypatch):
+    _status_with(monkeypatch, gguf_variant = "UD-Q4_K_XL")
+    result = CliRunner().invoke(
+        start.start_app,
+        ["claude", "--no-launch", "--no-model-load", "--model", MODEL["id"] + ":Q8_0"],
+    )
+    assert result.exit_code == 1
+    assert "--no-model-load" in result.output
+    assert _no_load_requests(fake_studio) == []
+
+
+def test_no_model_load_attaches_a_matching_context_length(fake_studio, monkeypatch):
+    _status_with(monkeypatch, requested_context_length = 8192)
     result = CliRunner().invoke(
         start.start_app,
         [
             "claude",
             "--no-launch",
+            "--no-model-load",
             "--model",
             MODEL["id"],
-            "--gpu-memory-mode",
-            mode,
+            "--context-length",
+            "8192",
         ],
     )
     assert result.exit_code == 0, result.output
-    loads = [call for call in fake_studio if call[1].endswith("/api/inference/load")]
-    assert loads == [("POST", f"{BASE}/api/inference/load", expected)]
+    assert _no_load_requests(fake_studio) == []
 
 
-def test_start_rejects_invalid_gpu_memory_mode(fake_studio):
+def test_no_model_load_refuses_a_mismatched_context_length(fake_studio, monkeypatch):
+    _status_with(monkeypatch, requested_context_length = 4096)
     result = CliRunner().invoke(
         start.start_app,
-        ["claude", "--no-launch", "--gpu-memory-mode", "invalid"],
+        [
+            "claude",
+            "--no-launch",
+            "--no-model-load",
+            "--model",
+            MODEL["id"],
+            "--context-length",
+            "8192",
+        ],
     )
-    assert result.exit_code != 0
-    assert "Invalid value for '--gpu-memory-mode'" in result.output
+    assert result.exit_code == 1
+    assert "--no-model-load" in result.output
+    assert _no_load_requests(fake_studio) == []
+
+
+def test_no_model_load_gates_the_inferred_settings_reload(fake_studio, monkeypatch):
+    # No --model but a knob: the resident is inferred as the target, and a settings
+    # mismatch that would reload is refused instead.
+    _status_with(monkeypatch, requested_context_length = 4096)
+    result = CliRunner().invoke(
+        start.start_app,
+        ["claude", "--no-launch", "--no-model-load", "--context-length", "8192"],
+    )
+    assert result.exit_code == 1
+    assert "--no-model-load" in result.output
+    assert _no_load_requests(fake_studio) == []
+
+
+def test_no_model_load_attaches_inferred_matching_settings(fake_studio, monkeypatch):
+    # The inferred resident already runs with the requested settings, so the gate attaches.
+    _status_with(monkeypatch, requested_context_length = 8192)
+    result = CliRunner().invoke(
+        start.start_app,
+        ["claude", "--no-launch", "--no-model-load", "--context-length", "8192"],
+    )
+    assert result.exit_code == 0, result.output
+    assert _no_load_requests(fake_studio) == []
+
+
+def test_no_model_load_attaches_a_resident_path(fake_studio, monkeypatch, tmp_path):
+    # A path load is listed by basename only; status proves which path the resident came from.
+    resident = tmp_path / "models" / "foo-Q4_K_M.gguf"
+    resident.parent.mkdir()
+    resident.write_bytes(b"GGUF")
+    inner = start._http_json
+
+    def http_json(
+        method,
+        url,
+        token,
+        payload = None,
+        timeout = 30,
+        error = None,
+        *,
+        internal_auth = False,
+    ):
+        if url.endswith("/api/inference/loaded-models"):
+            return {"object": "list", "data": [{"id": "foo-Q4_K_M", "loaded": True}]}
+        if url.endswith("/api/inference/status"):
+            return {"is_gguf": True, "model_identifier": os.fspath(resident)}
+        return inner(method, url, token, payload, timeout, error)
+
+    monkeypatch.setattr(start, "_http_json", http_json)
+    result = CliRunner().invoke(
+        start.start_app,
+        ["claude", "--no-launch", "--no-model-load", "--model", os.fspath(resident)],
+    )
+    assert result.exit_code == 0, result.output
+    assert _no_load_requests(fake_studio) == []
+
+
+def test_no_model_load_refuses_a_different_resident_path(fake_studio, monkeypatch, tmp_path):
+    # The listing shows only the basename; status proves the resident came from ANOTHER path,
+    # so the same-named request must be refused rather than attached.
+    old = tmp_path / "old" / "foo-Q4_K_M.gguf"
+    old.parent.mkdir()
+    old.write_bytes(b"GGUF")
+    new = tmp_path / "new" / "foo-Q4_K_M.gguf"
+    new.parent.mkdir()
+    new.write_bytes(b"GGUF")
+    inner = start._http_json
+
+    def http_json(
+        method,
+        url,
+        token,
+        payload = None,
+        timeout = 30,
+        error = None,
+        *,
+        internal_auth = False,
+    ):
+        if url.endswith("/api/inference/loaded-models"):
+            return {"object": "list", "data": [{"id": "foo-Q4_K_M", "loaded": True}]}
+        if url.endswith("/api/inference/status"):
+            return {"is_gguf": True, "model_identifier": os.fspath(old)}
+        return inner(method, url, token, payload, timeout, error)
+
+    monkeypatch.setattr(start, "_http_json", http_json)
+    result = CliRunner().invoke(
+        start.start_app,
+        ["claude", "--no-launch", "--no-model-load", "--model", os.fspath(new)],
+    )
+    assert result.exit_code == 1
+    assert "--no-model-load" in result.output
+    assert _no_load_requests(fake_studio) == []
+
+
+def test_no_model_load_refuses_a_loaded_but_inactive_model(fake_studio, monkeypatch):
+    # Status describes the ACTIVE chat model; another resident entry's settings cannot be
+    # proven from it, so an entry that is loaded but not active is refused, not attached.
+    inner = start._http_json
+
+    def http_json(
+        method,
+        url,
+        token,
+        payload = None,
+        timeout = 30,
+        error = None,
+        *,
+        internal_auth = False,
+    ):
+        if url.endswith("/api/inference/loaded-models"):
+            return {"object": "list", "data": [MODEL, {"id": "unsloth/other-GGUF", "loaded": True}]}
+        if url.endswith("/api/inference/status"):
+            return {
+                "is_gguf": True,
+                "active_model": "unsloth/other-GGUF",
+                "model_identifier": "unsloth/other-GGUF",
+                "gguf_variant": "Q4_K_M",
+            }
+        return inner(method, url, token, payload, timeout, error)
+
+    monkeypatch.setattr(start, "_http_json", http_json)
+    result = CliRunner().invoke(
+        start.start_app,
+        ["claude", "--no-launch", "--no-model-load", "--model", MODEL["id"] + ":Q4_K_M"],
+    )
+    assert result.exit_code == 1
+    assert "--no-model-load" in result.output
+    assert _no_load_requests(fake_studio) == []
+
+
+def test_no_model_load_refuses_when_status_is_unavailable(fake_studio, monkeypatch):
+    # Without status the server cannot prove the settings match, even for a listed resident.
+    inner = start._http_json
+
+    def http_json(
+        method,
+        url,
+        token,
+        payload = None,
+        timeout = 30,
+        error = None,
+        *,
+        internal_auth = False,
+    ):
+        if url.endswith("/api/inference/status"):
+            return {}
+        return inner(method, url, token, payload, timeout, error)
+
+    monkeypatch.setattr(start, "_http_json", http_json)
+    result = CliRunner().invoke(
+        start.start_app,
+        ["claude", "--no-launch", "--no-model-load", "--model", MODEL["id"] + ":Q4_K_M"],
+    )
+    assert result.exit_code == 1
+    assert "--no-model-load" in result.output
+    assert _no_load_requests(fake_studio) == []
 
 
 def test_connect_model_variant_suffix_loads_split_repo(fake_studio):
@@ -3856,31 +3559,6 @@ def test_connect_model_variant_suffix_loads_split_repo(fake_studio):
     result = CliRunner().invoke(
         start.start_app,
         ["claude", "--no-launch", "--model", "unsloth/Qwen3-4B-GGUF:UD-Q4_K_XL"],
-    )
-    assert result.exit_code == 0, result.output
-    loads = [c for c in fake_studio if c[1].endswith("/api/inference/load")]
-    assert loads == [
-        (
-            "POST",
-            f"{BASE}/api/inference/load",
-            {"model_path": "unsloth/Qwen3-4B-GGUF", "gguf_variant": "UD-Q4_K_XL"},
-        )
-    ]
-
-
-def test_connect_explicit_gguf_variant_wins_over_suffix(fake_studio):
-    # An explicit --gguf-variant takes precedence; the suffix is still stripped so the
-    # repo id stays valid.
-    result = CliRunner().invoke(
-        start.start_app,
-        [
-            "claude",
-            "--no-launch",
-            "--model",
-            "unsloth/Qwen3-4B-GGUF:Q8_0",
-            "--gguf-variant",
-            "UD-Q4_K_XL",
-        ],
     )
     assert result.exit_code == 0, result.output
     loads = [c for c in fake_studio if c[1].endswith("/api/inference/load")]
@@ -4088,235 +3766,6 @@ def _reset_auto_served():
     # otherwise try to signal it at interpreter shutdown).
     yield
     start._auto_served_server = None
-
-
-def test_start_studio_server_builds_command_and_waits(monkeypatch, capsys):
-    captured = {}
-    monkeypatch.setenv(start._START_API_KEY_MARKER_ENV, "parent")
-
-    class FakePopen:
-        def __init__(self, command, **kwargs):
-            captured["command"] = command
-            captured["kwargs"] = kwargs
-            self.pid = 4321
-
-        def poll(self):
-            return None
-
-    monkeypatch.setattr(start.subprocess, "Popen", FakePopen)
-    monkeypatch.setattr(start, "_studio_healthy", lambda base, timeout = 3.0: True)
-    monkeypatch.setattr(start, "_log_tail", lambda path, lines = 20: "API Key: sk-unsloth-abc123")
-    monkeypatch.setattr(start.time, "sleep", lambda _s: None)
-
-    returned_base, server = start._start_studio_server(
-        "http://127.0.0.1:8888",
-        "unsloth/Qwen3-1.7B-GGUF:UD-Q4_K_XL",
-        start.LoadOptions(
-            gguf_variant = "UD-Q4_K_XL",
-            max_seq_length = 8192,
-            load_in_4bit = True,
-            tensor_parallel = True,
-            gpu_memory_mode = "manual",
-        ),
-    )
-    cmd = captured["command"]
-    assert cmd[1] == "run"
-    assert "--disable-tools" in cmd and "--no-cloudflare" in cmd
-    assert "--reasoning" not in cmd
-    assert captured["kwargs"]["env"]["LLAMA_ARG_REASONING"] == "auto"
-    assert cmd[cmd.index("--model") + 1] == "unsloth/Qwen3-1.7B-GGUF:UD-Q4_K_XL"
-    assert cmd[cmd.index("--gguf-variant") + 1] == "UD-Q4_K_XL"
-    assert cmd[cmd.index("--context-length") + 1] == "8192"
-    assert "--tensor-parallel" in cmd
-    assert cmd[cmd.index("--gpu-memory-mode") + 1] == "manual"
-    assert "--start-api-key-marker" not in cmd
-    assert captured["kwargs"]["env"][start._START_API_KEY_MARKER_ENV] == "1"
-    assert start.os.environ[start._START_API_KEY_MARKER_ENV] == "parent"
-    assert cmd[cmd.index("-p") + 1] == "8888"
-    assert returned_base == "http://127.0.0.1:8888"
-    assert start.LoadOptions().load_in_4bit is True and "--no-load-in-4bit" not in cmd
-    assert captured["kwargs"].get("start_new_session") is True  # own process group
-    assert server.pid == 4321
-    output = capsys.readouterr().out
-    assert "Starting Unsloth server\n" in output
-    assert "Model: unsloth/Qwen3-1.7B-GGUF:UD-Q4_K_XL\n" in output
-    assert "No Unsloth server at" not in output
-    assert "server ready" not in output
-
-
-def test_start_studio_server_polls_progress_from_early_key(monkeypatch):
-    class FakePopen:
-        pid = 4321
-
-        def poll(self):
-            return None
-
-    tails = iter(
-        [
-            "UNSLOTH_START_API_KEY: sk-unsloth-early\nLoading model...",
-            "UNSLOTH_START_API_KEY: sk-unsloth-early\nModel loaded: owner/model",
-        ]
-    )
-    created = []
-
-    class FakeProgress:
-        downloaded_bytes = 0
-
-        def __init__(self, base, key, model, variant, internal_auth = False):
-            created.append((base, key, model, variant, internal_auth, "created"))
-
-        def poll(self):
-            created.append("poll")
-
-        def close(self):
-            created.append("close")
-
-        def complete(self):
-            created.append("complete")
-
-    monkeypatch.setattr(start.subprocess, "Popen", lambda *a, **k: FakePopen())
-    monkeypatch.setattr(start, "_studio_healthy", lambda *a, **k: True)
-    monkeypatch.setattr(start, "_log_tail", lambda *a, **k: next(tails))
-    monkeypatch.setattr(start, "_ModelDownloadProgress", FakeProgress)
-    monkeypatch.setattr(start.time, "sleep", lambda _s: None)
-    monkeypatch.setattr(
-        start.typer,
-        "echo",
-        lambda message = "", **_kwargs: created.append(("echo", message)),
-    )
-
-    returned_base, server = start._start_studio_server(
-        BASE,
-        "owner/model-GGUF",
-        start.LoadOptions(gguf_variant = "Q4_K_M"),
-    )
-
-    assert (returned_base, server.pid) == (BASE, 4321)
-    assert (BASE, "sk-unsloth-early", "owner/model-GGUF", "Q4_K_M", True, "created") in created
-    assert created.count("poll") == 2
-    assert created[-2:] == ["complete", "close"]
-    assert not any(isinstance(event, tuple) and "server ready" in event[-1] for event in created)
-
-
-def test_start_studio_server_follows_the_port_the_child_bound(monkeypatch, tmp_path):
-    requests = {"occupant": [], "studio": []}
-
-    def handler(name, status, body):
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
-                requests[name].append(self.path)
-                self.send_response(status)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, *_args):
-                pass
-
-        return Handler
-
-    occupant = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler("occupant", 404, b"{}"))
-    studio = http.server.ThreadingHTTPServer(
-        ("127.0.0.1", 0), handler("studio", 200, b'{"status": "healthy"}')
-    )
-    for httpd in (occupant, studio):
-        threading.Thread(target = httpd.serve_forever, daemon = True).start()
-    requested_port, bound_port = occupant.server_address[1], studio.server_address[1]
-    fake = SimpleNamespace(pid = 4242, poll = lambda: None)
-    commands = []
-    progress_bases = []
-
-    def fake_popen(command, **kwargs):
-        commands.append(command)
-        kwargs["stdout"].write(
-            f"UNSLOTH_START_PORT: {bound_port}\n"
-            "UNSLOTH_START_API_KEY: sk-unsloth-early\n"
-            "Model loaded: owner/model\n".encode()
-        )
-        kwargs["stdout"].flush()
-        return fake
-
-    class FakeProgress:
-        downloaded_bytes = 0
-
-        def __init__(self, base, *_args, **_kwargs):
-            progress_bases.append(base)
-
-        def poll(self):
-            pass
-
-        def complete(self):
-            pass
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(start.tempfile, "gettempdir", lambda: str(tmp_path))
-    monkeypatch.setattr(start.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(start, "_ModelDownloadProgress", FakeProgress)
-    monkeypatch.setattr(start, "_SERVER_START_TIMEOUT_S", 5)
-    try:
-        base, server = start._start_studio_server(
-            f"http://127.0.0.1:{requested_port}", "owner/model", start.LoadOptions()
-        )
-    finally:
-        for httpd in (occupant, studio):
-            httpd.shutdown()
-            httpd.server_close()
-
-    assert (base, server) == (f"http://127.0.0.1:{bound_port}", fake)
-    assert commands[0][commands[0].index("-p") + 1] == str(requested_port)
-    assert progress_bases == [base]
-    assert requests == {"occupant": [], "studio": ["/api/health"]}
-
-
-def test_start_studio_server_reads_the_port_the_child_reported_once(monkeypatch):
-    # The child reports its port once, before the loader pushes it out of the tail the key uses.
-    class FakePopen:
-        pid = 4321
-
-        def poll(self):
-            return None
-
-    # 401 lines: the 400-line tail starts one line past the port.
-    log = (
-        "UNSLOTH_START_PORT: 8889\n"
-        "UNSLOTH_START_API_KEY: sk-unsloth-early\n"
-        + "loading tensors\n" * 398
-        + "Model loaded: owner/model"
-    )
-    healthy = []
-    progress_bases = []
-
-    class FakeProgress:
-        downloaded_bytes = 0
-
-        def __init__(self, base, *_args, **_kwargs):
-            progress_bases.append(base)
-
-        def poll(self):
-            pass
-
-        def complete(self):
-            pass
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(start.subprocess, "Popen", lambda *a, **k: FakePopen())
-    monkeypatch.setattr(start, "_studio_healthy", lambda base, **_k: healthy.append(base) or True)
-    monkeypatch.setattr(start, "_read_log", lambda _path: log)
-    monkeypatch.setattr(start, "_log_tail", lambda *a, **k: "\n".join(log.splitlines()[-400:]))
-    monkeypatch.setattr(start, "_ModelDownloadProgress", FakeProgress)
-    monkeypatch.setattr(start.time, "sleep", lambda _s: None)
-
-    base, _server = start._start_studio_server(BASE, "owner/model", start.LoadOptions())
-
-    tail = "\n".join(log.splitlines()[-400:])
-    assert start._START_API_KEY_PREFIX in tail and start._START_PORT_PREFIX not in tail
-    assert base == "http://127.0.0.1:8889"
-    assert progress_bases == [base]
-    assert healthy == [base]
 
 
 def test_load_model_with_progress_uses_selected_gguf_size(monkeypatch, capsys):
@@ -4729,116 +4178,6 @@ def test_resolve_model_failed_load_stays_quiet_when_model_gone(monkeypatch, caps
     assert "Nothing was unloaded" not in capsys.readouterr().err
 
 
-def test_auto_serves_when_no_server_then_keeps_server(fake_studio, monkeypatch):
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
-    started = {}
-    fake = SimpleNamespace(pid = 999, poll = lambda: None)
-
-    def fake_start(
-        base,
-        model,
-        load,
-        server_options = None,
-    ):
-        started.update(base = base, model = model, load = load)
-        start._auto_served_server = fake
-        return base, fake
-
-    monkeypatch.setattr(start, "_start_studio_server", fake_start)
-    monkeypatch.setattr(
-        start, "_shutdown_server", lambda server: started.__setitem__("down", server)
-    )
-    monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/claude")
-    monkeypatch.setattr(start.subprocess, "run", lambda command, env: SimpleNamespace(returncode = 0))
-
-    result = CliRunner().invoke(
-        start.start_app, ["claude", "--model", "unsloth/Qwen3-1.7B-GGUF:UD-Q4_K_XL"]
-    )
-    assert result.exit_code == 0, result.output
-    # The `:QUANT` suffix is split off into the gguf_variant so `unsloth run` gets a valid
-    # repo id plus `--gguf-variant`, mirroring how `unsloth run` accepts either form.
-    assert started["model"] == "unsloth/Qwen3-1.7B-GGUF"
-    assert started["load"].gguf_variant == "UD-Q4_K_XL"
-    assert started["base"] == BASE
-    # A successful agent exit releases ownership and leaves the server available
-    # for another terminal. Explicit startup failures still use the cleanup path.
-    assert "down" not in started
-    assert start._auto_served_server is None
-    assert "is still running" in result.output
-    assert "unsloth studio stop" in result.output
-
-
-def test_auto_served_session_uses_the_port_the_server_bound(fake_studio, monkeypatch):
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
-    bound = "http://127.0.0.1:8889"
-    fake = SimpleNamespace(pid = 999, poll = lambda: None)
-    launched = {}
-
-    def fake_start(*_args):
-        start._auto_served_server = fake
-        return bound, fake
-
-    monkeypatch.setattr(start, "_start_studio_server", fake_start)
-    monkeypatch.setattr(start, "_launch", lambda command, env, **_kwargs: launched.update(env) or 0)
-
-    result = CliRunner().invoke(start.start_app, ["claude", "--model", "unsloth/Qwen3-1.7B-GGUF"])
-
-    assert result.exit_code == 0, result.output
-    assert f"Unsloth ready at {bound} " in result.output
-    assert launched["ANTHROPIC_BASE_URL"] == bound
-    assert fake_studio and all(
-        url.startswith(f"{bound}/") for _method, url, _payload in fake_studio
-    )
-
-
-def test_auto_served_agent_launch_failure_stops_server(fake_studio, monkeypatch):
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
-    stopped = []
-    fake = SimpleNamespace(pid = 999, poll = lambda: None)
-
-    def fake_start(*_args):
-        start._auto_served_server = fake
-        return _args[0], fake
-
-    monkeypatch.setattr(start, "_start_studio_server", fake_start)
-    monkeypatch.setattr(start, "_shutdown_server", stopped.append)
-    monkeypatch.setattr(
-        start,
-        "_launch",
-        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("agent launch failed")),
-    )
-
-    result = CliRunner().invoke(
-        start.start_app,
-        ["claude", "--model", "unsloth/Qwen3-1.7B-GGUF"],
-    )
-
-    assert result.exit_code == 1
-    assert stopped == [fake]
-    assert "is still running" not in result.output
-
-
-def test_auto_served_server_exit_is_not_reported_as_running(fake_studio, monkeypatch):
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
-    fake = SimpleNamespace(pid = 999, poll = lambda: 1)
-
-    def fake_start(*_args):
-        start._auto_served_server = fake
-        return _args[0], fake
-
-    monkeypatch.setattr(start, "_start_studio_server", fake_start)
-    monkeypatch.setattr(start, "_launch", lambda *a, **k: 0)
-
-    result = CliRunner().invoke(
-        start.start_app,
-        ["claude", "--model", "unsloth/Qwen3-1.7B-GGUF"],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert "stopped during the session" in result.output
-    assert "is still running" not in result.output
-
-
 def test_attached_server_prints_stop_hint_after_agent_exits(fake_studio, monkeypatch):
     monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/claude")
     monkeypatch.setattr(start, "_claude_flags", lambda *a, **k: [])
@@ -4878,168 +4217,12 @@ def test_nonzero_agent_exit_notes_code_before_stop_hint(fake_studio, monkeypatch
     assert f"Unsloth Studio is still running at {BASE}." in result.output
 
 
-def test_redacted_log_tail_strips_minted_keys(tmp_path):
-    log = tmp_path / "server.log"
-    log.write_text(
-        "booting\nUNSLOTH_START_API_KEY: sk-unsloth-feedfacefeedface\nerror: load failed\n",
-        encoding = "utf-8",
-    )
-
-    tail = start._redacted_log_tail(log)
-
-    assert "sk-unsloth-feedfacefeedface" not in tail
-    assert "sk-unsloth-[redacted]" in tail
-    assert "error: load failed" in tail
-
-
-def test_startup_failure_output_redacts_minted_key(monkeypatch, tmp_path, capsys):
-    monkeypatch.setattr(start.tempfile, "gettempdir", lambda: str(tmp_path))
-    fake = SimpleNamespace(pid = 4242, poll = lambda: 1)
-
-    def fake_popen(command, **kwargs):
-        # The child prints the early key marker, then dies before it is ready.
-        kwargs["stdout"].write(b"UNSLOTH_START_API_KEY: sk-unsloth-secretsecret\nload failed\n")
-        kwargs["stdout"].flush()
-        return fake
-
-    monkeypatch.setattr(start.subprocess, "Popen", fake_popen)
-
-    with pytest.raises(start.typer.Exit):
-        start._start_studio_server(BASE, "owner/model-GGUF", start.LoadOptions())
-
-    err = capsys.readouterr().err
-    assert "stopped before it was ready" in err
-    assert "sk-unsloth-secretsecret" not in err
-    assert "sk-unsloth-[redacted]" in err
-
-
-def test_codex_preflight_failure_tears_down_auto_served(fake_studio, monkeypatch):
-    # Listing unavailable, so the post-connect check decides and must still tear down.
-    monkeypatch.setattr(start, "_hub_gguf_files", lambda repo: None)
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
-    started = {}
-    fake = SimpleNamespace(pid = 999, poll = lambda: None)
-
-    def fake_start(
-        base,
-        model,
-        load,
-        server_options = None,
-    ):
-        started.update(base = base, model = model)
-        start._auto_served_server = fake
-        return base, fake
-
-    monkeypatch.setattr(start, "_start_studio_server", fake_start)
-    monkeypatch.setattr(
-        start, "_shutdown_server", lambda server: started.__setitem__("down", server)
-    )
-    inner = start._http_json
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/status"):
-            return {"is_gguf": False, "model_identifier": "transformers-model"}
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    result = CliRunner().invoke(
-        start.start_app, ["codex", "--model", "unsloth/Qwen3-1.7B", "--launch"]
-    )
-    assert result.exit_code != 0, result.output
-    assert "GGUF" in result.output
-    # Torn down at the point the preflight rejected the model, not only via atexit.
-    assert started.get("down") is fake
-
-
-def test_no_serve_preserves_error(fake_studio, monkeypatch):
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
-    started = {"called": False}
-    monkeypatch.setattr(
-        start, "_start_studio_server", lambda *a, **k: started.__setitem__("called", True)
-    )
-    result = CliRunner().invoke(
-        start.start_app, ["claude", "--model", "unsloth/Qwen3-1.7B-GGUF", "--no-serve"]
-    )
-    assert result.exit_code == 1
-    assert "No running Unsloth server" in result.output
-    assert started["called"] is False
-
-
-def test_no_launch_never_serves(fake_studio, monkeypatch):
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
-    started = {"called": False}
-    monkeypatch.setattr(
-        start, "_start_studio_server", lambda *a, **k: started.__setitem__("called", True)
-    )
-    result = CliRunner().invoke(
-        start.start_app, ["claude", "--model", "unsloth/Qwen3-1.7B-GGUF", "--no-launch"]
-    )
-    assert result.exit_code == 1
-    assert "No running Unsloth server" in result.output
-    assert started["called"] is False
-
-
-def test_no_server_no_model_hints_model_flag(fake_studio, monkeypatch):
+def test_no_server_hints_starting_one(fake_studio, monkeypatch):
     monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
     result = CliRunner().invoke(start.start_app, ["claude"])
     assert result.exit_code == 1
-    assert "--model" in result.output
-
-
-@pytest.mark.parametrize(
-    "base, expected",
-    [
-        ("http://127.0.0.1", "http://127.0.0.1:8888"),  # portless -> unsloth run's :8888
-        ("http://127.0.0.1:8888", "http://127.0.0.1:8888"),  # explicit port kept
-        ("http://127.0.0.1:9000", "http://127.0.0.1:9000"),
-        ("http://localhost", "http://localhost:8888"),
-        ("http://[::1]", "http://[::1]:8888"),  # IPv6 literal stays bracketed
-        ("http://[::1]:8888", "http://[::1]:8888"),
-        # Paths are stripped: unsloth run serves at the root, so /studio would make the
-        # health poll hit /studio/api/health (404) until the startup timeout.
-        ("http://127.0.0.1:8888/studio", "http://127.0.0.1:8888"),
-        ("http://127.0.0.1/studio", "http://127.0.0.1:8888"),
-    ],
-)
-def test_effective_base(base, expected):
-    assert start._effective_base(base) == expected
-
-
-def test_auto_serve_normalizes_portless_url(fake_studio, monkeypatch):
-    # A portless UNSLOTH_STUDIO_URL must launch AND poll :8888 (what unsloth run binds),
-    # not port 80, or readiness never matches and we hit the startup timeout.
-    monkeypatch.setenv("UNSLOTH_STUDIO_URL", "http://127.0.0.1")
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
-    started = {}
-    fake = SimpleNamespace(pid = 999, poll = lambda: None)
-
-    def fake_start(
-        base,
-        model,
-        load,
-        server_options = None,
-    ):
-        started["base"] = base
-        start._auto_served_server = fake
-        return base, fake
-
-    monkeypatch.setattr(start, "_start_studio_server", fake_start)
-    monkeypatch.setattr(start, "_shutdown_server", lambda server: None)
-    monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/claude")
-    monkeypatch.setattr(start.subprocess, "run", lambda command, env: SimpleNamespace(returncode = 0))
-
-    result = CliRunner().invoke(start.start_app, ["claude", "--model", "unsloth/Qwen3-1.7B-GGUF"])
-    assert result.exit_code == 0, result.output
-    assert started["base"] == "http://127.0.0.1:8888"
+    assert "No running Unsloth server found" in result.output
+    assert "unsloth studio" in result.output
 
 
 def test_connect_explicit_api_key_skips_mint(fake_studio):
@@ -6792,42 +5975,6 @@ def test_connect_pi_wsl_windows_shim_relocates_userprofile(fake_studio, monkeypa
     assert "USERPROFILE/p" in wslenv
 
 
-def test_agent_api_key_auto_started_rejected_env_key_falls_back(fake_studio, tmp_path, monkeypatch):
-    # UNSLOTH_API_KEY exported for some OTHER server must not fail the launch
-    # against a server this run just auto-started: validate, then fall back to
-    # the local mint path, and never remember the foreign key for this base.
-    inner = start._http_json
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/loaded-models") and token == "sk-unsloth-other-server":
-            raise urllib.error.HTTPError(url, 401, "Unauthorized", None, None)
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    key = start._agent_api_key(BASE, "sk-unsloth-other-server", auto_started = True)
-    assert key == "sk-unsloth-feedfacefeedface"  # minted for the fresh server
-    cached = json.loads((tmp_path / "agent_api_key.json").read_text())
-    assert "sk-unsloth-other-server" not in json.dumps(cached["servers"].get(BASE, {}))
-
-
-def test_agent_api_key_auto_started_accepted_key_is_honored(fake_studio, tmp_path):
-    # An explicit key the fresh server accepts (e.g. persisted in this Unsloth
-    # home's auth db across restarts) keeps working exactly as before.
-    key = start._agent_api_key(BASE, "sk-unsloth-deadbeefdeadbeef", auto_started = True)
-    assert key == "sk-unsloth-deadbeefdeadbeef"
-    cached = json.loads((tmp_path / "agent_api_key.json").read_text())
-    assert cached["servers"][BASE]["saved"] == ["sk-unsloth-deadbeefdeadbeef"]
-
-
 def test_session_config_no_launch_preserves_existing_state(fake_studio, tmp_path):
     # A previously printed recipe may still be running an agent whose sessions
     # or sqlite state live in the stable home; a re-run must not wipe it.
@@ -7205,42 +6352,6 @@ def _fake_hub_listing(monkeypatch, files_by_repo):
     return calls
 
 
-def test_codex_preflight_rejects_non_gguf_repo(monkeypatch, capsys):
-    _fake_hub_listing(monkeypatch, {"mlx-community/Qwen3-0.6B-4bit": []})
-    with pytest.raises(typer.Exit) as excinfo:
-        start._preflight_agent_gguf(start._CODEX_GGUF_AGENT, "mlx-community/Qwen3-0.6B-4bit")
-    assert excinfo.value.exit_code == 1
-    err = capsys.readouterr().err
-    assert "Codex needs a GGUF model" in err
-    assert "Try:" not in err
-
-
-def test_codex_preflight_passes_gguf_repo_and_splits_variant(monkeypatch):
-    calls = _fake_hub_listing(monkeypatch, {"unsloth/Qwen3-0.6B-GGUF": ["Qwen3-0.6B-Q4_K_M.gguf"]})
-    start._preflight_agent_gguf(start._CODEX_GGUF_AGENT, "unsloth/Qwen3-0.6B-GGUF:Q4_K_M")
-    assert calls == ["unsloth/Qwen3-0.6B-GGUF"]
-
-
-def test_codex_preflight_defers_when_listing_unavailable(monkeypatch):
-    _fake_hub_listing(monkeypatch, {})
-    start._preflight_agent_gguf(start._CODEX_GGUF_AGENT, "owner/private-model")
-
-
-def test_codex_preflight_skips_paths_and_empty_model(monkeypatch):
-    calls = _fake_hub_listing(monkeypatch, {})
-    start._preflight_agent_gguf(start._CODEX_GGUF_AGENT, "./models/foo.gguf")
-    start._preflight_agent_gguf(start._CODEX_GGUF_AGENT, None)
-    assert calls == []
-
-
-def test_codex_preflight_skips_remote_studio(monkeypatch):
-    # A one-slash server-side path can look like a hub id; do not reject it from here.
-    calls = _fake_hub_listing(monkeypatch, {"models/qwen-finetune": []})
-    monkeypatch.setenv("UNSLOTH_STUDIO_URL", "http://studio.example:8888")
-    start._preflight_agent_gguf(start._CODEX_GGUF_AGENT, "models/qwen-finetune")
-    assert calls == []
-
-
 def test_codex_gguf_failure_suggests_only_a_verified_sibling(monkeypatch, capsys):
     _fake_hub_listing(monkeypatch, {"owner/model-GGUF": ["model-Q4_K_M.gguf"]})
     with pytest.raises(typer.Exit):
@@ -7273,36 +6384,6 @@ def test_hub_gguf_files_unknown_on_error_or_empty_listing(monkeypatch):
         start.urllib.request, "urlopen", lambda request, timeout: io.BytesIO(b'{"siblings": []}')
     )
     assert start._hub_gguf_files("owner/empty") is None
-
-
-def test_codex_rejects_non_gguf_model_before_connect(monkeypatch):
-    monkeypatch.delenv("UNSLOTH_STUDIO_URL", raising = False)
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
-    monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/codex")
-    monkeypatch.setattr(start, "_hub_gguf_files", lambda repo: [])
-    monkeypatch.setattr(
-        start, "_connect", lambda *a, **k: pytest.fail("preflight must run before connect")
-    )
-    result = CliRunner().invoke(
-        start.start_app, ["codex", "--model", "mlx-community/Qwen3-0.6B-4bit"]
-    )
-    assert result.exit_code == 1
-    assert "Codex needs a GGUF model" in result.output
-
-
-def test_codex_preflight_normalizes_ownerless_shorthand(monkeypatch):
-    calls = _fake_hub_listing(monkeypatch, {"unsloth/Qwen3-0.6B": []})
-    with pytest.raises(typer.Exit):
-        start._preflight_agent_gguf(start._CODEX_GGUF_AGENT, "Qwen3-0.6B")
-    assert calls[0] == "unsloth/Qwen3-0.6B"
-
-
-def test_codex_preflight_shorthand_skips_existing_local_dir(monkeypatch, tmp_path):
-    calls = _fake_hub_listing(monkeypatch, {})
-    (tmp_path / "Qwen3-0.6B").mkdir()
-    monkeypatch.chdir(tmp_path)
-    start._preflight_agent_gguf(start._CODEX_GGUF_AGENT, "Qwen3-0.6B")
-    assert calls == []
 
 
 def test_hub_gguf_files_ignores_auxiliary_ggufs(monkeypatch):
@@ -7370,15 +6451,6 @@ def test_hub_gguf_files_filters_root_big_endian_only(monkeypatch):
         lambda request, timeout: io.BytesIO(json.dumps(payload).encode()),
     )
     assert start._hub_gguf_files("owner/be-pack") == ["quants/model-be.gguf", "model-belle.gguf"]
-
-
-def test_codex_preflight_defers_to_running_server(monkeypatch):
-    # With a server running, identifiers resolve against its cwd/cache/token, so the attach
-    # check asks it rather than guessing here.
-    calls = _fake_hub_listing(monkeypatch, {"mlx-community/Qwen3-0.6B-4bit": []})
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: "http://127.0.0.1:8888")
-    start._preflight_agent_gguf(start._CODEX_GGUF_AGENT, "mlx-community/Qwen3-0.6B-4bit")
-    assert calls == []
 
 
 def _fake_variants(monkeypatch, responses):
@@ -7491,16 +6563,6 @@ def test_hub_gguf_files_skips_hub_when_offline(monkeypatch, var):
         lambda request, timeout: pytest.fail("offline mode must not call the hub"),
     )
     assert start._hub_gguf_files("owner/model") is None
-
-
-def test_codex_preflight_defers_bare_names_to_attached_server(monkeypatch):
-    # A bare name may be a directory under the attached server's cwd, invisible here, so
-    # only the auto-start path may canonicalize it.
-    calls = _fake_hub_listing(monkeypatch, {"unsloth/Qwen3-0.6B": []})
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: "http://127.0.0.1:8888")
-    monkeypatch.setattr(start, "verify_studio_identity", lambda base: True)
-    start._preflight_agent_gguf(start._CODEX_GGUF_AGENT, "Qwen3-0.6B")
-    assert calls == []
 
 
 def test_codex_gguf_failure_skips_hint_probe_for_non_hub_ids(monkeypatch, capsys):
@@ -8046,6 +7108,13 @@ def test_codex_attach_check_requires_a_pickable_row_without_a_variant(monkeypatc
         start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "./m")
     err = capsys.readouterr().err
     assert "quant subdirectories" in err and "BF16" in err
+    # A path never parses `:QUANT`, so the hint names the quant file itself.
+    assert "Pass --model one of: ./m/BF16/model.gguf" in err
+    # A hub id keeps the shorthand hint.
+    _fake_variants(monkeypatch, rows)
+    with pytest.raises(typer.Exit):
+        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "unsloth/m")
+    assert "Pass --model unsloth/m:<QUANT> (available: BF16)" in capsys.readouterr().err
     # Naming the variant resolves it, and a top-level row needs nothing.
     _fake_variants(monkeypatch, rows)
     start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "./m", "BF16")
@@ -8098,13 +7167,15 @@ def test_codex_attach_check_honors_loadable_on_an_empty_listing(monkeypatch):
 
 
 def test_codex_preload_gate_checks_direct_path_identity(fake_studio, monkeypatch, tmp_path):
-    # /v1/models shows only the basename, so a different path with the same name reloads.
+    # /v1/models shows only the basename, so a different path with the same name must not read
+    # as resident: the preload gate still runs on the REQUESTED path and refuses its big-endian
+    # build before the load evicts the resident. Without the path-identity check the basename
+    # match would skip the gate and the load would go through.
     inner = start._http_json
-    probed = []
-    resident = tmp_path / "old" / "foo-Q4_K_M.gguf"
+    resident = tmp_path / "old" / "foo-Q4_K_M-be.gguf"
     resident.parent.mkdir()
     resident.write_bytes(b"GGUF")
-    other = tmp_path / "new" / "foo-Q4_K_M.gguf"
+    other = tmp_path / "new" / "foo-Q4_K_M-be.gguf"
     other.parent.mkdir()
     other.write_bytes(b"GGUF")
 
@@ -8119,24 +7190,19 @@ def test_codex_preload_gate_checks_direct_path_identity(fake_studio, monkeypatch
         internal_auth = False,
     ):
         if url.endswith("/api/inference/loaded-models"):
-            return {"data": [{"id": "foo-Q4_K_M", "loaded": True}]}
+            return {"data": [{"id": "foo-Q4_K_M-be", "loaded": True}]}
         if url.endswith("/api/inference/status"):
-            return {
-                "is_gguf": True,
-                "gguf_variant": "Q4_K_M",
-                "model_identifier": os.fspath(resident),
-            }
-        if "/api/models/gguf-variants" in url:
-            probed.append(url)
-            return {"variants": [{"quant": "Q4_K_M"}], "resolved_locally": True, "loadable": True}
+            return {"is_gguf": True, "model_identifier": os.fspath(resident)}
         return inner(method, url, token, payload, timeout, error)
 
     monkeypatch.setattr(start, "_http_json", http_json)
-    CliRunner().invoke(
+    result = CliRunner().invoke(
         start.start_app,
-        ["codex", "--model", os.fspath(other), "--gguf-variant", "Q4_K_M", "--no-launch"],
+        ["codex", "--model", os.fspath(other), "--no-launch"],
     )
-    assert probed, "a different path with the same basename is not the resident model"
+    assert result.exit_code == 1
+    assert "Codex needs a GGUF model" in result.output
+    assert not [c for c in fake_studio if c[1].endswith("/api/inference/load")]
 
 
 def test_codex_preload_gate_runs_for_a_settings_reload(fake_studio, monkeypatch):
@@ -8194,7 +7260,7 @@ def test_codex_preload_gate_runs_for_a_mistyped_resident_variant(fake_studio, mo
     monkeypatch.setattr(start, "_http_json", http_json)
     CliRunner().invoke(
         start.start_app,
-        ["codex", "--model", MODEL["id"], "--gguf-variant", "Q4KM", "--no-launch"],
+        ["codex", "--model", MODEL["id"] + ":Q4KM", "--no-launch"],
     )
     assert probed, "a separator-mangled quant is not the resident one"
 
@@ -8253,7 +7319,7 @@ def test_codex_preload_gate_still_runs_for_a_different_variant(fake_studio, monk
     monkeypatch.setattr(start, "_http_json", http_json)
     CliRunner().invoke(
         start.start_app,
-        ["codex", "--model", MODEL["id"], "--gguf-variant", "Q8_0", "--no-launch"],
+        ["codex", "--model", MODEL["id"] + ":Q8_0", "--no-launch"],
     )
     assert probed, "a different quant reloads, so the gate must check it"
 
@@ -8487,23 +7553,6 @@ def test_codex_attach_check_refuses_companion_gguf_files(monkeypatch, capsys, pa
     assert "Codex needs a GGUF model" in capsys.readouterr().err
 
 
-def test_codex_preflight_canonicalizes_missing_bare_gguf_names(tmp_path, monkeypatch):
-    # A bare foo.gguf naming no local file is a shorthand the load canonicalizes, so the
-    # preflight checks the repo that will load.
-    monkeypatch.chdir(tmp_path)
-    calls = _fake_hub_listing(monkeypatch, {"unsloth/foo.gguf": []})
-    with pytest.raises(typer.Exit):
-        start._preflight_agent_gguf(start._CODEX_GGUF_AGENT, "foo.gguf")
-    assert calls == ["unsloth/foo.gguf"]
-
-
-@pytest.mark.parametrize("kwargs", [{"serve": False}, {"launch": False}])
-def test_codex_preflight_skips_when_autostart_impossible(monkeypatch, kwargs):
-    calls = _fake_hub_listing(monkeypatch, {"mlx-community/Qwen3-0.6B-4bit": []})
-    start._preflight_agent_gguf(start._CODEX_GGUF_AGENT, "mlx-community/Qwen3-0.6B-4bit", **kwargs)
-    assert calls == []
-
-
 def test_codex_attach_check_normalizes_shorthand_after_raw_probe(monkeypatch, capsys):
     monkeypatch.setattr(start, "_hub_gguf_files", lambda repo: None)
     urls = []
@@ -8650,78 +7699,6 @@ def test_require_gguf_for_agent_reads_the_servers_status(monkeypatch, capsys):
     )
 
 
-def test_claude_preflight_rejects_non_gguf_repo(monkeypatch, capsys):
-    _fake_hub_listing(monkeypatch, {"mlx-community/Qwen3-0.6B-4bit": []})
-    with pytest.raises(typer.Exit):
-        start._preflight_agent_gguf(start._CLAUDE_GGUF_AGENT, "mlx-community/Qwen3-0.6B-4bit")
-    assert "Claude Code needs a GGUF model" in capsys.readouterr().err
-
-
-def test_claude_command_preflights_before_starting_a_server(fake_studio, monkeypatch, tmp_path):
-    _fake_hub_listing(monkeypatch, {"mlx-community/Qwen3-0.6B-4bit": []})
-    monkeypatch.setattr(start, "_agents_config_root", lambda: tmp_path / "agents")
-    started = {"called": False}
-    monkeypatch.setattr(
-        start, "_start_studio_server", lambda *a, **k: started.__setitem__("called", True)
-    )
-    result = CliRunner().invoke(
-        start.start_app, ["claude", "--model", "mlx-community/Qwen3-0.6B-4bit"]
-    )
-    assert result.exit_code == 1
-    assert "Claude Code needs a GGUF model" in result.output
-    assert started["called"] is False
-
-
-@pytest.mark.parametrize(
-    ("subcommand", "label"),
-    [("claude", "Claude Code"), ("codex", "Codex")],
-)
-def test_a_rejected_model_never_offers_to_install_the_agent(
-    monkeypatch, tmp_path, subcommand, label
-):
-    # No fake_studio: it stubs _require_agent_for_launch to a no-op, which is the call
-    # under test here. _install_agent runs a remote installer, so the refusal must come
-    # first. Neither test reaches a server.
-    _fake_hub_listing(monkeypatch, {"mlx-community/Qwen3-0.6B-4bit": []})
-    monkeypatch.setattr(start, "_agents_config_root", lambda: tmp_path / "agents")
-    monkeypatch.setattr(start, "_which_with_install_dirs", lambda name: None)
-    monkeypatch.setattr(start, "_start_studio_server", lambda *a, **k: None)
-    offered = []
-    monkeypatch.setattr(
-        start,
-        "_install_agent",
-        lambda name, hint: offered.append(name),
-    )
-    result = CliRunner().invoke(
-        start.start_app,
-        [subcommand, "--model", "mlx-community/Qwen3-0.6B-4bit", "--launch"],
-    )
-    assert result.exit_code == 1
-    assert f"{label} needs a GGUF model" in result.output
-    assert offered == []
-
-
-def test_a_missing_agent_is_still_reported_for_a_model_that_passes(monkeypatch, tmp_path):
-    # The reorder must not turn the install prompt into dead code for a runnable model.
-    _fake_hub_listing(monkeypatch, {"unsloth/Qwen3-0.6B-GGUF": ["Q4_K_M.gguf"]})
-    monkeypatch.setattr(start, "_agents_config_root", lambda: tmp_path / "agents")
-    monkeypatch.setattr(start, "_which_with_install_dirs", lambda name: None)
-    monkeypatch.setattr(start, "_start_studio_server", lambda *a, **k: None)
-    offered = []
-    monkeypatch.setattr(
-        start,
-        "_install_agent",
-        lambda name, hint: offered.append(name),
-    )
-    result = CliRunner().invoke(
-        start.start_app,
-        ["claude", "--model", "unsloth/Qwen3-0.6B-GGUF", "--launch"],
-    )
-    assert offered == ["claude"]
-    assert result.exit_code == 1
-    assert "not found on PATH" in result.output
-
-
 def test_claude_preload_gate_rejects_before_an_evicting_load(fake_studio, monkeypatch):
     inner = start._http_json
     probed = []
@@ -8749,79 +7726,6 @@ def test_claude_preload_gate_rejects_before_an_evicting_load(fake_studio, monkey
     assert "Claude Code needs a GGUF model" in result.output
     assert probed, "the gate must probe the server before the load"
     assert not [call for call in fake_studio if call[1].endswith("/api/inference/load")]
-
-
-def test_claude_post_connect_failure_tears_down_auto_served(fake_studio, monkeypatch):
-    # Listing unavailable: the check falls back to post-connect and must still tear down an
-    # auto-started server instead of leaving it to atexit.
-    monkeypatch.setattr(start, "_hub_gguf_files", lambda repo: None)
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
-    started = {}
-    fake = SimpleNamespace(pid = 999, poll = lambda: None)
-
-    def fake_start(
-        base,
-        model,
-        load,
-        server_options = None,
-    ):
-        started.update(base = base, model = model)
-        start._auto_served_server = fake
-        return base, fake
-
-    monkeypatch.setattr(start, "_start_studio_server", fake_start)
-    monkeypatch.setattr(
-        start, "_shutdown_server", lambda server: started.__setitem__("down", server)
-    )
-    inner = start._http_json
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/status"):
-            return {"is_gguf": False, "model_identifier": "transformers-model"}
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    result = CliRunner().invoke(
-        start.start_app, ["claude", "--model", "unsloth/Qwen3-1.7B", "--launch"]
-    )
-    assert result.exit_code != 0, result.output
-    assert "Claude Code needs a GGUF model" in result.output
-    assert started.get("down") is fake
-
-
-def test_claude_post_connect_failure_spares_an_attached_server(fake_studio, monkeypatch):
-    down = []
-    monkeypatch.setattr(start, "_shutdown_server", lambda server: down.append(server))
-    inner = start._http_json
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/status"):
-            return {"is_gguf": False, "model_identifier": "transformers-model"}
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
-    assert result.exit_code == 1
-    assert "Claude Code needs a GGUF model" in result.output
-    assert down == []
 
 
 # Tolerance: callers tear the server down on any exception, so only "is_gguf": false rejects.
@@ -8958,55 +7862,6 @@ def test_require_gguf_does_not_swallow_a_bug(monkeypatch):
     _status_raises(monkeypatch, AttributeError("typo in the stub"))
     with pytest.raises(AttributeError):
         _require_claude_gguf()
-
-
-@pytest.mark.parametrize("agent", ["claude", "codex"])
-def test_an_unreadable_status_leaves_the_auto_served_server_alone(fake_studio, monkeypatch, agent):
-    # The regression: a 500 from get_status used to reject, then shut down a loaded GGUF.
-    monkeypatch.setattr(start, "_hub_gguf_files", lambda repo: None)
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
-    started = {}
-    fake = SimpleNamespace(pid = 999, poll = lambda: None)
-
-    def fake_start(
-        base,
-        model,
-        load,
-        server_options = None,
-    ):
-        started.update(base = base, model = model)
-        start._auto_served_server = fake
-        return base, fake
-
-    monkeypatch.setattr(start, "_start_studio_server", fake_start)
-    monkeypatch.setattr(
-        start, "_shutdown_server", lambda server: started.__setitem__("down", server)
-    )
-    monkeypatch.setattr(start.shutil, "which", lambda _: f"/usr/local/bin/{agent}")
-    monkeypatch.setattr(start.subprocess, "run", lambda command, env: SimpleNamespace(returncode = 0))
-    inner = start._http_json
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/status"):
-            raise urllib.error.HTTPError(url, 500, "Failed to get status", None, None)
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    result = CliRunner().invoke(
-        start.start_app, [agent, "--model", "unsloth/Qwen3-1.7B-GGUF", "--launch"]
-    )
-    assert result.exit_code == 0, result.output
-    assert "needs a GGUF model" not in result.output
-    assert started.get("down") is None
 
 
 @pytest.mark.parametrize("agent", ["claude", "codex"])

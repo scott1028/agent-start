@@ -101,6 +101,23 @@ _TEXT_MAP = [
 _UNSLOTH_BOOTSTRAP = (
     "import sys; sys.argv[0] = 'unsloth'; from unsloth_cli import app; sys.exit(app())"
 )
+# Wording divergence by design: on an attach, unsloth start warns that a pin the agent can't
+# send applies only to a server it would auto-start; agent-switch never starts a server, so it
+# warns the pin is ignored. Map the old sentence onto the new one and compare everything else
+# as usual. The pi case only diverges when the host's pi is older than 0.84.
+_PIN_WARNING_MAP = [
+    (
+        r"Warning: an Unsloth server is already running at \S+, and this agent cannot send "
+        r"([^;]+) itself; they apply only when this command starts the server, so the running "
+        r"server keeps its current sampling\. Stop it with `unsloth studio stop` and re-run "
+        r"to apply them\.",
+        r"Warning: this agent can't send \1 itself, so it is ignored.",
+    ),
+]
+_EXPECTED_DIVERGENCES = {
+    "codex --temperature 0.6 --top-k 20": _PIN_WARNING_MAP,
+    "pi --temperature 0.6 --top-k 20": _PIN_WARNING_MAP,
+}
 # A JSON object key "unsloth" maps by its parent key.
 _KEY_MAP = {"providers": "agent-switch", "agent": "local", "mcpServers": "local"}
 
@@ -232,6 +249,7 @@ def main() -> int:
     threading.Thread(target = server.serve_forever, daemon = True).start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
     failures = 0
+    diverged = 0
     total = 0
     try:
         for agent, cases in CASES.items():
@@ -279,8 +297,18 @@ def main() -> int:
                     ]
                     left = _transcript(out_u, unsloth_home / "auth" / "agents", roots, True)
                     right = _transcript(out_a, agent_switch_home / "agents", roots, False)
+                    maps = _EXPECTED_DIVERGENCES.get(label, ())
+                    mapped = False
+                    for pattern, replacement in maps:
+                        new_left = re.sub(pattern, replacement, left)
+                        mapped = mapped or new_left != left
+                        left = new_left
                     if left == right:
-                        print(f"PASS  {label}")
+                        if mapped:
+                            diverged += 1
+                            print(f"DIFF* {label}  (expected divergence)")
+                        else:
+                            print(f"PASS  {label}")
                         continue
                     failures += 1
                     print(f"DIFF  {label}")
@@ -295,7 +323,7 @@ def main() -> int:
                     print()
     finally:
         server.shutdown()
-    print(f"\n{total - failures}/{total} cases match")
+    print(f"\n{total - failures - diverged}/{total} cases match, {diverged} expected divergences")
     return 1 if failures else 0
 
 

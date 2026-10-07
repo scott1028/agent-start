@@ -69,8 +69,7 @@ model server, e.g. for a gateway that needs its own auth:
 An `Authorization` header there replaces the built-in `Bearer <api-key>`.
 It applies to every server, Unsloth Studio included: there an `Authorization` header also stands in
 for `--api-key`, so no Studio key is minted. Studio's own API-key listing, minting and identity check
-never carry these headers, and neither do the download-progress polls of a server this command has
-just started, which use that server's own start key. A server that only answers when they are present
+never carry these headers. A server that only answers when they are present
 must be named with `--url`, `--provider unsloth` or `UNSLOTH_STUDIO_URL`; they are never sent while
 agent-switch probes for an unnamed server.
 
@@ -80,6 +79,10 @@ Arguments agent-switch does not know are passed to the agent unchanged, e.g.
 The context window comes from the server: Ollama `/api/ps`, LM Studio's loaded instance,
 llama-server `meta.n_ctx`, vLLM `max_model_len`, or Unsloth. A generic server that reports none
 needs `--context-length`.
+
+agent-switch never starts a model server itself. By default it may load the `--model` you name
+into a server that is already running; `--no-model-load` makes it a pure client that never loads,
+reloads or unloads anything — the model must already be loaded on the server.
 
 `--compact-at 0.85` starts the agent's auto-compaction once 85% of that window is used, scaled
 per agent (Claude Code, Codex, OpenCode and Pi); accepted range 0.5–0.95, and leaving it unset

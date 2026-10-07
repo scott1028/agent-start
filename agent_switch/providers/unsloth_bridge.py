@@ -139,17 +139,3 @@ def managed_node_paths() -> Optional[tuple]:
     if not isinstance(paths, list) or len(paths) != 2 or not isinstance(paths[0], str):
         return None
     return paths[0], paths[1] if isinstance(paths[1], str) else None
-
-
-def unsloth_launch_head() -> Optional[list]:
-    """argv prefix that runs the `unsloth` CLI through its own interpreter (Windows, #8490)."""
-    python = unsloth_python()
-    if python is None:
-        return None
-    head = _call(
-        "from pathlib import Path\n"
-        "from unsloth_cli.commands.studio import _managed_cli_argv\n"
-        "out = _managed_cli_argv(Path(args[0]))",
-        python,
-    )
-    return head if isinstance(head, list) and all(isinstance(a, str) for a in head) else None

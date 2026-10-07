@@ -48,6 +48,14 @@ def _alias(model: str, context_length: int) -> str:
     return f"{_ALIAS_PREFIX}{slug}-ctx{context_length}:latest"
 
 
+def resident_alias(entries: list, model: str, context_length: Optional[int]) -> Optional[dict]:
+    """The loaded ctx alias carrying this window, if one is already resident."""
+    if not context_length:
+        return None
+    alias = _alias(canonical(model), context_length)
+    return next((entry for entry in entries if entry["id"] == alias and entry["loaded"]), None)
+
+
 def _not_found(model: str, body) -> ProviderError:
     return ProviderError(
         f"{LABEL} doesn't have {model}: {error_detail(body)}. Pull it first with `ollama pull {model}`."

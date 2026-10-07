@@ -115,6 +115,7 @@ def connect(
     model: Optional[str],
     context_length: Optional[int],
     needs: tuple = (),
+    allow_load: bool = True,
 ) -> tuple:
     """(base, key, entry) for a non-Unsloth target; entry is {"id", "context_length"}."""
     module = _MODULES[target.name]
@@ -129,17 +130,44 @@ def connect(
             and match.get("context_length") != context_length
         )
         if match is None or not match["loaded"] or stale_window:
-            loaded_id = module.load(base, key, model, context_length if module.SETS_CONTEXT else None, headers)
-            entries = module.models(base, key, headers)
-            match = _find(entries, loaded_id, module)
-            if match is None or not match["loaded"]:
-                raise ProviderError(f"{module.LABEL} didn't report {model} as loaded.")
+            # A resident ctx alias (Ollama) already carries the requested window, so attach to it instead of loading.
+            match = getattr(module, "resident_alias", lambda *a: None)(entries, model, context_length) or match
+            # Recompute staleness on the (possibly alias-replaced) match: a resident model at a
+            # different window still needs a reload, or --context-length would be silently ignored.
+            needs_load = (
+                match is None
+                or not match["loaded"]
+                or (
+                    module.SETS_CONTEXT
+                    and context_length
+                    and match.get("context_length") != context_length
+                )
+            )
+            if (
+                needs_load
+                and not allow_load
+                and module.CAN_LOAD
+                and getattr(module, "can_load", lambda *a: True)(base, key, headers)
+            ):
+                resident = [entry["id"] for entry in entries if entry["loaded"]]
+                candidates = ", ".join(resident) if resident else "none"
+                raise ProviderError(
+                    f"--no-model-load: {module.LABEL} at {base} does not have {model} "
+                    "loaded with these settings. "
+                    f"Loaded: {candidates}. Load it on the server or drop --no-model-load."
+                )
+            if needs_load:
+                loaded_id = module.load(base, key, model, context_length if module.SETS_CONTEXT else None, headers)
+                entries = module.models(base, key, headers)
+                match = _find(entries, loaded_id, module)
+                if match is None or not match["loaded"]:
+                    raise ProviderError(f"{module.LABEL} didn't report {model} as loaded.")
     else:
         loaded = [entry for entry in entries if entry["loaded"]]
         if not loaded:
             raise ProviderError(
-                f"No model is loaded on {module.LABEL} at {base}. Pass --model <name> to "
-                + ("load one." if module.CAN_LOAD else "pick one it serves.")
+                f"No model is loaded on {module.LABEL} at {base}. Pass --model <name> "
+                + ("to load one." if module.CAN_LOAD and allow_load else "to pick one it serves.")
             )
         if len(loaded) > 1:
             names = ", ".join(entry["id"] for entry in loaded)

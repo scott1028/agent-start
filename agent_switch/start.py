@@ -3,7 +3,6 @@
 
 """`unsloth start` — launch a coding agent against a running Unsloth server."""
 
-import atexit
 import base64
 import contextlib
 import errno
@@ -25,7 +24,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Literal, NamedTuple, NoReturn, Optional
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode
 
 import click
 import typer
@@ -148,7 +147,7 @@ _CODEX_ENV_UNSET = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN")
 # Shared by every agent command; only the config/env/command differ. Help is grouped into rich panels so `--help` reads as Model / Server / Session instead of one long unaligned list.
 _PANEL_MODEL = "Model"
 _PANEL_SERVER = "Server"
-_PANEL_SAMPLING = "Sampling"
+_PANEL_SAMPLING = "Sampling (in the agent's requests, not on the server; ignored if unsent)"
 _PANEL_SESSION = "Agent session"
 
 _MODEL_OPTION = typer.Option(
@@ -159,51 +158,12 @@ _MODEL_OPTION = typer.Option(
     help = "Model for the agent, or a bare `org/name(:variant)` positional. "
     "Defaults to the one loaded on the server.",
 )
-_GGUF_VARIANT_OPTION = typer.Option(
-    None,
-    "--gguf-variant",
-    rich_help_panel = _PANEL_MODEL,
-    help = "GGUF quant variant to load (e.g. UD-Q4_K_XL). Defaults to UD-Q4_K_XL for "
-    "unsloth/* GGUF repos, else Q4_K_M.",
-)
 _CONTEXT_OPTION = typer.Option(
     0,
     "--max-seq-length",
     "--context-length",
     rich_help_panel = _PANEL_MODEL,
     help = "Context length in tokens for the load (0 = model default).",
-)
-_LOAD_4BIT_OPTION = typer.Option(
-    True,
-    "--load-in-4bit/--no-load-in-4bit",
-    rich_help_panel = _PANEL_MODEL,
-    help = "Load hub models in 4-bit (ignored for GGUF).",
-)
-_TENSOR_PARALLEL_OPTION = typer.Option(
-    False,
-    "--tensor-parallel/--no-tensor-parallel",
-    rich_help_panel = _PANEL_MODEL,
-    help = "Split a GGUF across GPUs by tensor instead of by layer (multi-GPU only).",
-)
-_GPU_MEMORY_MODE_OPTION = typer.Option(
-    None,
-    "--gpu-memory-mode",
-    rich_help_panel = _PANEL_MODEL,
-    help = (
-        "GPU memory strategy for GGUF models loaded by this command. Auto lets "
-        "Unsloth manage placement. Manual with default layers and context delegates "
-        "placement and sizing to llama.cpp --fit. Omit when attaching to preserve "
-        "the running model's mode."
-    ),
-)
-
-# Server knobs. Tool flags only configure a server `unsloth start` auto-starts (--serve); reasoning rides in the agent's own config where it can.
-_SERVE_OPTION = typer.Option(
-    True,
-    "--serve/--no-serve",
-    rich_help_panel = _PANEL_SERVER,
-    help = "If no Unsloth server is running, auto-start one for --model and keep it "
-    "available after the agent exits. --no-serve errors out instead.",
 )
 _URL_OPTION = typer.Option(
     None,
@@ -219,26 +179,12 @@ _PROVIDER_OPTION = typer.Option(
     help = "Server type, when detection should be skipped. Without --url, its usual local port.",
 )
 ProviderName = Literal["unsloth", "ollama", "lmstudio", "llamacpp", "vllm", "openai"]
-_ENABLE_TOOLS_OPTION = typer.Option(
-    None,
-    "--enable-tools/--disable-tools",
+_MODEL_LOAD_OPTION = typer.Option(
+    True,
+    "--model-load/--no-model-load",
     rich_help_panel = _PANEL_SERVER,
-    help = "Server-side tools (web search, code execution) for the auto-started server. "
-    "Default off so the agent's own tools are relayed unchanged.",
-)
-_TOOL_CALL_HEALING_OPTION = typer.Option(
-    None,
-    "--enable-tool-call-healing/--disable-tool-call-healing",
-    rich_help_panel = _PANEL_SERVER,
-    help = "Promote text-form tool calls from small GGUFs back into structured calls. On by "
-    "default; when the flag is omitted an inherited UNSLOTH_DISABLE_TOOL_CALL_HEALING is kept.",
-)
-_TOOL_CALL_NUDGING_OPTION = typer.Option(
-    None,
-    "--enable-tool-call-nudging/--disable-tool-call-nudging",
-    rich_help_panel = _PANEL_SERVER,
-    help = "Retry once with a nudge when a non-streaming passthrough tool call can't be healed. "
-    "On by default; when the flag is omitted an inherited UNSLOTH_TOOL_CALL_NUDGE is kept.",
+    help = "--no-model-load: never load, reload or unload a model on the server; "
+    "--model must already be loaded there.",
 )
 _REASONING_OPTION = typer.Option(
     None,
@@ -259,7 +205,7 @@ _REASONING_EFFORT_OPTION = typer.Option(
         "unset, which keeps the template's level."
     ),
 )
-# Sampling overrides ride in the agent's own config, so only this session uses them; one the agent cannot send pins the auto-started server instead. Default unset means the model's recommended sampling is used.
+# Sampling overrides ride in the agent's own config, so only this session uses them; one the agent cannot send is ignored. Default unset means the model's recommended sampling is used.
 _TEMPERATURE_OPTION = typer.Option(
     None,
     "--temperature",
@@ -567,11 +513,10 @@ class LoadOptions(NamedTuple):
 
     gguf_variant: Optional[str] = None
     max_seq_length: int = 0
-    load_in_4bit: bool = True
-    tensor_parallel: bool = False
-    gpu_memory_mode: Optional[Literal["auto", "manual"]] = None
     # Names the user actually typed: --context-length 0 equals the declared default yet is a reset the server must hear. Appended last to keep positional callers working.
     supplied: frozenset = frozenset()
+    # --no-model-load: never load, reload or unload a model on the server.
+    allow_load: bool = True
 
     def overrides(self) -> frozenset:
         """Fields that must reach the load: typed explicitly, or differing from default."""
@@ -580,9 +525,6 @@ class LoadOptions(NamedTuple):
             for name, default in (
                 ("gguf_variant", None),
                 ("max_seq_length", 0),
-                ("load_in_4bit", True),
-                ("tensor_parallel", False),
-                ("gpu_memory_mode", None),
             )
             if getattr(self, name) != default
         }
@@ -591,11 +533,7 @@ class LoadOptions(NamedTuple):
 
 
 _LOAD_OPTION_PARAMS = (
-    "gguf_variant",
     "max_seq_length",
-    "load_in_4bit",
-    "tensor_parallel",
-    "gpu_memory_mode",
 )
 
 
@@ -616,26 +554,19 @@ def _supplied_load_params(ctx) -> frozenset:
     return frozenset(supplied)
 
 
-def _load_options(
-    ctx, gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode
-) -> LoadOptions:
+def _load_options(ctx, max_seq_length, allow_load: bool = True) -> LoadOptions:
     """Build LoadOptions for an agent command, recording what was typed."""
     return LoadOptions(
-        gguf_variant,
+        None,
         max_seq_length,
-        load_in_4bit,
-        tensor_parallel,
-        gpu_memory_mode,
         _supplied_load_params(ctx),
+        allow_load,
     )
 
 
 class ServerOptions(NamedTuple):
-    """Start flags: carried fields ride in the agent's requests; the rest configure an auto-started server."""
+    """Start flags: carried fields ride in the agent's requests."""
 
-    enable_tools: Optional[bool] = None
-    tool_call_healing: Optional[bool] = None
-    tool_call_nudging: Optional[bool] = None
     reasoning: Optional[Literal["on", "off", "auto"]] = None
     reasoning_effort: Optional[str] = None
     temperature: Optional[float] = None
@@ -646,8 +577,6 @@ class ServerOptions(NamedTuple):
     presence_penalty: Optional[float] = None
     # Fields the agent's own config sends with each request, kept off the server.
     carried: frozenset = frozenset()
-    # Carried fields with a value: an inherited UNSLOTH_SAMPLING_* pin would override them.
-    unpinned: frozenset = frozenset()
     # The server the body goes to; others name some fields differently or drop them.
     provider: str = "unsloth"
 
@@ -739,12 +668,10 @@ def _subagent_model_id(
     key: str,
     entry: dict,
     requested_model: Optional[str],
-    requested_variant: Optional[str],
 ) -> str:
     """Return an API model id that preserves the selected GGUF variant. Coding-agent model definitions outlive the initial load, so if Unsloth later unloads the model a bare repository id may resolve to a different cached quant; include the explicit or currently loaded variant so an automatic reload selects the same weights."""
     model_id = str(entry["id"])
-    _, inline_variant = _split_repo_variant(requested_model or "")
-    variant = requested_variant or inline_variant
+    _, variant = _split_repo_variant(requested_model or "")
     if not variant:
         try:
             status = _http_json("GET", f"{base}/api/inference/status", key)
@@ -805,8 +732,8 @@ def _http_json(
 ):
     """On a failed request: raise if `error` is None, else fail with `error` plus the reason.
 
-    `internal_auth` marks a request that authenticates with an agent-switch credential: Studio's
-    owner JWT for its API-key calls, or the start key of a server this command launched. The user's
+    `internal_auth` marks a request that authenticates with an agent-switch credential:
+    Studio's owner JWT for its API-key calls. The user's
     custom --header pairs belong to the model API and must not replace those.
     """
     custom = {} if internal_auth else _active_target.headers
@@ -844,19 +771,12 @@ def _http_json(
         _fail_request(exc, error)
 
 
-# A server that WE auto-started (never one we merely found). Kept at module scope so failure paths and the atexit backstop can tear it down without threading a handle through all six agent commands. Only one agent runs per process, so one slot is enough.
-_auto_served_server: Optional[subprocess.Popen] = None
-# Model download + load can be slow, so this caps time since the download last
-# advanced, not total elapsed time (see `_start_studio_server`).
-_SERVER_START_TIMEOUT_S = 900
+# How often the progress reader polls the server's download endpoints while a load runs.
 _DOWNLOAD_POLL_INTERVAL_S = 1.0
 # Ceiling on the doubling back-off the progress reader uses after a polling error.
 _DOWNLOAD_POLL_MAX_BACKOFF_S = 60.0
 # How often the progress reader re-lists the repos a load announced; each listed repo costs a cache scan per poll.
 _LOAD_DOWNLOAD_LIST_INTERVAL_S = 5.0
-_START_API_KEY_PREFIX = "UNSLOTH_START_API_KEY: "
-_START_PORT_PREFIX = "UNSLOTH_START_PORT: "
-_START_API_KEY_MARKER_ENV = "_UNSLOTH_START_API_KEY_MARKER"
 
 
 def _format_download_bytes(value: int) -> str:
@@ -994,13 +914,9 @@ class _ModelDownloadProgress:
         key: str,
         model: str,
         variant: Optional[str],
-        internal_auth: bool = False,
     ) -> None:
         self._base = base
         self._key = key
-        # A server this command launched reports progress against its start key, which the user's
-        # custom --header pairs must not replace.
-        self._internal_auth = internal_auth
         self._model = model
         self._variant = variant or ""
         self._expected_bytes = 0
@@ -1038,7 +954,6 @@ class _ModelDownloadProgress:
                         f"{self._base}/api/hub/gguf-variants?{params}",
                         self._key,
                         timeout = 10,
-                        internal_auth = self._internal_auth,
                     )
                 except urllib.error.HTTPError as exc:
                     if exc.code != 404:
@@ -1049,7 +964,6 @@ class _ModelDownloadProgress:
                         f"{self._base}/api/models/gguf-variants?{params}",
                         self._key,
                         timeout = 10,
-                        internal_auth = self._internal_auth,
                     )
                 self._variant = self._variant or str(info.get("default_variant") or "")
                 wanted = _normalized_variant(self._variant)
@@ -1072,9 +986,7 @@ class _ModelDownloadProgress:
         self._listed_at = now
         try:
             url = f"{self._base}{self._progress_prefix}/active-downloads"
-            listing = _http_json(
-                "GET", url, self._key, timeout = 10, internal_auth = self._internal_auth
-            )
+            listing = _http_json("GET", url, self._key, timeout = 10)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 self._listed_at = float("inf")  # Older server: no load-owned jobs to find.
@@ -1102,7 +1014,7 @@ class _ModelDownloadProgress:
         else:
             params = urlencode({"repo_id": repo})
             url = f"{self._base}{self._progress_prefix}/download-progress?{params}"
-        return _http_json("GET", url, self._key, timeout = 10, internal_auth = self._internal_auth)
+        return _http_json("GET", url, self._key, timeout = 10)
 
     def poll(self) -> None:
         if not self._configured:
@@ -1149,10 +1061,10 @@ class _ModelDownloadProgress:
             if active in readings:
                 self._display.update(readings[active], active)
         except Exception:
-            # Progress is best-effort and never fails the load, but `_start_studio_server`
-            # reads `downloaded_bytes` to tell a live transfer from a wedged one. Backing
-            # off keeps a broken endpoint cheap; giving up for good would kill the very
-            # download this exists to protect, so it never stops probing.
+            # Progress is best-effort and never fails the load; `downloaded_bytes` is read
+            # only by tests asserting what the reader saw. Backing off keeps a broken endpoint cheap;
+            # giving up for good would kill the very download this exists to protect, so
+            # it never stops probing.
             self._failures += 1
             self._retry_at = time.monotonic() + min(
                 2.0**self._failures, _DOWNLOAD_POLL_MAX_BACKOFF_S
@@ -1216,356 +1128,19 @@ def _load_model_with_progress(
         progress.close()
 
 
-def _studio_healthy(base: str, timeout: float = 3.0) -> bool:
-    request = urllib.request.Request(f"{base}/api/health", headers = {"User-Agent": _USER_AGENT})
-    try:
-        with urllib.request.urlopen(request, timeout = timeout) as response:
-            return json.loads(response.read(65536).decode() or "{}").get("status") == "healthy"
-    except Exception:
-        return False
-
-
-def _read_log(path: Path) -> str:
-    try:
-        return path.read_text(encoding = "utf-8", errors = "replace")
-    except OSError:
-        return "(no server log)"
-
-
-def _log_tail(path: Path, lines: int = 20) -> str:
-    return "\n".join(_read_log(path).splitlines()[-lines:])
-
-
-def _redacted_log_tail(path: Path, lines: int = 20) -> str:
-    """Tail with minted keys removed; only for tails shown on the terminal."""
-    return re.sub(r"sk-unsloth-\S+", "sk-unsloth-[redacted]", _log_tail(path, lines))
-
-
-def _shutdown_server(server: Optional[subprocess.Popen]) -> None:
-    # Idempotent teardown of a server WE started, plus its own children (llama-server, cloudflared). A no-op once the process is already gone.
-    if server is None or server.poll() is not None:
-        return
-    if os.name == "nt":
-        # terminate()/kill() reach only the parent `unsloth run`; taskkill /T walks the whole tree so the llama-server child does not keep the port and GPU.
-        try:
-            subprocess.run(
-                ["taskkill", "/PID", str(server.pid), "/T", "/F"],
-                capture_output = True,
-                timeout = 15,
-                check = False,
-            )
-            server.wait(timeout = 5)
-        except Exception:
-            with contextlib.suppress(Exception):
-                server.kill()
-        return
-    try:
-        os.killpg(os.getpgid(server.pid), signal.SIGTERM)
-    except OSError:
-        server.terminate()
-    try:
-        server.wait(timeout = 15)
-    except Exception:
-        try:
-            os.killpg(os.getpgid(server.pid), signal.SIGKILL)
-        except OSError:
-            server.kill()
-
-
-def _shutdown_auto_served() -> None:
-    global _auto_served_server
-    server, _auto_served_server = _auto_served_server, None
-    if server is not None and server.poll() is None:
-        typer.echo("Stopping the auto-started Unsloth server…")
-        _shutdown_server(server)
-
-
-def _keep_auto_served() -> bool:
-    """Release ownership so a successfully started server survives this CLI."""
-    global _auto_served_server
-    server, _auto_served_server = _auto_served_server, None
-    atexit.unregister(_shutdown_auto_served)
-    return server is not None and server.poll() is None
-
-
-def _start_studio_server(
-    base: str,
-    model: str,
-    load: LoadOptions,
-    server: ServerOptions = ServerOptions(),
-) -> tuple:
-    """Spawn `unsloth run` for `model`, wait until it is fully ready, and return (base, server)."""
-    global _auto_served_server
-    # Windows goes through Unsloth's own interpreter, not the launcher on PATH: shutil.which resolves `unsloth` to the denied unsloth.exe, since PATHEXT puts .EXE ahead of the .cmd shim (#8490).
-    launch_head = unsloth_bridge.unsloth_launch_head() if sys.platform == "win32" else None
-    if launch_head is None:
-        launch_head = [shutil.which("unsloth") or "unsloth"]
-    parsed = urlparse(base)
-    # Tools default off means passthrough mode (relay the agent's own tools); --no-cloudflare means loopback only, no tunnel. Mirrors .github/scripts/serve-unsloth-run.sh. Healing/nudging travel via the child env below (version-agnostic) rather than new run flags that an older re-exec'd run could mistake for llama-server args.
-    command = [
-        *launch_head,
-        "run",
-        "-H",
-        parsed.hostname or "127.0.0.1",
-        "-p",
-        str(parsed.port or 8888),
-        "--enable-tools" if server.enable_tools else "--disable-tools",
-        "--no-cloudflare",
-        "--model",
-        model,
-    ]
-    if load.gguf_variant:
-        command += ["--gguf-variant", load.gguf_variant]
-    if load.max_seq_length:
-        command += ["--context-length", str(load.max_seq_length)]
-    if not load.load_in_4bit:
-        command += ["--no-load-in-4bit"]
-    if load.tensor_parallel:
-        command += ["--tensor-parallel"]
-    if load.gpu_memory_mode is not None:
-        command += ["--gpu-memory-mode", load.gpu_memory_mode]
-
-    log_path = Path(tempfile.gettempdir()) / f"unsloth-start-server-{os.getpid()}.log"
-    typer.echo("Starting Unsloth server")
-    typer.echo(f"Model: {_display_model_spec(model, load.gguf_variant)}")
-    typer.echo(f"Server log: {log_path}")
-    # 0600: the `unsloth run` banner in this log carries the minted sk-unsloth- key, and the tempdir is world-traversable. Unlink first so a stale looser-mode file (pid reuse) cannot survive with its old permissions.
-    log_path.unlink(missing_ok = True)
-    log = os.fdopen(os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb")
-    # Own session/process group so a mid-session Ctrl+C (cancel a turn) does not reach the server. It survives a successful agent session; torn down on startup/launch failure.
-    child_env = os.environ.copy()
-    # Current llama-server versions read this documented env equivalent of --reasoning. Older managed versions ignore an unknown env variable instead of failing startup on an unknown passthrough CLI flag. An omitted start option follows the model template.
-    child_env["LLAMA_ARG_REASONING"] = server.reasoning or "auto"
-    # Always written, like the line above: an inherited value would otherwise pin a level the omitted flag promises to leave alone. 'default' is llama.cpp's own sentinel for "keep the chat template's level".
-    child_env["LLAMA_ARG_REASONING_EFFORT"] = server.reasoning_effort or "default"
-    # Pass the marker via env so an older launcher ignores it instead of treating an unknown CLI flag as a llama-server arg; new launchers preserve it across re-exec.
-    child_env[_START_API_KEY_MARKER_ENV] = "1"
-    # Convey healing/nudging through the env; `unsloth run` reads these when its own flags are omitted, so this works even if run re-execs into an older Unsloth venv. Only write when the operator set the flag explicitly; otherwise keep whatever they already exported (child_env is a copy of os.environ), falling back to the start defaults (healing on, nudging on) when nothing was inherited.
-    if server.tool_call_healing is not None:
-        child_env["UNSLOTH_DISABLE_TOOL_CALL_HEALING"] = "0" if server.tool_call_healing else "1"
-    elif "UNSLOTH_DISABLE_TOOL_CALL_HEALING" not in child_env:
-        child_env["UNSLOTH_DISABLE_TOOL_CALL_HEALING"] = "0"
-    if server.tool_call_nudging is not None:
-        child_env["UNSLOTH_TOOL_CALL_NUDGE"] = "1" if server.tool_call_nudging else "0"
-    elif "UNSLOTH_TOOL_CALL_NUDGE" not in child_env:
-        child_env["UNSLOTH_TOOL_CALL_NUDGE"] = "1"
-    # Forward any sampling pin via the env; `unsloth run` reads UNSLOTH_SAMPLING_* and the backend resolver applies it as a hard override. Only set fields the operator specified.
-    for _sampling_name in _SAMPLING_FIELDS:
-        _sampling_env = f"UNSLOTH_SAMPLING_{_sampling_name.upper()}"
-        _sampling_value = getattr(server, _sampling_name)
-        if _sampling_value is not None:
-            child_env[_sampling_env] = str(_sampling_value)
-        elif _sampling_name in server.unpinned:
-            child_env.pop(_sampling_env, None)
-    kwargs: dict = {
-        "stdout": log,
-        "stderr": subprocess.STDOUT,
-        "stdin": subprocess.DEVNULL,
-        "env": child_env,
-    }
-    if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        kwargs["start_new_session"] = True
-    try:
-        server = subprocess.Popen(command, **kwargs)
-    finally:
-        log.close()  # Popen dup'd the fd; drop the parent's copy
-    _auto_served_server = server
-    atexit.register(_shutdown_auto_served)
-
-    deadline = time.monotonic() + _SERVER_START_TIMEOUT_S
-    progress: Optional[_ModelDownloadProgress] = None
-    downloaded_bytes = 0
-    early_key_seen = False
-    port_followed = False
-    try:
-        while time.monotonic() < deadline:
-            if server.poll() is not None:
-                # The early key marker lands here before load finishes; redact it.
-                tail = _redacted_log_tail(log_path)
-                _shutdown_auto_served()
-                _fail(f"The Unsloth server stopped before it was ready. Last log lines:\n{tail}")
-            tail = _log_tail(log_path, lines = 400)
-            # `unsloth run` falls forward off a taken port, so poll the port it reports. Printed
-            # once, so read the whole log, not the tail below.
-            if not port_followed:
-                bound_port = re.search(
-                    rf"^{re.escape(_START_PORT_PREFIX)}(\d+)$",
-                    _read_log(log_path),
-                    flags = re.MULTILINE,
-                )
-                if bound_port:
-                    port_followed = True
-                    base = _effective_base(base, int(bound_port.group(1)))
-            if progress is None:
-                marker = re.search(
-                    rf"^{re.escape(_START_API_KEY_PREFIX)}(sk-unsloth-[^\s]+)$",
-                    tail,
-                    flags = re.MULTILINE,
-                )
-                if marker:
-                    early_key_seen = True
-                    progress = _ModelDownloadProgress(
-                        base,
-                        marker.group(1),
-                        model,
-                        load.gguf_variant,
-                        internal_auth = True,
-                    )
-            if progress is not None:
-                progress.poll()
-            # Fresh bytes are the one unambiguous sign the child is moving, so the cap
-            # measures time since the transfer last advanced rather than total elapsed.
-            # Server log growth deliberately does NOT count: the loop's own health poll,
-            # echoed tracebacks and the loader's watchdog heartbeat all keep the log
-            # growing while nothing loads, which would make this deadline unreachable.
-            bytes_now = progress.downloaded_bytes if progress is not None else 0
-            if bytes_now > downloaded_bytes:
-                deadline = time.monotonic() + _SERVER_START_TIMEOUT_S
-            downloaded_bytes = bytes_now
-            # New children emit an early key marker, so wait for the final model banner;
-            # older children only print the key after load, so fall back to that.
-            ready_signal = "Model loaded:" in tail if early_key_seen else "sk-unsloth-" in tail
-            if _studio_healthy(base) and ready_signal:
-                if progress is not None:
-                    progress.complete()
-                    progress.close()
-                    progress = None
-                return base, server
-            time.sleep(2.0)
-    finally:
-        if progress is not None:
-            progress.close()
-    _shutdown_auto_served()
-    _fail(
-        "The Unsloth server didn't become ready and made no progress for "
-        f"{_SERVER_START_TIMEOUT_S}s. See {log_path}."
-    )
-
-
-def _effective_base(base: str, port: Optional[int] = None) -> str:
-    # `unsloth run` binds to `parsed.port or 8888` and serves at the root, so normalize UNSLOTH_STUDIO_URL to plain scheme://host:port. A portless http://127.0.0.1 would otherwise launch on 8888 but poll port 80, and a path like /studio would poll /studio/api/health (404), either way hitting the startup timeout. IPv6 literals stay bracketed.
-    parsed = urlparse(base)
-    host = parsed.hostname or "127.0.0.1"
-    if ":" in host:  # bare IPv6 literal (urlparse strips the brackets)
-        host = f"[{host}]"
-    return f"{parsed.scheme or 'http'}://{host}:{port or parsed.port or 8888}"
-
-
-def _require_studio(
-    model: Optional[str] = None,
-    load: Optional[LoadOptions] = None,
-    *,
-    serve: bool = False,
-    launch: bool = True,
-    server_options: ServerOptions = ServerOptions(),
-) -> tuple:
-    """Return (base, server). server is a Popen only when WE auto-started it."""
-    sent = server_options.sent_by_agent()
-    server_options = server_options._replace(
-        unpinned = frozenset(name for name in sent if getattr(server_options, name) is not None),
-        **dict.fromkeys(sent),
-    )
-    # What the agent cannot send itself only reaches the env of a server WE launch, which then applies it to every client.
-    _pinned = [
-        "--" + _name.replace("_", "-")
-        for _name in _SAMPLING_FIELDS
-        if getattr(server_options, _name) is not None
-    ]
-    _reasoning_pins = [
-        f"{_flag} {_value}"
-        for _flag, _value in (
-            ("--reasoning", server_options.reasoning),
-            ("--reasoning-effort", server_options.reasoning_effort),
-        )
-        if _value is not None
-    ]
+def _require_studio() -> str:
+    """The base of a running Unsloth server; this command never starts one."""
     # Only the health probe is restricted: find_studio_server() sends the pairs to a base the user
     # named and stays credential-free on the default port and the pid-record bases. The Studio it
     # finds then carries them on every request, like an explicit --api-key does.
     base = find_studio_server(headers = _active_target.headers)
     if base is not None:
-        if _pinned:
-            typer.echo(
-                f"Warning: an Unsloth server is already running at {base}, and this agent "
-                f"cannot send {', '.join(_pinned)} itself; they apply only when this command "
-                "starts the server, so the running server keeps its current sampling. Stop it "
-                "with `unsloth studio stop` and re-run to apply them.",
-                err = True,
-            )
-        if _reasoning_pins:
-            typer.echo(
-                f"Warning: an Unsloth server is already running at {base}, and this agent "
-                f"cannot send {', '.join(_reasoning_pins)} itself; it takes effect only when "
-                "this command starts the server, so the running server keeps its current "
-                "reasoning mode. Stop it with `unsloth studio stop` and re-run to apply the "
-                "override.",
-                err = True,
-            )
-        _tool_flags = [
-            _on if _value else _off
-            for _value, _on, _off in (
-                (server_options.enable_tools, "--enable-tools", "--disable-tools"),
-                (
-                    server_options.tool_call_healing,
-                    "--enable-tool-call-healing",
-                    "--disable-tool-call-healing",
-                ),
-                (
-                    server_options.tool_call_nudging,
-                    "--enable-tool-call-nudging",
-                    "--disable-tool-call-nudging",
-                ),
-            )
-            if _value is not None
-        ]
-        if _tool_flags:
-            typer.echo(
-                f"Warning: an Unsloth server is already running at {base}; "
-                f"{', '.join(_tool_flags)} takes effect only when this command starts the "
-                "server, so the running server keeps its current tool settings. Stop it with "
-                "`unsloth studio stop` and re-run to apply it.",
-                err = True,
-            )
-        return base, None
+        return base
     expected = os.environ.get("UNSLOTH_STUDIO_URL", "http://127.0.0.1:8888").rstrip("/")
-    # Auto-start a local server only for an interactive launch with a model to serve, and only for a plain-HTTP loopback target: never stand in for an explicit remote UNSLOTH_STUDIO_URL, and never for an https:// one, since `unsloth run` serves plain HTTP and the health poll against https would spin until the startup timeout.
-    if (
-        serve
-        and launch
-        and model
-        and is_loopback_url(expected)
-        and urlparse(expected).scheme == "http"
-    ):
-        # Normalize to the port unsloth run actually binds, so the health poll and the returned base hit the same server we launch, not a portless :80.
-        expected = _effective_base(expected)
-        load = load or LoadOptions()
-        _server_wide = _pinned + [pin for pin in _reasoning_pins if pin != "--reasoning auto"]
-        if _server_wide:
-            typer.echo(
-                f"Warning: this agent cannot send {', '.join(_server_wide)} itself, so the "
-                "server this command starts applies them to every client until it stops.",
-                err = True,
-            )
-        _dropped = [
-            f"UNSLOTH_SAMPLING_{_name.upper()}"
-            for _name in _SAMPLING_FIELDS
-            if _name in server_options.unpinned
-            and os.environ.get(f"UNSLOTH_SAMPLING_{_name.upper()}")
-        ]
-        if _dropped:
-            typer.echo(
-                f"Warning: this agent's flags replace the inherited {', '.join(_dropped)}, so "
-                "the server this command starts drops those pins for every client.",
-                err = True,
-            )
-        # Leave a bare GGUF repo's variant unset: the server's own quant preference already picks the best available (UD-Q4_K_XL for Unsloth uploads, else Q4_K_M) and falls back when that exact quant is missing, which forcing a fixed variant here would break.
-        return _start_studio_server(expected, model, load, server_options)
-    model_hint = "" if model else " Pass --model to have it start one for you, or"
     _fail(
-        f"No running Unsloth server found at {expected}.{model_hint} start one with "
-        "`unsloth studio`, or point UNSLOTH_STUDIO_URL at a remote server."
+        f"No running Unsloth server found at {expected}. Start one with `unsloth studio` or "
+        "`unsloth run`, point UNSLOTH_STUDIO_URL at a remote server, or pick another server "
+        "with --url/--provider."
     )
 
 
@@ -1727,12 +1302,7 @@ def _key_accepted(base: str, key: str) -> bool:
         )
 
 
-def _agent_api_key(
-    base: str,
-    explicit: Optional[str],
-    *,
-    auto_started: bool = False,
-) -> str:
+def _agent_api_key(base: str, explicit: Optional[str]) -> str:
     # A custom Authorization from --header is the credential every request to this server actually
     # sends, so no Studio key is needed here: replaying or minting below would validate a credential
     # that is never used. Every agent lets that Authorization win over this placeholder key.
@@ -1740,10 +1310,8 @@ def _agent_api_key(
         return providers.NO_KEY
     cache = _key_cache_path()
     if explicit:
-        if not auto_started or _key_accepted(base, explicit):
-            _remember_key(cache, base, explicit, "saved")
-            return explicit
-        # The server was auto-started for this run, so an exported UNSLOTH_API_KEY meant for some other server must not fail the launch: the loopback mint path below is guaranteed to work. An explicit key the fresh server accepts is still honored above.
+        _remember_key(cache, base, explicit, "saved")
+        return explicit
 
     # Replay a key the user saved for THIS EXACT server first (scoped per base, so it only goes back there, including a remote or SSH-tunnelled Unsloth whose secret the local handshake cannot match). Skip ones the server rejects.
     for key in _cached_keys(cache, base, "saved"):
@@ -1907,20 +1475,29 @@ def _inference_status(base: str, key: str) -> dict:
         return {}
 
 
-_OTHER_ACCOUNT_RESIDENT = (
-    "The model loaded in Unsloth belongs to another account, so this API key cannot use it. "
-    "Pass --model <hf-id-or-path> to load one: the same model and quant shares it, anything "
-    "else unloads it for every session using it."
-)
+def _other_account_resident(allow_load: bool) -> str:
+    head = "The model loaded in Unsloth belongs to another account, so this API key cannot use it. "
+    if not allow_load:
+        return head + "Load one on the server, or drop --no-model-load and pass --model <hf-id-or-path>."
+    return (
+        head
+        + "Pass --model <hf-id-or-path> to load one: the same model and quant shares it, "
+        "anything else unloads it for every session using it."
+    )
 
 
-def _resident_load_target(models: list, status: dict, allow_casefold: bool):
+def _resident_load_target(models: list, status: dict, allow_casefold: bool, allow_load: bool = True):
     """(identifier to post, id it is advertised as) for the running model. The loaded listing shows only the sanitized basename while _same_loaded_identifier compares resident paths exactly, so the load must carry the identifier status reports."""
     if status.get("is_diffusion"):
         # An image runtime answers with an active_model like any other, but it cannot serve chat: targeting it would tear down the diffusion server and then point the agent at a model that can never answer it.
         _fail(
             "Unsloth is serving an image model, which cannot serve chat, so there are no "
-            "settings to apply. Re-run with --model naming the chat model to load."
+            "settings to apply. "
+            + (
+                "Re-run with --model naming the chat model to load."
+                if allow_load
+                else "Load a chat model on the server; --no-model-load never loads one."
+            )
         )
     active_id = status.get("active_model")
     entry = None
@@ -1947,12 +1524,16 @@ def _resident_load_target(models: list, status: dict, allow_casefold: bool):
     public_id = active_id or (entry or {}).get("id")
     if not public_id:
         if status.get("yours") is False:
-            _fail(_OTHER_ACCOUNT_RESIDENT)
+            _fail(_other_account_resident(allow_load))
         if status:
             # Status answered and named no chat model. Returning empty here would drop the knobs silently, which is the bug this path exists to fix.
             _fail(
                 "No chat model is currently loaded, so there are no settings to apply. "
-                "Re-run with --model naming the model to load."
+                + (
+                    "Re-run with --model naming the model to load."
+                    if allow_load
+                    else "Load one on the server, or drop --no-model-load."
+                )
             )
         return None, None
     identifier = status.get("model_identifier")
@@ -2042,34 +1623,80 @@ def _load_settings_differ(status: dict, load: LoadOptions, overrides: frozenset)
             resident = status.get("requested_context_length")
             if resident is None or int(resident) != int(load.max_seq_length):
                 return True
-        elif name == "load_in_4bit":
-            # GGUF has no 4-bit setting and reports null, which would read as "differs" and warn about an unload the server is not going to perform.
-            if status.get("is_gguf"):
-                continue
-            resident = status.get("load_in_4bit")
-            if resident is None or bool(resident) != bool(load.load_in_4bit):
-                return True
-        elif name == "tensor_parallel":
-            # llama.cpp only. The standard load never forwards it, so a restart would apply nothing.
-            if not status.get("is_gguf"):
-                continue
-            # The architecture gate can normalize a tensor request to layer mode and say so, so asking for it AGAIN is the request already applied, not a difference, and the backend dedupes exactly this state. Asking to turn it OFF is the opposite: the backend keeps the tensor intent behind that fallback and does not read a bare false as an explicit drop (the UI sends false routinely), so only a real reload can clear it.
-            if status.get("tensor_parallel_dropped_by_arch_gate"):
-                if load.tensor_parallel:
-                    continue
-                return True
-            if bool(status.get("tensor_parallel")) != bool(load.tensor_parallel):
-                return True
-        elif name == "gpu_memory_mode":
-            if not status.get("is_gguf"):
-                continue
-            # A paravirtual host pins every placement request to the same runtime, and a CPU fallback is preserved across reloads by _preserve_cpu_fallback_intent, so in both cases the raw mode cannot tell two requests apart. resident-config-match.ts skips placement on exactly these two for the same reason.
-            if status.get("gpu_placement_paravirtual") or status.get("cpu_fallback_reason"):
-                continue
-            if status.get("gpu_memory_mode") != load.gpu_memory_mode:
-                return True
-            # Manual to manual is a real no-op: the payload only sends the implicit gpu_layers = -1 when switching INTO manual, so a resident already pinned to a layer count keeps it through the round-trip and nothing changes.
     return False
+
+
+def _refuse_not_resident(display: str, models: list) -> NoReturn:
+    loaded = [str(m.get("id")) for m in models if m.get("loaded") is not False]
+    candidates = ", ".join(loaded) if loaded else "none"
+    _fail(
+        f"--no-model-load: {display} is not loaded on the server with these "
+        f"settings. Loaded: {candidates}. Load it on the server or drop --no-model-load."
+    )
+
+
+def _attach_resident_only(
+    base: str,
+    key: str,
+    models: list,
+    requested: str,
+    attach_public_id: Optional[str],
+    load: LoadOptions,
+    overrides: frozenset,
+    allow_casefold: bool,
+    status: dict,
+) -> dict:
+    """--no-model-load: attach a proven resident listing entry, or fail. Never loads, reloads or unloads anything."""
+
+    # The inferred path's requested may be a server-internal identifier; show the public one.
+    display = attach_public_id or requested
+    wanted_ids = ({requested, attach_public_id} - {None}) | _public_model_ids(requested)
+    entry = next(
+        (
+            m
+            for m in models
+            if m.get("loaded") is not False
+            and any(
+                _model_id_matches(m.get("id"), want, allow_casefold = allow_casefold)
+                for want in wanted_ids
+            )
+        ),
+        None,
+    )
+    if entry is None:
+        _refuse_not_resident(display, models)
+    if not status:
+        status = _inference_status(base, key)
+    # An older server without the status endpoint cannot prove the runtime settings match.
+    if not status:
+        _refuse_not_resident(display, models)
+    # Status describes the ACTIVE chat model; its settings only prove anything about the entry we attach if it IS that model.
+    if _is_model_path(requested):
+        loaded_paths = {
+            str(status.get(field))
+            for field in ("model_identifier", "gguf_path", "model_path")
+            if status.get(field)
+        }
+        wanted_path = os.path.abspath(os.path.expanduser(requested))
+        if not any(
+            os.path.abspath(os.path.expanduser(path)) == wanted_path for path in loaded_paths
+        ):
+            _refuse_not_resident(display, models)
+    elif not any(
+        _model_id_matches(status.get(field), requested, allow_casefold = allow_casefold)
+        for field in ("active_model", "model_identifier")
+        if status.get(field)
+    ):
+        _refuse_not_resident(display, models)
+    if "gguf_variant" in overrides:
+        resident = status.get("gguf_variant") if status.get("is_gguf") else None
+        if not resident or str(resident).strip().lower() != str(load.gguf_variant).strip().lower():
+            _refuse_not_resident(display, models)
+    if "max_seq_length" in overrides:
+        resident = status.get("requested_context_length")
+        if resident is None or int(resident) != int(load.max_seq_length):
+            _refuse_not_resident(display, models)
+    return entry
 
 
 def _resolve_model(
@@ -2078,7 +1705,6 @@ def _resolve_model(
     requested: Optional[str],
     load: LoadOptions = LoadOptions(),
     preload_check = None,
-    infer_resident: bool = True,
 ) -> dict:
     models = _loaded_models(base, key)
     load_requested = False
@@ -2092,9 +1718,11 @@ def _resolve_model(
     status_snapshot = None
     # Whether the inferred settings can restart the resident. Computed once: the preload gate, the warning, the consent refusal and force_reload must all agree, and asking twice against a snapshot taken at different times is how they drift apart.
     inferred_differs = False
-    if requested is None and load_has_overrides and infer_resident:
+    if requested is None and load_has_overrides:
         status_snapshot = _inference_status(base, key)
-        requested, attach_public_id = _resident_load_target(models, status_snapshot, allow_casefold)
+        requested, attach_public_id = _resident_load_target(
+            models, status_snapshot, allow_casefold, load.allow_load
+        )
         inferred_differs = _load_settings_differ(status_snapshot, load, overrides)
         # preload_check deliberately survives: it is the only gate before the load evicts the shared model (_require_gguf_for_codex runs after _connect returns). An older server answers this listing from the full catalog, which also carries cached-but-unloaded entries (loaded == False); matching one would skip /api/inference/load and leave the agent pointed at a model that is not resident, so only attach to an entry that is actually loaded.
     match = (
@@ -2110,6 +1738,19 @@ def _resolve_model(
             None,
         )
     )
+    if not load.allow_load and requested and match is None:
+        # --no-model-load: attach only a resident whose id, path, variant and settings are PROVEN to match; the load endpoint is never called.
+        return _attach_resident_only(
+            base,
+            key,
+            models,
+            requested,
+            attach_public_id,
+            load,
+            overrides,
+            allow_casefold,
+            status_snapshot or {},
+        )
     if requested and match is None:
         load_requested = True
         # Only here is an evicting load certain: the gate must not reject a request the resident model already satisfies (a path-loaded GGUF shown as a bare basename can collide with a non-GGUF unsloth/<name>).
@@ -2223,23 +1864,8 @@ def _resolve_model(
         # Mirror `unsloth run`'s load knobs; keep the default payload as just model_path so a bare `--model` load is unchanged. Membership decides, not truthiness: a reset like --context-length 0 equals the default yet must be sent.
         payload = {"model_path": requested}
         if "gguf_variant" in overrides and load.gguf_variant:
-            direct_file = attach_public_id is not None and str(requested).lower().endswith(".gguf")
-            if direct_file:
-                # from_identifier consults a variant only for a DIRECTORY, so a DIFFERENT quant cannot be selected: posting one would reload the very same file and label it with a quant that does not describe its weights. Restating the one already running asks for no change, so drop the inapplicable field and let the other overrides through.
-                resident_variant = status_snapshot.get("gguf_variant")
-                same = (
-                    bool(resident_variant)
-                    and str(resident_variant).strip().lower()
-                    == str(load.gguf_variant).strip().lower()
-                )
-                if not same:
-                    _fail(
-                        f"'{attach_public_id}' was loaded from a single .gguf file, so "
-                        f"--gguf-variant {load.gguf_variant} cannot select a different quant. "
-                        "Re-run with --model naming the repository to switch quants."
-                    )
-            else:
-                payload["gguf_variant"] = load.gguf_variant
+            # The variant now comes only from the `org/name:QUANT` shorthand, which requires --model, so the inferred path (attach_public_id) never reaches here.
+            payload["gguf_variant"] = load.gguf_variant
         elif attach_public_id is not None and status_snapshot.get("is_gguf"):
             # Re-send the running quant: a repo id carries none, so from_identifier would auto-pick (GGUF_QUANT_PREFERENCE, UD-Q4_K_XL first) and changing only the context would evict a chosen Q8_0 to download a different quant. Skip a .gguf path, which loads as itself; the server gates on the same suffix.
             resident_variant = status_snapshot.get("gguf_variant")
@@ -2247,18 +1873,6 @@ def _resolve_model(
                 payload["gguf_variant"] = resident_variant
         if "max_seq_length" in overrides:
             payload["max_seq_length"] = load.max_seq_length
-        if "load_in_4bit" in overrides:
-            payload["load_in_4bit"] = load.load_in_4bit
-        if "tensor_parallel" in overrides:
-            payload["tensor_parallel"] = load.tensor_parallel
-        if "gpu_memory_mode" in overrides and load.gpu_memory_mode is not None:
-            payload["gpu_memory_mode"] = load.gpu_memory_mode
-            # -1 means "pick the layers", which is right when the user is switching INTO manual, but on an inferred attach to a resident already in manual it would throw away the layer count it was pinned to. Leave it for the round-trip.
-            already_manual = (
-                attach_public_id is not None and status_snapshot.get("gpu_memory_mode") == "manual"
-            )
-            if load.gpu_memory_mode == "manual" and not already_manual:
-                payload["gpu_layers"] = -1
         if (
             attach_public_id is not None
             and inferred_differs
@@ -2322,12 +1936,15 @@ def _resolve_model(
     resident = next((m for m in models if m.get("loaded") is not False), None)
     if resident is None:
         if _inference_status(base, key).get("yours") is False:
-            _fail(_OTHER_ACCOUNT_RESIDENT)
+            _fail(_other_account_resident(load.allow_load))
         # An empty listing and one holding only unloaded entries are the same situation
         # to the user, and which one a server sends depends only on its version.
         _fail(
             "No model is loaded in Unsloth. Load one from the model dropdown in "
             "the UI, or pass --model <hf-id-or-path> to load it from here."
+            if load.allow_load
+            else "No model is loaded in Unsloth. Load one on the server; --no-model-load "
+            "never loads one here."
         )
     return resident
 
@@ -2625,49 +2242,6 @@ def _fail_agent_needs_gguf(agent: _GgufAgent, model_id: str) -> NoReturn:
     _fail(message)
 
 
-def _preflight_agent_gguf(
-    agent: _GgufAgent,
-    model: Optional[str],
-    *,
-    serve: bool = True,
-    launch: bool = True,
-    target: Target = Target("unsloth"),
-) -> None:
-    # Hub-listing preflight for the auto-start path only: with a server running, identifiers
-    # resolve against its cwd/cache/token, so _attach_gguf_check asks the server instead.
-    # Only a complete listing with no .gguf files rejects; unknown defers to the
-    # post-connect check. Mirrors _require_studio's auto-start condition, so with no start
-    # possible its "no running server" error comes first, without a hub probe.
-    if not (serve and launch and model):
-        return
-    # _require_studio only sees a --url/--provider target after _connect exports it, so the base
-    # below would be some other server's. Defer those targets to the post-connect check, which
-    # also asks the server with the custom pairs rather than probing it without them.
-    if target.base:
-        return
-    expected = os.environ.get("UNSLOTH_STUDIO_URL", "http://127.0.0.1:8888").rstrip("/")
-    if not is_loopback_url(expected) or urlparse(expected).scheme != "http":
-        return
-    if find_studio_server(headers = target.headers) is not None:
-        return
-    repo, _ = _split_repo_variant(model)
-    # A bare foo.gguf naming no local file is a shorthand, not a path: the load
-    # canonicalizes it like any other owner-less name.
-    if "/" not in repo and (not _is_model_path(repo) or repo.lower().endswith(".gguf")):
-        # The server canonicalizes owner-less shorthands to unsloth/<name>.
-        try:
-            if Path(os.path.expanduser(repo)).exists():
-                return
-        except OSError:
-            return
-        repo = f"unsloth/{repo}"
-    if not _is_hub_model_id(repo):
-        return
-    files = _hub_gguf_files(repo)
-    if files is not None and not files:
-        _fail_agent_needs_gguf(agent, repo)
-
-
 def _attach_gguf_check(
     agent: _GgufAgent,
     base: str,
@@ -2864,9 +2438,23 @@ def _attach_gguf_check(
                         if isinstance(row.get("quant"), str) and row["quant"]
                     )
                 )
+                if _is_model_path(candidate):
+                    # A path never parses a `:QUANT` suffix, so name the quant files themselves.
+                    files = ", ".join(
+                        dict.fromkeys(
+                            f"{candidate.rstrip('/')}/{row['filename']}"
+                            for row in variants
+                            if isinstance(row.get("filename"), str)
+                        )
+                    )
+                    _fail(
+                        f"{candidate} keeps its GGUF weights in quant subdirectories, which a "
+                        "variantless load cannot pick."
+                        + (f" Pass --model one of: {files}." if files else " Pass --model a quant file.")
+                    )
                 _fail(
                     f"{candidate} keeps its GGUF weights in quant subdirectories, which a "
-                    "variantless load cannot pick. Pass --gguf-variant"
+                    f"variantless load cannot pick. Pass --model {candidate}:<QUANT>"
                     + (f" (available: {offered})." if offered else ".")
                 )
             if variant and not _answer_offers_variant(variants, variant, strict = local_answer):
@@ -2886,7 +2474,7 @@ def _attach_gguf_check(
 
 
 def _require_gguf_for_agent(agent: _GgufAgent, base: str, key: str, model_id: str) -> None:
-    # Only a definite "no" rejects: the callers wrap this in `except BaseException: _shutdown_auto_served()`, so guessing kills a server that may have just loaded a GGUF.
+    # Only a definite "no" rejects: a wrong guess would fail a session against a server that may already be serving a GGUF.
     try:
         status = _http_json("GET", f"{base}/api/inference/status", key)
     except urllib.error.HTTPError:
@@ -4329,17 +3917,6 @@ def _launch(
 _UNSLOTH = Target("unsloth")
 # The server this invocation talks to, for the status lines _run prints. Set by _resolve_target and _connect.
 _active_target: Target = _UNSLOTH
-_UNSLOTH_LOAD_FLAGS = {
-    "gguf_variant": "--gguf-variant",
-    "load_in_4bit": "--load-in-4bit/--no-load-in-4bit",
-    "tensor_parallel": "--tensor-parallel",
-    "gpu_memory_mode": "--gpu-memory-mode",
-}
-_UNSLOTH_SERVER_FLAGS = {
-    "enable_tools": "--enable-tools/--disable-tools",
-    "tool_call_healing": "--enable-tool-call-healing/--disable-tool-call-healing",
-    "tool_call_nudging": "--enable-tool-call-nudging/--disable-tool-call-nudging",
-}
 _REQUEST_FLAGS = {
     **{name: "--" + name.replace("_", "-") for name in _SAMPLING_FIELDS},
     "enable_thinking": "--reasoning",
@@ -4372,12 +3949,26 @@ def _resolve_target(
         if len(found) > 1:
             listed = "\n".join(f"  {providers.label(t.name)} at {t.base}" for t in found)
             _fail(f"Found several model servers:\n{listed}\nPick one with --url (or --provider).")
-        # No server at all stays on Unsloth, which can auto-start one for --model.
+        # No server at all stays on Unsloth, whose _require_studio reports the missing server.
         target = found[0] if found else _UNSLOTH
         if headers:
             target = target._replace(headers = headers)
     _active_target = target
     return target
+
+
+def _warn_unsent_pins(server_options: ServerOptions) -> None:
+    """Sampling/reasoning pins this agent cannot carry in its own requests are ignored."""
+    sent = server_options.sent_by_agent()
+    unsent = [
+        _REQUEST_FLAGS[name]
+        for name in (*_SAMPLING_FIELDS, "reasoning", "reasoning_effort")
+        if getattr(server_options, name) is not None
+        and name not in sent
+        and not (name == "reasoning" and server_options.reasoning == "auto")
+    ]
+    if unsent:
+        typer.echo(f"Warning: this agent can't send {', '.join(unsent)} itself, so it is ignored.", err = True)
 
 
 def _connect_provider(
@@ -4389,30 +3980,16 @@ def _connect_provider(
     needs: tuple,
 ) -> tuple:
     label = providers.label(target.name)
-    refused = [_UNSLOTH_LOAD_FLAGS[name] for name in _UNSLOTH_LOAD_FLAGS if name in load.overrides()]
-    refused += [
-        flag for name, flag in _UNSLOTH_SERVER_FLAGS.items() if getattr(server_options, name) is not None
-    ]
-    if refused:
-        _fail(f"{', '.join(refused)} only applies to Unsloth, not {label} at {target.base}.")
-    # What this agent cannot carry has no server to fall back on here, unlike an Unsloth this command starts.
-    sent = server_options.sent_by_agent()
-    unsent = [
-        _REQUEST_FLAGS[name]
-        for name in (*_SAMPLING_FIELDS, "reasoning", "reasoning_effort")
-        if getattr(server_options, name) is not None
-        and name not in sent
-        and not (name == "reasoning" and server_options.reasoning == "auto")
-    ]
-    if unsent:
-        typer.echo(f"Warning: this agent can't send {', '.join(unsent)} itself, so it is ignored.", err = True)
+    _warn_unsent_pins(server_options)
     _, dropped = providers.request_body(target.name, server_options._replace(provider = "unsloth").request_body())
     for name in dropped:
         typer.echo(f"Warning: {label} ignores {_REQUEST_FLAGS[name]}, so it is left out.", err = True)
     cache = _provider_key_cache_path()
     key = api_key or next(iter(_cached_keys(cache, target.base, "saved")), None)
     try:
-        base, key, entry = providers.connect(target, key, model, load.max_seq_length or None, needs)
+        base, key, entry = providers.connect(
+            target, key, model, load.max_seq_length or None, needs, allow_load = load.allow_load
+        )
     except ProviderError as exc:
         _fail(str(exc))
     if api_key:
@@ -4425,8 +4002,6 @@ def _connect(
     model: Optional[str],
     load: LoadOptions = LoadOptions(),
     *,
-    serve: bool = False,
-    launch: bool = True,
     server_options: ServerOptions = ServerOptions(),
     preload_check = None,
     target: Target = _UNSLOTH,
@@ -4439,41 +4014,26 @@ def _connect(
     if target.base:
         # --url to an Unsloth reaches discovery the same way UNSLOTH_STUDIO_URL does.
         os.environ["UNSLOTH_STUDIO_URL"] = target.base
-    # `--model org/name:QUANT` is shorthand for `--model org/name --gguf-variant QUANT`. Split it before we match or serve so the attach path resolves against the already-loaded `org/name` (listed without the suffix) instead of reloading a `:`-suffixed repo id, which Unsloth rejects and which would evict a model another session is using.
+    # `--model org/name:QUANT` is shorthand for `--model org/name --gguf-variant QUANT`. Split it before we match so the attach path resolves against the already-loaded `org/name` (listed without the suffix) instead of reloading a `:`-suffixed repo id, which Unsloth rejects and which would evict a model another session is using.
     if model:
         repo, variant = _split_repo_variant(model)
         if variant:
             model = repo
-            if not load.gguf_variant:
-                load = load._replace(gguf_variant = variant)
-    base, server = _require_studio(
-        model, load, serve = serve, launch = launch, server_options = server_options
-    )
-    try:
-        key = _agent_api_key(base, api_key, auto_started = server is not None)
-        # A server we just started has exactly the requested model loaded, so resolve to whatever it is serving instead of re-matching the raw --model string. Only an attach can still trigger an evicting load, so _resolve_model gets the pre-load check and runs it only when that load is imminent.
-        entry = _resolve_model(
-            base,
-            key,
-            None if server is not None else model,
-            load,
-            preload_check = None if server is not None else preload_check,
-            # That server was started FROM these knobs, so inferring a target here would reload what was just loaded.
-            infer_resident = server is None,
+            load = load._replace(gguf_variant = variant)
+    base = _require_studio()
+    _warn_unsent_pins(server_options)
+    key = _agent_api_key(base, api_key)
+    entry = _resolve_model(base, key, model, load, preload_check = preload_check)
+    status = _inference_status(base, key) if model else {}
+    # A GGUF can be active while the resolved entry is another resident model.
+    if status.get("memory_warning") and any(
+        _model_id_matches(
+            (entry or {}).get("id"), status_id, allow_casefold = is_loopback_url(base)
         )
-        status = _inference_status(base, key) if model else {}
-        # A GGUF can be active while the resolved entry is another resident model.
-        if status.get("memory_warning") and any(
-            _model_id_matches(
-                (entry or {}).get("id"), status_id, allow_casefold = is_loopback_url(base)
-            )
-            for status_id in (status.get("active_model"), status.get("model_identifier"))
-            if status_id
-        ):
-            typer.echo(f"Warning: {status['memory_warning']}", err = True)
-    except BaseException:
-        _shutdown_auto_served()
-        raise
+        for status_id in (status.get("active_model"), status.get("model_identifier"))
+        if status_id
+    ):
+        typer.echo(f"Warning: {status['memory_warning']}", err = True)
     return base, key, entry
 
 
@@ -4500,26 +4060,13 @@ def _run(
             unset_env = unset_env,
             wsl_env_bridge = wsl_env_bridge,
         )
-        if _keep_auto_served():
-            typer.echo(f"Unsloth Studio is still running at {base}.")
-            typer.echo("Stop it with: unsloth studio stop")
         return
-    try:
-        code = _launch(
-            command,
-            env,
-            install_hint = install_hint,
-            unset_env = unset_env,
-        )
-    except BaseException:
-        # Startup succeeded but the agent failed to launch; tear the server down rather than orphan it.
-        _shutdown_auto_served()
-        raise
-    auto_started = _auto_served_server is not None
-    kept = _keep_auto_served()
-    if auto_started and not kept:
-        typer.echo(f"The auto-started Unsloth server at {base} stopped during the session.")
-        raise typer.Exit(code = code)
+    code = _launch(
+        command,
+        env,
+        install_hint = install_hint,
+        unset_env = unset_env,
+    )
     if code:
         # The server status below must not read as a successful agent session.
         typer.echo(f"The agent exited with code {code}.")
@@ -5262,14 +4809,7 @@ def claude(
     api_key: Optional[str] = _KEY_OPTION,
     header: Optional[list[str]] = _HEADER_OPTION,
     launch: bool = _LAUNCH_OPTION,
-    gguf_variant: Optional[str] = _GGUF_VARIANT_OPTION,
     max_seq_length: int = _CONTEXT_OPTION,
-    load_in_4bit: bool = _LOAD_4BIT_OPTION,
-    tensor_parallel: bool = _TENSOR_PARALLEL_OPTION,
-    gpu_memory_mode: Optional[Literal["auto", "manual"]] = _GPU_MEMORY_MODE_OPTION,
-    enable_tools: Optional[bool] = _ENABLE_TOOLS_OPTION,
-    tool_call_healing: Optional[bool] = _TOOL_CALL_HEALING_OPTION,
-    tool_call_nudging: Optional[bool] = _TOOL_CALL_NUDGING_OPTION,
     reasoning: Optional[Literal["on", "off", "auto"]] = _REASONING_OPTION,
     reasoning_effort: Optional[str] = _REASONING_EFFORT_OPTION,
     temperature: Optional[float] = _TEMPERATURE_OPTION,
@@ -5279,7 +4819,7 @@ def claude(
     repetition_penalty: Optional[float] = _REPETITION_PENALTY_OPTION,
     presence_penalty: Optional[float] = _PRESENCE_PENALTY_OPTION,
     compact_at: Optional[float] = _COMPACT_AT_OPTION,
-    serve: bool = _SERVE_OPTION,
+    model_load: bool = _MODEL_LOAD_OPTION,
     url: Optional[str] = _URL_OPTION,
     provider: Optional[ProviderName] = _PROVIDER_OPTION,
     yolo: bool = _YOLO_OPTION,
@@ -5296,14 +4836,8 @@ def claude(
         if os.name == "nt"
         else "curl -fsSL https://claude.ai/install.sh | bash"
     )
-    # Before the install prompt: _install_agent runs a remote installer, and this can refuse outright, so asking first fetches a tool the run cannot use.
-    if target.name == "unsloth":
-        _preflight_agent_gguf(_CLAUDE_GGUF_AGENT, model, serve = serve, launch = launch, target = target)
     _require_agent_for_launch("claude", install_hint, launch)
     server_options = ServerOptions(
-        enable_tools = enable_tools,
-        tool_call_healing = tool_call_healing,
-        tool_call_nudging = tool_call_nudging,
         reasoning = reasoning,
         reasoning_effort = reasoning_effort,
         temperature = temperature,
@@ -5318,28 +4852,19 @@ def claude(
     base, key, entry = _connect(
         api_key,
         model,
-        _load_options(
-            ctx, gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode
-        ),
-        serve = serve,
-        launch = launch,
+        _load_options(ctx, max_seq_length, model_load),
         preload_check = functools.partial(_attach_gguf_check, _CLAUDE_GGUF_AGENT),
         server_options = server_options,
         target = target,
         needs = ("/v1/messages",),
     )
-    # Before the launch owns the server, so a rejection tears it down, not atexit.
-    try:
-        if target.name == "unsloth":
-            _require_gguf_for_agent(_CLAUDE_GGUF_AGENT, base, key, entry["id"])
-    except BaseException:
-        _shutdown_auto_served()
-        raise
+    if target.name == "unsloth":
+        _require_gguf_for_agent(_CLAUDE_GGUF_AGENT, base, key, entry["id"])
     model_id = entry["id"]
     _check_compact_at(compact_at, entry)
     if as_subagent:
         subagent_id = (
-            _subagent_model_id(base, key, entry, model, gguf_variant)
+            _subagent_model_id(base, key, entry, model)
             if target.name == "unsloth"
             else entry["id"]
         )
@@ -5411,14 +4936,7 @@ def codex(
     api_key: Optional[str] = _KEY_OPTION,
     header: Optional[list[str]] = _HEADER_OPTION,
     launch: bool = _LAUNCH_OPTION,
-    gguf_variant: Optional[str] = _GGUF_VARIANT_OPTION,
     max_seq_length: int = _CONTEXT_OPTION,
-    load_in_4bit: bool = _LOAD_4BIT_OPTION,
-    tensor_parallel: bool = _TENSOR_PARALLEL_OPTION,
-    gpu_memory_mode: Optional[Literal["auto", "manual"]] = _GPU_MEMORY_MODE_OPTION,
-    enable_tools: Optional[bool] = _ENABLE_TOOLS_OPTION,
-    tool_call_healing: Optional[bool] = _TOOL_CALL_HEALING_OPTION,
-    tool_call_nudging: Optional[bool] = _TOOL_CALL_NUDGING_OPTION,
     reasoning: Optional[Literal["on", "off", "auto"]] = _REASONING_OPTION,
     reasoning_effort: Optional[str] = _REASONING_EFFORT_OPTION,
     temperature: Optional[float] = _TEMPERATURE_OPTION,
@@ -5428,7 +4946,7 @@ def codex(
     repetition_penalty: Optional[float] = _REPETITION_PENALTY_OPTION,
     presence_penalty: Optional[float] = _PRESENCE_PENALTY_OPTION,
     compact_at: Optional[float] = _COMPACT_AT_OPTION,
-    serve: bool = _SERVE_OPTION,
+    model_load: bool = _MODEL_LOAD_OPTION,
     url: Optional[str] = _URL_OPTION,
     provider: Optional[ProviderName] = _PROVIDER_OPTION,
     yolo: bool = _YOLO_OPTION,
@@ -5441,17 +4959,11 @@ def codex(
     headers = parse_headers(header)
     target = _resolve_target(url, provider, api_key, headers)
     install_hint = _npm_install_hint("@openai/codex")
-    # Before the install prompt: _install_agent runs a remote installer, and this can refuse outright, so asking first fetches a tool the run cannot use.
-    if target.name == "unsloth":
-        _preflight_agent_gguf(_CODEX_GGUF_AGENT, model, serve = serve, launch = launch, target = target)
     _require_agent_for_launch("codex", install_hint, launch)
     codex_effort = _codex_reasoning_effort(reasoning, reasoning_effort)
     if codex_effort and not _agent_version_at_least("codex", _CODEX_REASONING_REQUEST_MIN_VERSION):
         codex_effort = None
     server_options = ServerOptions(
-        enable_tools = enable_tools,
-        tool_call_healing = tool_call_healing,
-        tool_call_nudging = tool_call_nudging,
         reasoning = reasoning,
         reasoning_effort = reasoning_effort,
         temperature = temperature,
@@ -5466,27 +4978,18 @@ def codex(
     base, key, entry = _connect(
         api_key,
         model,
-        _load_options(
-            ctx, gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode
-        ),
-        serve = serve,
-        launch = launch,
+        _load_options(ctx, max_seq_length, model_load),
         preload_check = functools.partial(_attach_gguf_check, _CODEX_GGUF_AGENT),
         server_options = server_options,
         target = target,
         needs = ("/v1/responses",),
     )
-    # This preflight runs after _connect may have auto-started a server but before _run takes over its lifecycle, so tear the server down here if it rejects the model (a transformers-backend model) rather than leaving it on the atexit backstop.
-    try:
-        if target.name == "unsloth":
-            _require_gguf_for_agent(_CODEX_GGUF_AGENT, base, key, entry["id"])
-    except BaseException:
-        _shutdown_auto_served()
-        raise
+    if target.name == "unsloth":
+        _require_gguf_for_agent(_CODEX_GGUF_AGENT, base, key, entry["id"])
     _check_compact_at(compact_at, entry)
     if as_subagent:
         subagent_id = (
-            _subagent_model_id(base, key, entry, model, gguf_variant)
+            _subagent_model_id(base, key, entry, model)
             if target.name == "unsloth"
             else entry["id"]
         )
@@ -5550,14 +5053,7 @@ def opencode(
     api_key: Optional[str] = _KEY_OPTION,
     header: Optional[list[str]] = _HEADER_OPTION,
     launch: bool = _LAUNCH_OPTION,
-    gguf_variant: Optional[str] = _GGUF_VARIANT_OPTION,
     max_seq_length: int = _CONTEXT_OPTION,
-    load_in_4bit: bool = _LOAD_4BIT_OPTION,
-    tensor_parallel: bool = _TENSOR_PARALLEL_OPTION,
-    gpu_memory_mode: Optional[Literal["auto", "manual"]] = _GPU_MEMORY_MODE_OPTION,
-    enable_tools: Optional[bool] = _ENABLE_TOOLS_OPTION,
-    tool_call_healing: Optional[bool] = _TOOL_CALL_HEALING_OPTION,
-    tool_call_nudging: Optional[bool] = _TOOL_CALL_NUDGING_OPTION,
     reasoning: Optional[Literal["on", "off", "auto"]] = _REASONING_OPTION,
     reasoning_effort: Optional[str] = _REASONING_EFFORT_OPTION,
     temperature: Optional[float] = _TEMPERATURE_OPTION,
@@ -5568,7 +5064,7 @@ def opencode(
     presence_penalty: Optional[float] = _PRESENCE_PENALTY_OPTION,
     max_tokens: Optional[int] = _MAX_TOKENS_OPTION,
     compact_at: Optional[float] = _COMPACT_AT_OPTION,
-    serve: bool = _SERVE_OPTION,
+    model_load: bool = _MODEL_LOAD_OPTION,
     url: Optional[str] = _URL_OPTION,
     provider: Optional[ProviderName] = _PROVIDER_OPTION,
     yolo: bool = _YOLO_OPTION,
@@ -5584,9 +5080,6 @@ def opencode(
     install_hint = _npm_install_hint("@opencode-ai/cli@beta" if opencode_v2 else "opencode-ai")
     _require_agent_for_launch(command_name, install_hint, launch)
     server_options = ServerOptions(
-        enable_tools = enable_tools,
-        tool_call_healing = tool_call_healing,
-        tool_call_nudging = tool_call_nudging,
         reasoning = reasoning,
         reasoning_effort = reasoning_effort,
         temperature = temperature,
@@ -5601,11 +5094,7 @@ def opencode(
     base, key, entry = _connect(
         api_key,
         model,
-        _load_options(
-            ctx, gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode
-        ),
-        serve = serve,
-        launch = launch,
+        _load_options(ctx, max_seq_length, model_load),
         server_options = server_options,
         target = target,
     )
@@ -5622,7 +5111,7 @@ def opencode(
                 err = True,
             )
         subagent_id = (
-            _subagent_model_id(base, key, entry, model, gguf_variant)
+            _subagent_model_id(base, key, entry, model)
             if target.name == "unsloth"
             else entry["id"]
         )
@@ -5745,15 +5234,8 @@ def pi(
     api_key: Optional[str] = _KEY_OPTION,
     header: Optional[list[str]] = _HEADER_OPTION,
     launch: bool = _LAUNCH_OPTION,
-    gguf_variant: Optional[str] = _GGUF_VARIANT_OPTION,
     max_seq_length: int = _CONTEXT_OPTION,
     max_tokens: Optional[int] = _MAX_TOKENS_OPTION,
-    load_in_4bit: bool = _LOAD_4BIT_OPTION,
-    tensor_parallel: bool = _TENSOR_PARALLEL_OPTION,
-    gpu_memory_mode: Optional[Literal["auto", "manual"]] = _GPU_MEMORY_MODE_OPTION,
-    enable_tools: Optional[bool] = _ENABLE_TOOLS_OPTION,
-    tool_call_healing: Optional[bool] = _TOOL_CALL_HEALING_OPTION,
-    tool_call_nudging: Optional[bool] = _TOOL_CALL_NUDGING_OPTION,
     reasoning: Optional[Literal["on", "off", "auto"]] = _REASONING_OPTION,
     reasoning_effort: Optional[str] = _REASONING_EFFORT_OPTION,
     temperature: Optional[float] = _TEMPERATURE_OPTION,
@@ -5763,7 +5245,7 @@ def pi(
     repetition_penalty: Optional[float] = _REPETITION_PENALTY_OPTION,
     presence_penalty: Optional[float] = _PRESENCE_PENALTY_OPTION,
     compact_at: Optional[float] = _COMPACT_AT_OPTION,
-    serve: bool = _SERVE_OPTION,
+    model_load: bool = _MODEL_LOAD_OPTION,
     url: Optional[str] = _URL_OPTION,
     provider: Optional[ProviderName] = _PROVIDER_OPTION,
     yolo: bool = _YOLO_OPTION,
@@ -5783,9 +5265,6 @@ def pi(
         _fail(f"Missing Pi subagent extension: {_PI_SUBAGENT_EXTENSION}")
     _require_agent_for_launch("pi", install_hint, launch)
     server_options = ServerOptions(
-        enable_tools = enable_tools,
-        tool_call_healing = tool_call_healing,
-        tool_call_nudging = tool_call_nudging,
         reasoning = reasoning,
         reasoning_effort = reasoning_effort,
         temperature = temperature,
@@ -5804,11 +5283,7 @@ def pi(
     base, key, entry = _connect(
         api_key,
         model,
-        _load_options(
-            ctx, gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode
-        ),
-        serve = serve,
-        launch = launch,
+        _load_options(ctx, max_seq_length, model_load),
         server_options = server_options,
         target = target,
     )
@@ -5820,7 +5295,7 @@ def pi(
                 err = True,
             )
         subagent_id = (
-            _subagent_model_id(base, key, entry, model, gguf_variant)
+            _subagent_model_id(base, key, entry, model)
             if target.name == "unsloth"
             else entry["id"]
         )

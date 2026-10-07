@@ -300,6 +300,144 @@ def test_lmstudio_loads_with_the_requested_context(fake_server):
     assert entry == {"id": "qwen/qwen3-8b", "context_length": 32768}
 
 
+# ── connect: --no-model-load ──
+
+
+def test_no_model_load_refuses_an_unloaded_ollama_model(fake_server):
+    _ollama(fake_server)
+    with pytest.raises(ProviderError, match = "--no-model-load") as excinfo:
+        providers.connect(
+            Target("ollama", fake_server.base), None, "nope", None, allow_load = False
+        )
+    assert "Loaded: none" in str(excinfo.value)
+    assert not any(method == "POST" for method, *_ in fake_server.requests)
+
+
+def test_ollama_a_different_resident_window_goes_through_the_alias(fake_server):
+    # A resident model at another window is stale for --context-length: the alias load still runs.
+    state = {"ps": [("smollm2:135m", 16384)], "created": None}
+    alias = "agent-switch/smollm2-135m-ctx8192:latest"
+
+    def ps(_):
+        return 200, {"models": [{"name": n, "model": n, "context_length": c} for n, c in state["ps"]]}
+
+    def create(payload):
+        state["created"] = payload
+        return 200, {"status": "success"}
+
+    def generate(payload):
+        assert payload["model"] == alias
+        state["ps"] = [(alias, 8192)]
+        return 200, {"done": True}
+
+    _ollama(fake_server)
+    fake_server.route("GET", "/api/ps", ps)
+    fake_server.route("POST", "/api/create", create)
+    fake_server.route("POST", "/api/generate", generate)
+    _, _, entry = providers.connect(Target("ollama", fake_server.base), None, "smollm2:135m", 8192)
+    assert state["created"] is not None, "a resident model at another window must reload at the requested one"
+    assert entry == {"id": alias, "context_length": 8192}
+
+
+def test_no_model_load_refuses_a_resident_at_another_window(fake_server):
+    _ollama(fake_server, ps = [("smollm2:135m", 16384)])
+    with pytest.raises(ProviderError, match = "--no-model-load") as excinfo:
+        providers.connect(
+            Target("ollama", fake_server.base), None, "smollm2:135m", 8192, allow_load = False
+        )
+    assert "Loaded: smollm2:135m" in str(excinfo.value)
+    assert not any(method == "POST" for method, *_ in fake_server.requests)
+
+
+def test_no_model_load_attaches_a_resident_ollama_ctx_alias(fake_server):
+    # A resident alias already carries the window, so --no-model-load can still honor --context-length.
+    alias = "agent-switch/smollm2-135m-ctx8192:latest"
+    _ollama(fake_server, ps = [(alias, 8192)], tags = ("smollm2:135m", alias))
+    _, _, entry = providers.connect(
+        Target("ollama", fake_server.base), None, "smollm2:135m", 8192, allow_load = False
+    )
+    assert entry == {"id": alias, "context_length": 8192}
+    assert not any(method == "POST" for method, *_ in fake_server.requests)
+
+
+def test_no_model_load_nothing_loaded_points_at_the_server(fake_server):
+    _ollama(fake_server)
+    with pytest.raises(ProviderError, match = "pick one it serves"):
+        providers.connect(
+            Target("ollama", fake_server.base), None, None, None, allow_load = False
+        )
+
+
+def test_no_model_load_refuses_an_unloaded_router_model(fake_server):
+    fake_server.route("GET", "/props", body = {"role": "router", "default_generation_settings": {"n_ctx": 0}})
+    fake_server.route(
+        "GET",
+        "/v1/models",
+        body = {"data": [{"id": "jan-4b", "owned_by": "llamacpp", "status": {"value": "unloaded"}, "meta": None}]},
+    )
+    with pytest.raises(ProviderError, match = "--no-model-load"):
+        providers.connect(
+            Target("llamacpp", fake_server.base), None, "jan-4b", None, allow_load = False
+        )
+    assert not any(method == "POST" for method, *_ in fake_server.requests)
+
+
+def test_no_model_load_keeps_the_plain_llama_server_error(fake_server):
+    # A single-model llama-server can't load anything anyway; its own precise error stands.
+    _llamacpp_single(fake_server)
+    with pytest.raises(ProviderError, match = "can't switch models") as excinfo:
+        providers.connect(
+            Target("llamacpp", fake_server.base), None, "other-model", None, allow_load = False
+        )
+    assert "--no-model-load" not in str(excinfo.value)
+
+
+def test_no_model_load_keeps_the_lmstudio_v0_hint(fake_server):
+    fake_server.route("GET", "/api/v0/models", body = {"data": [{"id": "qwen/qwen3-8b", "state": "loaded", "max_context_length": 4096}]})
+    fake_server.route("GET", "/v1/models", body = {"object": "list", "data": [{"id": "qwen/qwen3-8b"}]})
+    with pytest.raises(ProviderError, match = "lms load") as excinfo:
+        providers.connect(
+            Target("lmstudio", fake_server.base), None, "qwen/other", None, allow_load = False
+        )
+    assert "--no-model-load" not in str(excinfo.value)
+
+
+def test_lmstudio_a_different_resident_window_reloads(fake_server):
+    # A resident instance at another window is stale for --context-length: the load still runs.
+    state = {"instances": [{"id": "qwen/qwen3-8b", "config": {"context_length": 16384}}]}
+
+    def models(_):
+        return 200, {"models": [{"type": "llm", "key": "qwen/qwen3-8b", "max_context_length": 40960,
+                                 "loaded_instances": state["instances"]}]}
+
+    def load(payload):
+        assert payload == {"model": "qwen/qwen3-8b", "context_length": 32768}
+        state["instances"] = [{"id": "qwen/qwen3-8b", "config": {"context_length": 32768}}]
+        return 200, {"instance_id": "qwen/qwen3-8b", "status": "loaded"}
+
+    fake_server.route("GET", "/api/v1/models", models)
+    fake_server.route("GET", "/v1/models", body = {"object": "list", "data": [{"id": "qwen/qwen3-8b"}]})
+    fake_server.route("POST", "/api/v1/models/load", load)
+    _, _, entry = providers.connect(Target("lmstudio", fake_server.base), None, "qwen/qwen3-8b", 32768)
+    assert entry == {"id": "qwen/qwen3-8b", "context_length": 32768}
+
+
+def test_no_model_load_refuses_a_resident_at_another_lmstudio_window(fake_server):
+    fake_server.route(
+        "GET",
+        "/api/v1/models",
+        body = {"models": [{"type": "llm", "key": "qwen/qwen3-8b", "max_context_length": 40960,
+                            "loaded_instances": [{"id": "qwen/qwen3-8b", "config": {"context_length": 16384}}]}]},
+    )
+    fake_server.route("GET", "/v1/models", body = {"object": "list", "data": [{"id": "qwen/qwen3-8b"}]})
+    with pytest.raises(ProviderError, match = "--no-model-load") as excinfo:
+        providers.connect(
+            Target("lmstudio", fake_server.base), None, "qwen/qwen3-8b", 32768, allow_load = False
+        )
+    assert "Loaded: qwen/qwen3-8b" in str(excinfo.value)
+    assert not any(method == "POST" for method, *_ in fake_server.requests)
+
+
 # ── endpoint capability ──
 
 

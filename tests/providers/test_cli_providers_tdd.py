@@ -114,25 +114,6 @@ def test_colon_model_names_are_not_split_into_a_gguf_variant(cli, fake_server):
     assert _exports(result.output)["ANTHROPIC_MODEL"] == "smollm2:135m"
 
 
-@pytest.mark.parametrize(
-    "flag",
-    [
-        ["--gguf-variant", "Q4_K_M"],
-        ["--no-load-in-4bit"],
-        ["--tensor-parallel"],
-        ["--gpu-memory-mode", "auto"],
-        ["--enable-tools"],
-        ["--disable-tool-call-healing"],
-    ],
-)
-def test_unsloth_only_flags_are_refused_elsewhere(cli, fake_server, flag):
-    _ollama(fake_server)
-    result = cli("claude", "--url", fake_server.base, *flag, "--no-launch")
-    assert result.exit_code == 1
-    assert "only applies to Unsloth" in result.output
-    assert not any(method == "POST" for method, *_ in fake_server.requests)
-
-
 def test_unsupported_sampling_fields_warn_and_stay_out_of_the_body(cli, fake_server):
     _ollama(fake_server)
     result = cli("claude", "--url", fake_server.base, "--temperature", "0.6", "--top-k", "20", "--no-launch")

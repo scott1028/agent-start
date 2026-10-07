@@ -34,6 +34,11 @@ def fingerprint(base: str, key: Optional[str] = None, headers: Optional[dict] = 
     return _v1_models(base, key, headers) is not None or _v0_models(base, key, headers) is not None
 
 
+def can_load(base: str, key: Optional[str], headers: Optional[dict] = None) -> bool:
+    """Only servers with the v1 REST API take the load endpoint; older ones get the `lms load` hint."""
+    return _v1_models(base, key, headers) is not None
+
+
 def models(base: str, key: Optional[str], headers: Optional[dict] = None) -> list:
     require_json(LABEL, base, "/v1/models", key, headers)
     listing = _v1_models(base, key, headers)

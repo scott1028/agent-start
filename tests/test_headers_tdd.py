@@ -263,34 +263,6 @@ def test_json_body_keeps_its_content_type(monkeypatch):
     assert sent[0][1]["content-type"] == "application/json"
 
 
-def test_start_key_progress_polls_keep_the_start_key(monkeypatch):
-    # The server this command launched reports its download progress against the key it printed in
-    # the log; --header must not replace it, or the polls 401 and the start looks wedged.
-    sent = _studio_transport(
-        monkeypatch,
-        {
-            "GET /api/hub/gguf-variants": 404,
-            "GET /api/models/gguf-variants": {"default_variant": "Q4_K_M", "variants": []},
-            "GET /api/models/active-downloads": {"downloads": []},
-            "GET /api/models/download-progress": {},
-        },
-        {"Authorization": "Bearer gateway", "X-Tenant": "eng"},
-    )
-    progress = start._ModelDownloadProgress(
-        BASE, "sk-unsloth-startkey", "unsloth/Repo-GGUF", "Q4_K_M", internal_auth = True
-    )
-    progress.poll()
-    paths = [url.split("?")[0] for url, _ in sent]
-    assert paths[:2] == [
-        f"{BASE}/api/hub/gguf-variants",
-        f"{BASE}/api/models/gguf-variants",
-    ]
-    assert any("download-progress" in path for path in paths[2:])
-    for _, request_headers in sent:
-        assert request_headers["authorization"] == "Bearer sk-unsloth-startkey"
-        assert "x-tenant" not in request_headers
-
-
 def test_unsloth_model_calls_carry_headers(monkeypatch):
     sent = _studio_transport(monkeypatch, {"GET /v1/models": {"data": []}}, {"X-Foo": "bar"})
     start._http_json("GET", f"{BASE}/v1/models", "sk-studio-key")
@@ -391,7 +363,7 @@ def test_require_studio_probes_the_named_base_with_the_custom_headers(monkeypatc
     monkeypatch.setattr(start, "find_studio_server", lambda **kwargs: seen.append(kwargs) or BASE)
     monkeypatch.setattr(start, "_active_target", start.Target("unsloth", BASE, {"Authorization": "Bearer gateway"}))
     monkeypatch.setenv("UNSLOTH_STUDIO_URL", BASE)
-    assert start._require_studio() == (BASE, None)
+    assert start._require_studio() == BASE
     assert seen[0]["headers"] == {"Authorization": "Bearer gateway"}
 
 
@@ -404,27 +376,6 @@ def test_named_studio_with_headers_does_not_scan_the_local_ports(monkeypatch):
     target = start._resolve_target(None, None, None, {"Authorization": "Bearer gateway"})
     assert target.name == "unsloth"
     assert target.headers == {"Authorization": "Bearer gateway"}
-
-
-def test_gguf_preflight_defers_a_named_url_target_to_the_post_connect_check(monkeypatch):
-    # The preflight reads UNSLOTH_STUDIO_URL, which _connect only points at --url later, so probing
-    # here would probe some other base with this target's credential.
-    monkeypatch.setattr(
-        start, "find_studio_server", lambda **kwargs: pytest.fail("must not probe another base")
-    )
-    monkeypatch.setattr(start, "_hub_gguf_files", lambda repo: pytest.fail("must not reach the hub"))
-    monkeypatch.delenv("UNSLOTH_STUDIO_URL", raising = False)
-    target = start.Target("unsloth", BASE, {"Authorization": "Bearer gateway"})
-    start._preflight_agent_gguf(start._CLAUDE_GGUF_AGENT, "unsloth/Repo", target = target)
-
-
-def test_gguf_preflight_probes_a_named_env_studio_with_the_custom_headers(monkeypatch):
-    seen = []
-    monkeypatch.setattr(start, "find_studio_server", lambda **kwargs: seen.append(kwargs) or BASE)
-    monkeypatch.setenv("UNSLOTH_STUDIO_URL", BASE)
-    target = start.Target("unsloth", None, {"Authorization": "Bearer gateway"})
-    start._preflight_agent_gguf(start._CLAUDE_GGUF_AGENT, "unsloth/Repo", target = target)
-    assert seen[0]["headers"] == {"Authorization": "Bearer gateway"}
 
 
 def test_hub_listing_never_carries_the_custom_headers(monkeypatch):

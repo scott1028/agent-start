@@ -35,6 +35,11 @@ def _router(base: str, key: Optional[str], headers: Optional[dict] = None) -> bo
     return isinstance(props, dict) and props.get("role") == "router"
 
 
+def can_load(base: str, key: Optional[str], headers: Optional[dict] = None) -> bool:
+    """Only router mode loads on request; a plain llama-server's own error is more precise."""
+    return _router(base, key, headers)
+
+
 def models(base: str, key: Optional[str], headers: Optional[dict] = None) -> list:
     listing = require_json(LABEL, base, "/v1/models", key, headers)
     props = get_json(base, "/props", key, headers = headers)
