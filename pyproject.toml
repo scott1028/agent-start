@@ -1,7 +1,7 @@
 [project]
 name = "agent-switch"
 version = "0.1.0"
-description = "Launch Claude Code, Codex, OpenCode, Pi or DeepSeek Harness against a local OpenAI-compatible model server."
+description = "Launch Claude Code, Codex, OpenCode, Pi or DeepSeek Harness (dsh or its TUI) against a local OpenAI-compatible model server."
 readme = "README.md"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE", "NOTICE.md"]
@@ -25,6 +25,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["agent_switch"]
+
+[tool.hatch.build.targets.sdist]
+# TDD guardrail tests (*_tdd.py) are development by-products, not part of the source release.
+exclude = ["*_tdd.py"]
 
 [tool.ruff]
 target-version = "py310"

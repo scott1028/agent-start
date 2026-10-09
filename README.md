@@ -1,9 +1,9 @@
 # agent-switch
 
-Launch Claude Code, Codex, OpenCode, Pi or DeepSeek Harness (dsh) against a local model server:
-Ollama, LM Studio, llama-server, vLLM or any OpenAI-compatible server. The agent gets a throwaway,
-session-only configuration; your own `~/.claude`, `~/.codex`, `~/.dsh`, OpenCode and Pi settings
-are not modified.
+Launch Claude Code, Codex, OpenCode, Pi or DeepSeek Harness (dsh, or its TUI dsh-tui) against a
+local model server: Ollama, LM Studio, llama-server, vLLM or any OpenAI-compatible server. The agent
+gets a throwaway, session-only configuration; your own `~/.claude`, `~/.codex`, `~/.dsh`,
+`~/.dsh-tui`, OpenCode and Pi settings are not modified.
 
 ## Tested Strata version
 
@@ -55,6 +55,7 @@ agent-switch pi --url http://127.0.0.1:8000/v1 --no-launch   # print the env and
 agent-switch claude --as-subagent                    # keep Claude's cloud model, add a local subagent
 agent-switch dsh --url http://127.0.0.1:8080         # DeepSeek Harness, web UI
 agent-switch dsh --profile headless "fix the failing test"   # one task, print the result, exit
+agent-switch dsh-tui --url http://127.0.0.1:8080     # DeepSeek Harness TUI (alias: dst)
 ```
 
 Without `--url` or `--provider`, agent-switch checks the usual local ports (Ollama 11434, LM Studio
@@ -71,6 +72,42 @@ dsh starts its web profile (`dsh web`) unless the arguments name another, e.g. `
 Its `DSH_HOME` is moved to a session directory that is removed when dsh exits (`--persist` keeps
 it), so a session sees none of the profiles, plugins or DeepSeek API key in your `~/.dsh`. dsh
 replaces any `User-Agent` passed with `--header`. `--as-subagent` is not supported for dsh.
+
+`dsh-tui` and its alias `dst` start the DeepSeek Harness TUI (`@deepseek-harness-tui/dsh-tui`,
+tried with 0.14.0 on dsh 0.1.5-rc.2 and 0.2.0-rc.2) on the same route, in one session directory
+shared by both names. The TUI keeps its state in `~/.dsh-tui` under the home directory, so `HOME`
+and `USERPROFILE` move there along with `DSH_HOME`, and pnpm's store and cache stay inside it too:
+your own dsh and dsh-tui profiles, accounts, history and pnpm store are neither read nor written.
+A fresh session directory installs the TUI profile with pnpm on first start (about 9 s and 89 MB
+here); `--persist` keeps it, with the profile and store, for later runs and for resuming with
+`--resume <id>` or `-c`. It needs an interactive terminal; `--no-launch` prints the command, whose
+last line clears the TUI's inherited handoff variables with `env -u` on Linux and macOS.
+
+- The session is pinned to the dsh backend and the agent-switch model route. `--profile`,
+  `--from-default-profile`, a `--backend` other than `dsh`, `--compact-at` (the TUI's agent presets
+  own compaction), `--as-subagent` and the launcher's own `update`, `migrate`, `doctor`, `safe`,
+  `version` and `help` commands are refused; put such a word after `--` to send it as a prompt.
+  Switching the kernel inside the TUI leaves that route.
+- A `--patch` you pass is applied after agent-switch's and replaces whole config blocks, so it can
+  override the route: a `dsh-tui` row there must restate `provider`, `model`, `backend` and the
+  `preset`/`workspace`/`sessionId` bindings. agent-switch warns when one is passed.
+- On Windows, dsh-tui runs every tool with `danger-full-access` and no approval prompts whatever
+  the permission mode says, so agent-switch requires `--yolo` there. This path is untested. From
+  WSL, install dsh-tui and dsh inside WSL: a Windows dsh-tui or dsh is refused, because WSL can
+  hand a Windows process a cleared variable only as an empty string, which dsh-tui reads as set.
+- dsh-tui binds a per-session socket under the session directory, and a Unix socket path is cut
+  at 108 bytes on Linux and 104 on macOS, which would put it outside that directory. agent-switch
+  refuses a session directory too deep for the socket to stay inside: keep `AGENT_SWITCH_HOME`
+  short. Editor integrations that reach a running TUI through `~/.dsh-tui/inject` (dsh.nvim) do
+  not find it.
+- With `HOME` moved, Git no longer finds `~/.gitconfig`, so tools the TUI runs lose the global
+  identity and settings kept there (`git commit` reports "Author identity unknown") unless your
+  environment points Git at a configuration itself, for example with `GIT_CONFIG_GLOBAL`, which
+  is passed through unchanged. Set the identity per repository with `git config user.name` /
+  `user.email`. How SSH finds keys under the moved home is untested. Moving the home keeps the
+  TUI's own state apart; it does not hide every global configuration and is not a sandbox.
+- To resume, use `agent-switch dsh-tui --persist --resume <id>`: the TUI's own exit hint runs
+  `dsh` directly, outside agent-switch.
 
 `--header NAME=VALUE` (repeat the flag) adds an HTTP header to every request sent to the
 model server, e.g. for a gateway that needs its own auth:
