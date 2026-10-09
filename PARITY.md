@@ -2,16 +2,16 @@
 
 Reference: unsloth commit `8e11ba15e`, `unsloth_cli/commands/start.py` and its tests.
 Markers: `[v]` handled and passed, `[x]` handled but not passed, `[ ]` not handled yet.
-Out of scope for v1 (stays on `unsloth start`): the hermes, openclaw and dsh agents, and `--app`.
+Out of scope for v1 (stays on `unsloth start`): the hermes and openclaw agents, and `--app`.
 
 How each item was checked:
 
 - **tests**: the ported upstream tests (`tests/test_*.py`) pass.
-- **diff**: `tests/parity/compare_no_launch.py` matches `unsloth start --no-launch` (33/34 cases on this host; the harness tolerates up to two expected divergences in the sampling-pin warning wording — the pi one only applies to hosts with pi < 0.84).
+- **diff**: `tests/parity/compare_no_launch.py` matches `unsloth start --no-launch` (38/40 cases on this host plus 2 expected divergences, codex and dsh, in the sampling-pin warning wording; pi adds a third only on hosts with pi < 0.84).
 - **live**: run on this Linux host against a real server.
 - **sim**: Windows/WSL behavior, checked only by tests that fake the platform; not run on a real Windows or WSL machine.
 
-## Shared CLI surface (claude, codex, opencode, pi)
+## Shared CLI surface (claude, codex, opencode, pi, dsh)
 
 - [v] Positional `org/name(:variant)` is routed to `--model`; the rest passes through to the agent (tests, diff)
 - [v] `--` separator is preserved when forwarding (`_PassthroughCommand`) (tests, diff)
@@ -84,6 +84,22 @@ How each item was checked:
 - [v] Clean screen before launch (tests)
 - [v] `--as-subagent`: bundled TS extension and bootstrap config (tests incl. Bun, diff; not run live)
 
+## dsh
+
+- [v] DeepSeek Harness detection: a `dsh` that is not the Harness is rejected before connecting, and one shadowing it earlier on PATH is skipped (tests; the installed dsh 0.1.5-rc.2 is detected, live)
+- [v] `--patch` overlay with the `llm-pi-ai` route (`apiKeyEnv`, compat, window, output limit) and `agent-default-model`, rewritten whole and only when it changed (tests, diff; composed by dsh 0.1.5-rc.2 `--dump-config` for the headless and web profiles)
+- [v] `dsh web` unless the arguments name a profile or launcher option; `--patch` placed where the launcher parses it, none for `-V`/`--version`/`plugin` (tests, diff)
+- [v] Env: `AGENT_SWITCH_API_KEY`, `DSH_HOME` relocated, `DSH_TELEMETRY_DISABLED`, `DSH_PERMISSION_MODE` pinned for both `--yolo` and the default (tests, diff)
+- [v] Reasoning through `compat.chatTemplateKwargs` with `reasoningEfforts`; sampling pins warned and ignored (tests, diff)
+- [v] WSL: the patch path on argv is translated (tests; sim)
+- [v] `--as-subagent` rejected before connecting (tests)
+- [v] Ephemeral `DSH_HOME` removed on exit, `--persist` keeps it; `~/.dsh` unchanged (tests; removal and `~/.dsh` checked with the real dsh, headless and web, against a fake vLLM-shaped server)
+- [v] Extension: `--header` goes to the route's `headers`, never the env, and the patch is written 0600 (tests; the real dsh sent the header, and a custom `Authorization` replaced the Bearer key, against the fake server)
+- [v] Extension: `--max-tokens` capped at half the window with a warning, written as given without a window (tests)
+- [v] Extension: non-Unsloth servers; reasoning only to llama-server and vLLM, as raw fields that dsh wraps in `chat_template_kwargs` itself, warned and dropped for Ollama, LM Studio and generic servers; `--no-model-load` and `--context-length` through the shared gates (tests; the wrapping seen with the real dsh against the fake server)
+- [v] Extension: `--compact-at` writes `compaction-basic.thresholdRatio`, which only the headless profile applies: dsh 0.1.5-rc.2's web profile disables that top-level entry and each agent preset runs its own, so web compaction is not supported. A web launch, `--no-launch` included, warns on stderr before starting; headless and other profiles, `plugin`, `--version` and config dumps do not (tests; headless applies it per `--dump-config`)
+- [ ] A turn from a real local model, headless and in the web UI's model list (not run: the local Unsloth had no model loaded and no other server was running)
+
 ## Beyond `unsloth start`: other model servers
 
 - [v] `--url` / `--provider`; without them, a running Unsloth first, else the one server on the usual Ollama, LM Studio, llama-server or vLLM port (tests)
@@ -103,4 +119,5 @@ How each item was checked:
 
 - `unsloth_cli._inference.verify_studio_identity` / `_studio_token` / `connect_studio_server` tests: agent-switch calls Unsloth's own implementation through `providers/unsloth_bridge.py`, so those tests stay upstream.
 - `unsloth connect` alias test: agent-switch has no `connect` alias.
-- hermes, openclaw, dsh and `--app` tests: those features are out of scope for v1.
+- hermes, openclaw and `--app` tests: those features are out of scope for v1.
+- dsh in `test_noninteractive_missing_agent_stops_before_connect`: after a declined install the dsh resolver searches PATH and the install dirs again, so on a host with DeepSeek Harness installed the test finds the real one.

@@ -192,6 +192,11 @@ def connect(
     return base, key or NO_KEY, {"id": match["id"], "context_length": int(window)}
 
 
+def get_has_template_kwargs(name: str) -> bool:
+    """Whether this provider reads chat_template_kwargs from a request."""
+    return getattr(_MODULES[name], "TEMPLATE_KWARGS", False)
+
+
 def request_body(name: str, body: dict) -> tuple:
     """(body this provider accepts, request fields it had to drop)."""
     module = _MODULES[name]

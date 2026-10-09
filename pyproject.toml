@@ -1,7 +1,7 @@
 [project]
 name = "agent-switch"
 version = "0.1.0"
-description = "Launch Claude Code, Codex, OpenCode or Pi against a local OpenAI-compatible model server."
+description = "Launch Claude Code, Codex, OpenCode, Pi or DeepSeek Harness against a local OpenAI-compatible model server."
 readme = "README.md"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE", "NOTICE.md"]
@@ -10,6 +10,7 @@ dependencies = [
     "typer>=0.19.0",
     # start.py imports click directly; typer stopped depending on it in 0.27.
     "click>=8.0",
+    "pyyaml>=6",
 ]
 
 [project.scripts]

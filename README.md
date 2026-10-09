@@ -1,9 +1,9 @@
 # agent-switch
 
-Launch Claude Code, Codex, OpenCode or Pi against a local model server: Unsloth Studio, Ollama,
-LM Studio, llama-server, vLLM or any OpenAI-compatible server. The agent gets a throwaway,
-session-only configuration; your own `~/.claude`, `~/.codex`, OpenCode and Pi settings are not
-modified.
+Launch Claude Code, Codex, OpenCode, Pi or DeepSeek Harness (dsh) against a local model server:
+Unsloth Studio, Ollama, LM Studio, llama-server, vLLM or any OpenAI-compatible server. The agent
+gets a throwaway, session-only configuration; your own `~/.claude`, `~/.codex`, `~/.dsh`, OpenCode
+and Pi settings are not modified.
 
 A port of `unsloth start` (see `NOTICE.md` and `PARITY.md`) that works with servers other than
 Unsloth.
@@ -61,7 +61,14 @@ agent-switch codex --url http://127.0.0.1:11434      # Ollama; provider detected
 agent-switch opencode --provider lmstudio -m qwen/qwen3-8b --context-length 32768
 agent-switch pi --url http://127.0.0.1:8000/v1 --no-launch   # print the env and command instead
 agent-switch claude --as-subagent                    # keep Claude's cloud model, add a local subagent
+agent-switch dsh --url http://127.0.0.1:8080         # DeepSeek Harness, web UI
+agent-switch dsh --profile headless "fix the failing test"   # one task, print the result, exit
 ```
+
+dsh starts its web profile (`dsh web`) unless the arguments name another, e.g. `--profile headless`.
+Its `DSH_HOME` is moved to a session directory that is removed when dsh exits (`--persist` keeps
+it), so a session sees none of the profiles, plugins or DeepSeek API key in your `~/.dsh`. dsh
+replaces any `User-Agent` passed with `--header`. `--as-subagent` is not supported for dsh.
 
 `--header NAME=VALUE` (repeat the flag) adds an HTTP header to every request sent to the
 model server, e.g. for a gateway that needs its own auth:
@@ -85,10 +92,11 @@ into a server that is already running; `--no-model-load` makes it a pure client 
 reloads or unloads anything — the model must already be loaded on the server.
 
 `--compact-at 0.85` starts the agent's auto-compaction once 85% of that window is used, scaled
-per agent (Claude Code, Codex, OpenCode and Pi); accepted range 0.5–0.95, and leaving it unset
-keeps each agent's own behavior. Claude Code applies the fraction to its own effective window
-(the window minus its output reserve), so there it can only pull the built-in trigger earlier,
-never later.
+per agent (Claude Code, Codex, OpenCode, Pi and DeepSeek Harness); accepted range 0.5–0.95, and
+leaving it unset keeps each agent's own behavior. Claude Code applies the fraction to its own
+effective window (the window minus its output reserve), so there it can only pull the built-in
+trigger earlier, never later. DeepSeek Harness applies it only to its headless profile
+(`--profile headless`): its web profile ignores it, and agent-switch warns before starting it.
 
 ## Develop
 

@@ -43,6 +43,8 @@ CASES = {
                  ["--yolo", "run", "hello"]],
     "pi": [[], ["--yolo"], _SESSION, ["--reasoning", "off"], ["--max-tokens", "4096"],
            ["--as-subagent"], ["-p", "hello"]],
+    "dsh": [[], ["--yolo"], _SESSION, ["--reasoning", "off"], ["--reasoning-effort", "high"],
+            ["--profile", "headless", "hi"]],
 }
 
 # Unsloth's agent-facing ids -> agent-switch's, applied to the unsloth side only. Longest first.
@@ -59,6 +61,11 @@ _TEXT_MAP = [
     ("unsloth_agent", "local_agent"),
     ("unsloth_api", "agent_switch"),
     ("UNSLOTH_STUDIO_AUTH_TOKEN", "AGENT_SWITCH_AUTH_TOKEN"),
+    ("UNSLOTH_API_KEY", "AGENT_SWITCH_API_KEY"),
+    ("unsloth.patch.yml", "agent-switch.patch.yml"),
+    ("    providers:\n      unsloth:\n", "    providers:\n      agent-switch:\n"),
+    ("displayName: Unsloth Studio\n", "displayName: agent-switch\n"),
+    ("    provider: unsloth\n", "    provider: agent-switch\n"),
     ("UNSLOTH_CLAUDE_SUBAGENT_", "AGENT_SWITCH_CLAUDE_SUBAGENT_"),
     ("UNSLOTH_CODEX_SUBAGENT_CONFIG", "AGENT_SWITCH_CODEX_SUBAGENT_CONFIG"),
     ("UNSLOTH_PI_SUBAGENT_", "AGENT_SWITCH_PI_SUBAGENT_"),
@@ -117,6 +124,7 @@ _PIN_WARNING_MAP = [
 _EXPECTED_DIVERGENCES = {
     "codex --temperature 0.6 --top-k 20": _PIN_WARNING_MAP,
     "pi --temperature 0.6 --top-k 20": _PIN_WARNING_MAP,
+    "dsh --temperature 0.6 --top-k 20": _PIN_WARNING_MAP,
 }
 # A JSON object key "unsloth" maps by its parent key.
 _KEY_MAP = {"providers": "agent-switch", "agent": "local", "mcpServers": "local"}

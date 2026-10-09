@@ -30,6 +30,10 @@ import click
 import typer
 from typer.core import TyperCommand
 
+from agent_switch._coding_agents import (
+    deepseek_harness_executables_on_path,
+    is_deepseek_harness_executable,
+)
 from agent_switch._inference import (
     _USER_AGENT,
     find_studio_server,
@@ -55,6 +59,13 @@ _CODEX_PROFILE = "agent_switch"
 _CODEX_ENV_KEY = "AGENT_SWITCH_AUTH_TOKEN"
 # Codex treats an SSE stream with no bytes for this long as lost, cancels it and reconnects. Its default is 300000 (5 minutes), measured against the WHOLE quiet period, and llama-server sends nothing at all while it processes the prompt. A local CPU host chews through a prompt at low tens of tokens a second and Codex's own preamble is several thousand tokens before the user has typed anything: 16.1 tok/s measured on a 2-core box means ~460s of silence for a ~7300-token first turn, so the default trips before the first token exists. The reconnect is worse than the wait, because llama-server hands the retry a different parallel slot whose KV cache shares no prefix, so each attempt restarts prompt processing from zero and the five retries can never converge. Observed as a request completing in exactly 300056ms with `Reconnecting... 1/5` and no turn ever finishing. 20 minutes here, sized to be longer than a slow local first turn rather than to any server-side budget: nothing here bounds generation, and a genuinely dead stream is still caught, just later.
 _CODEX_STREAM_IDLE_TIMEOUT_MS = 1_200_000
+_DSH_PROVIDER = "agent-switch"
+_DSH_ENV_KEY = "AGENT_SWITCH_API_KEY"
+_DSH_PATCH_FILE = "agent-switch.patch.yml"
+_DSH_PACKAGE = "@deepseek-ai/dsh"
+# dsh picks its sandbox+approval preset from DSH_PERMISSION_MODE via ??, so omitting it would inherit a danger-full-access exported in the parent shell, and "" is not unset to ??. Pin the mode in both directions instead of only setting it for --yolo.
+_DSH_SAFE_PERMISSION_MODE = "workspace-write"
+_DSH_YOLO_PERMISSION_MODE = "danger-full-access"
 _PI_PROVIDER = "agent-switch"
 _SUBAGENT_NAME = "local"
 _SUBAGENT_DESCRIPTION = (
@@ -331,8 +342,9 @@ _COMPACT_AT_OPTION = typer.Option(
     help = (
         "Fraction of the context window that triggers the agent's auto-compaction: "
         "0.85 starts it once 85% of the context is used. Applies to Claude Code, Codex, "
-        "OpenCode and Pi; Claude Code scales its own effective window, so there the ratio "
-        "can only pull its built-in trigger earlier. Unset keeps each agent's current behavior."
+        "OpenCode, Pi and DeepSeek Harness's headless profile (its web profile ignores it, "
+        "with a warning); Claude Code scales its own effective window, so there the ratio can "
+        "only pull its built-in trigger earlier. Unset keeps each agent's current behavior."
     ),
 )
 
@@ -506,6 +518,62 @@ def _npm_install_hint(package: str, *, ignore_scripts: bool = False) -> str:
     if os.name == "nt":
         return " ".join(_powershell_quote(part) for part in parts)
     return shlex.join(parts)
+
+
+_DSH_LAUNCHER_ARGS = frozenset(
+    "--profile --patch --dump-config --dump-default-config -V --version plugin web".split()
+)
+
+
+# Launcher invocations that boot no profile, so they take no --patch overlay.
+_DSH_NO_PROFILE_ARGS = frozenset("-V --version plugin".split())
+
+
+def _dsh_command(args: list[str], patch: Optional[str] = None) -> list[str]:
+    head = args[0] if args else ""
+    if head in _DSH_LAUNCHER_ARGS or head.startswith(("--profile=", "--patch=")):
+        command = ["dsh", *args]
+    else:
+        command = ["dsh", "web", *args]
+    if patch is not None and command[1] not in _DSH_NO_PROFILE_ARGS:
+        # `dsh <name>` only expands to `--profile <name>` when the name comes first, so the
+        # overlay goes after a bare profile name and ahead of a leading launcher option.
+        at = 1 if command[1].startswith("-") else 2
+        command[at:at] = ["--patch", patch]
+    return command
+
+
+# Launcher options that take a value, as `--name value` or `--name=value`.
+_DSH_VALUE_ARGS = frozenset("--profile --patch --from-default-profile".split())
+# Launcher options that print the profile tree and exit instead of booting it.
+_DSH_DUMP_ARGS = frozenset("--dump-config --dump-default-config".split())
+
+
+def _get_dsh_boot_profile(command: list[str]) -> Optional[str]:
+    """The profile a `_dsh_command` argv boots, or None when it boots none (plugin, version, dump).
+
+    Like the launcher, read only its own leading options: they end at `--` or at the first
+    other argument, and everything from there on belongs to the app. The `web` alias takes
+    only --patch and the dumps.
+    """
+    args = command[1:]
+    if args[:1] == ["web"]:
+        profile, value_args, exit_args, args = "web", {"--patch"}, _DSH_DUMP_ARGS, args[1:]
+    else:
+        profile, value_args, exit_args = None, _DSH_VALUE_ARGS, _DSH_DUMP_ARGS | {"-V", "--version"}
+    while args:
+        name, equals, value = args[0].partition("=")
+        if name in exit_args:
+            return None
+        if name not in value_args:
+            break
+        if not equals:
+            value = args[1] if len(args) > 1 else None
+            args = args[1:]
+        args = args[1:]
+        if name == "--profile":
+            profile = value
+    return profile
 
 
 class LoadOptions(NamedTuple):
@@ -700,6 +768,12 @@ def _subagent_model_id(
 def _fail(message: str) -> NoReturn:
     typer.echo(message, err = True)
     raise typer.Exit(code = 1)
+
+
+def _reject_as_subagent(agent: str, args: list) -> None:
+    # Reject early, or the flag reaches the agent binary after Unsloth loaded the model.
+    if any(arg == "--as-subagent" or arg.startswith("--as-subagent=") for arg in args):
+        _fail(f"--as-subagent is not supported for {agent}.")
 
 
 def _http_error_detail(exc: urllib.error.HTTPError) -> str:
@@ -3552,6 +3626,23 @@ def _which_with_install_dirs(name: str) -> Optional[str]:
             os.environ["PATH"] = original
 
 
+def _which_deepseek_harness_with_install_dirs() -> Optional[str]:
+    """Find the first valid DeepSeek Harness even when another ``dsh`` shadows it."""
+    original = os.environ.get("PATH")
+    _augment_path_with_install_dirs()
+    try:
+        for executable in deepseek_harness_executables_on_path():
+            executable = _prefer_windows_cmd_sibling(executable)
+            if executable is not None and is_deepseek_harness_executable(executable):
+                return executable
+        return None
+    finally:
+        if original is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = original
+
+
 def _install_source(install_hint: str) -> Optional[str]:
     """The first http(s) URL an install hint fetches, or None (e.g. an npm install)."""
     match = re.search(r"https?://[^\s'\")]+", install_hint)
@@ -3692,11 +3783,30 @@ def _install_agent(name: str, install_hint: str) -> Optional[str]:
 
 def _resolve_or_install_agent(name: str, install_hint: str, resolver) -> str:
     executable = resolver(name)
+    invalid_executable = None
     if executable is not None:
-        return executable
+        if name != "dsh" or is_deepseek_harness_executable(executable):
+            return executable
+        invalid_executable = executable
+        executable = _which_deepseek_harness_with_install_dirs()
+        if executable is not None:
+            return executable
+
     executable = _install_agent(name, install_hint)
     if executable is not None:
-        return executable
+        if name != "dsh" or is_deepseek_harness_executable(executable):
+            return executable
+        invalid_executable = executable
+    if name == "dsh":
+        executable = _which_deepseek_harness_with_install_dirs()
+        if executable is not None:
+            return executable
+
+    if invalid_executable is not None:
+        _fail(
+            f"`{invalid_executable}` is not DeepSeek Harness. Install DeepSeek Harness "
+            f"with: {install_hint}"
+        )
     _fail(f"`{name}` not found on PATH. Install it with: {install_hint}")
 
 
@@ -4802,6 +4912,86 @@ def write_pi_subagent_config(
     )
 
 
+def write_dsh_patch(
+    base: str,
+    model: dict,
+    path: Path,
+    request_body: Optional[dict] = None,
+    *,
+    headers: Optional[dict] = None,
+    max_tokens: Optional[int] = None,
+    compact_at: Optional[float] = None,
+) -> None:
+    """Write the dsh loader patch that points the booted profile at the model server.
+
+    dsh 0.1.7 dropped `settings.yaml`: it now imports a leftover one into the profile only
+    after the first boot has settled, so that boot still runs on the DeepSeek default. A
+    `--patch` overlay is read at boot on every dsh release this supports, and the file is
+    agent-switch's own, so it is rewritten whole rather than merged.
+    """
+    import yaml
+
+    model_entry = {"id": model["id"]}
+    window = model.get("context_length") or model.get("max_context_length")
+    if window:
+        window = int(window)
+        model_entry["contextWindow"] = window
+        model_entry["maxTokens"] = _agent_output_limit(window, max_tokens)
+    elif max_tokens:
+        model_entry["maxTokens"] = max_tokens
+    compat = {"supportsDeveloperRole": False, "maxTokensField": "max_tokens"}
+    if request_body:
+        # dsh sends template kwargs only for a model that declares reasoning levels.
+        model_entry["reasoningEfforts"] = {
+            "off": None,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+        }
+        compat["thinkingFormat"] = "chat-template"
+        compat["chatTemplateKwargs"] = request_body
+    entries = [
+        {
+            "id": "llm-pi-ai",
+            "name": "@deepseek-ai/dsh-llm-pi-ai",
+            "config": {
+                "providers": {
+                    _DSH_PROVIDER: {
+                        "displayName": "agent-switch",
+                        "api": "openai-completions",
+                        "baseURL": f"{base}/v1",
+                        "apiKeyEnv": _DSH_ENV_KEY,
+                        # Values go out verbatim: unlike Pi, dsh resolves no $NAME or !command.
+                        **({"headers": headers} if headers else {}),
+                        # pi-ai reads an unknown base URL as OpenAI itself.
+                        "compat": compat,
+                        "models": [model_entry],
+                    }
+                }
+            },
+        },
+        {
+            "id": "agent-default-model",
+            "name": "@deepseek-ai/dsh-agent-default-model",
+            "config": {"provider": _DSH_PROVIDER, "model": model["id"]},
+        },
+    ]
+    if compact_at is not None and window:
+        # dsh compacts once the context passes thresholdRatio of the model's window.
+        entries.append(
+            {
+                "id": "compaction-basic",
+                "name": "@deepseek-ai/dsh-compaction-basic",
+                "config": {"thresholdRatio": compact_at},
+            }
+        )
+    text = yaml.safe_dump(entries, sort_keys = False)
+    if not path.exists() or path.read_text(encoding = "utf-8") != text:
+        # Private: a --header value may be a token.
+        _write_private_text(path, text)
+        typer.echo(f"Updated {path}")
+
+
 @start_app.command("claude", cls = _PassthroughCommand, context_settings = _PASSTHROUGH)
 def claude(
     ctx: typer.Context,
@@ -5378,3 +5568,90 @@ def pi(
         )
 
 
+@start_app.command("dsh", cls = _PassthroughCommand, context_settings = _PASSTHROUGH)
+def dsh(
+    ctx: typer.Context,
+    model: Optional[str] = _MODEL_OPTION,
+    api_key: Optional[str] = _KEY_OPTION,
+    header: Optional[list[str]] = _HEADER_OPTION,
+    launch: bool = _LAUNCH_OPTION,
+    max_seq_length: int = _CONTEXT_OPTION,
+    max_tokens: Optional[int] = _MAX_TOKENS_OPTION,
+    reasoning: Optional[Literal["on", "off", "auto"]] = _REASONING_OPTION,
+    reasoning_effort: Optional[str] = _REASONING_EFFORT_OPTION,
+    temperature: Optional[float] = _TEMPERATURE_OPTION,
+    top_p: Optional[float] = _TOP_P_OPTION,
+    top_k: Optional[int] = _TOP_K_OPTION,
+    min_p: Optional[float] = _MIN_P_OPTION,
+    repetition_penalty: Optional[float] = _REPETITION_PENALTY_OPTION,
+    presence_penalty: Optional[float] = _PRESENCE_PENALTY_OPTION,
+    compact_at: Optional[float] = _COMPACT_AT_OPTION,
+    model_load: bool = _MODEL_LOAD_OPTION,
+    url: Optional[str] = _URL_OPTION,
+    provider: Optional[ProviderName] = _PROVIDER_OPTION,
+    yolo: bool = _YOLO_OPTION,
+    persist: bool = _PERSIST_OPTION,
+):
+    """Point DeepSeek Harness (dsh) at a local model server and start it."""
+    model, ctx.args[:] = _consume_positional_model(model, ctx.args)
+    _reject_as_subagent("dsh", ctx.args)
+    headers = parse_headers(header)
+    target = _resolve_target(url, provider, api_key, headers)
+    install_hint = _npm_install_hint(_DSH_PACKAGE)
+    _require_agent_for_launch("dsh", install_hint, launch)
+    # dsh sends reasoning only as chat_template_kwargs, which only these servers read.
+    carried = (
+        _REASONING_FIELDS
+        if target.name == "unsloth" or providers.get_has_template_kwargs(target.name)
+        else frozenset()
+    )
+    server_options = ServerOptions(
+        reasoning = reasoning,
+        reasoning_effort = reasoning_effort,
+        temperature = temperature,
+        top_p = top_p,
+        top_k = top_k,
+        min_p = min_p,
+        repetition_penalty = repetition_penalty,
+        presence_penalty = presence_penalty,
+        carried = carried,
+        provider = target.name,
+    )
+    base, key, entry = _connect(
+        api_key,
+        model,
+        _load_options(ctx, max_seq_length, model_load),
+        server_options = server_options,
+        target = target,
+    )
+    _check_compact_at(compact_at, entry)
+    with _session_config("dsh", launch, persist = persist) as home:
+        patch = home / _DSH_PATCH_FILE
+        write_dsh_patch(
+            base,
+            entry,
+            patch,
+            # dsh wraps these in chat_template_kwargs itself, so pass the untranslated fields.
+            server_options._replace(provider = "unsloth").request_body(),
+            headers = headers,
+            max_tokens = max_tokens,
+            compact_at = compact_at,
+        )
+        # A Windows dsh under WSL gets DSH_HOME translated through WSLENV, but not argv.
+        command = _dsh_command(ctx.args, _agent_config_path(patch, ["dsh"]))
+        if compact_at is not None and _get_dsh_boot_profile(command) == "web":
+            typer.echo(
+                "Warning: --compact-at is ignored for dsh's web profile. "
+                "Use --profile headless to apply it.",
+                err = True,
+            )
+        env = {
+            _DSH_ENV_KEY: key,
+            "DSH_HOME": str(home),
+            # dsh uploads session records once a user records /feedback.
+            "DSH_TELEMETRY_DISABLED": "1",
+            "DSH_PERMISSION_MODE": (
+                _DSH_YOLO_PERMISSION_MODE if yolo else _DSH_SAFE_PERMISSION_MODE
+            ),
+        }
+        _run(base, entry, env, command, launch = launch, install_hint = install_hint)
