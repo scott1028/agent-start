@@ -13,15 +13,18 @@ from typer.testing import CliRunner
 import agent_switch.start as start
 from agent_switch import providers
 from agent_switch.providers.types import Target
+import shutil
+from agent_switch.agents import codex as codex_agent, opencode as opencode_agent, pi as pi_agent
+from tests.start_split import set_start_attr
 
 
 @pytest.fixture
 def cli(tmp_path, monkeypatch):
-    monkeypatch.setattr(start, "_agents_config_root", lambda: tmp_path / "agents")
-    monkeypatch.setattr(start, "_require_agent_for_launch", lambda *args: None)
-    monkeypatch.setattr(start, "_opencode_command", lambda *_: ("opencode", False))
+    set_start_attr(monkeypatch, "_agents_config_root", lambda: tmp_path / "agents")
+    set_start_attr(monkeypatch, "_require_agent_for_launch", lambda *args: None)
+    set_start_attr(monkeypatch, "_opencode_command", lambda *_: ("opencode", False))
     # No agent binaries: version probes assume a current build, as for a recipe run elsewhere.
-    monkeypatch.setattr(start.shutil, "which", lambda _: None)
+    monkeypatch.setattr(shutil, "which", lambda name, path = None: None)
     monkeypatch.delenv("AGENT_SWITCH_API_KEY", raising = False)
 
     def invoke(*argv):
@@ -74,7 +77,7 @@ def test_codex_against_vllm(cli, fake_server, tmp_path):
     assert result.exit_code == 0, result.output
     config = (tmp_path / "agents" / "codex" / "config.toml").read_text()
     assert f'base_url = "{fake_server.base}/v1"' in config
-    profile = (tmp_path / "agents" / "codex" / f"{start._CODEX_PROFILE}.config.toml").read_text()
+    profile = (tmp_path / "agents" / "codex" / f"{codex_agent._CODEX_PROFILE}.config.toml").read_text()
     assert 'model = "Qwen/Qwen3-8B"' in profile
     assert "model_context_window = 32768" in profile
 
@@ -85,7 +88,7 @@ def test_opencode_against_llamacpp(cli, fake_server, tmp_path):
     result = cli("opencode", "--url", fake_server.base, "--no-launch")
     assert result.exit_code == 0, result.output
     config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
-    provider = config["provider"][start._OPENCODE_PROVIDER]
+    provider = config["provider"][opencode_agent._OPENCODE_PROVIDER]
     assert provider["options"]["baseURL"] == f"{fake_server.base}/v1"
     assert provider["models"]["/m/jan.gguf"]["limit"]["context"] == 4096
 
@@ -100,7 +103,7 @@ def test_pi_against_lmstudio(cli, fake_server, tmp_path):
     result = cli("pi", "--url", fake_server.base, "--no-launch")
     assert result.exit_code == 0, result.output
     models = json.loads((tmp_path / "agents" / "pi" / ".pi" / "agent" / "models.json").read_text())
-    entry = models["providers"][start._PI_PROVIDER]
+    entry = models["providers"][pi_agent._PI_PROVIDER]
     assert entry["baseUrl"] == f"{fake_server.base}/v1"
     assert entry["models"][0]["contextWindow"] == 16384
 
@@ -155,7 +158,7 @@ def test_codex_needs_the_responses_endpoint(cli, fake_server):
 
 def test_no_url_uses_the_only_local_server_found(cli, fake_server, monkeypatch):
     _ollama(fake_server)
-    monkeypatch.setattr(start.providers, "scan_local_servers", lambda: [Target("ollama", fake_server.base)])
+    monkeypatch.setattr(providers, "scan_local_servers", lambda: [Target("ollama", fake_server.base)])
     result = cli("claude", "--no-launch")
     assert result.exit_code == 0, result.output
     assert _exports(result.output)["ANTHROPIC_BASE_URL"] == fake_server.base
@@ -163,7 +166,7 @@ def test_no_url_uses_the_only_local_server_found(cli, fake_server, monkeypatch):
 
 def test_no_url_with_several_local_servers_asks_which(cli, monkeypatch):
     monkeypatch.setattr(
-        start.providers,
+        providers,
         "scan_local_servers",
         lambda: [Target("ollama", "http://127.0.0.1:11434"), Target("vllm", "http://127.0.0.1:8000")],
     )

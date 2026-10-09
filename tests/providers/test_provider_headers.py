@@ -7,10 +7,10 @@ import json
 
 import pytest
 
-import agent_switch.start as start
 from agent_switch import providers
 from agent_switch.providers.utils import request_json, require_json
 from test_cli_providers import _exports, _ollama, cli  # noqa: F401  (fixture import)
+from agent_switch.agents import opencode as opencode_agent, pi as pi_agent
 
 
 def _last_headers(server, path):
@@ -74,7 +74,7 @@ def test_opencode_cli_header_lands_in_config(cli, fake_server, tmp_path):
     result = cli("opencode", "--url", fake_server.base, "--header", "X-Foo=bar", "--no-launch")
     assert result.exit_code == 0, result.output
     config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
-    assert config["provider"][start._OPENCODE_PROVIDER]["options"]["headers"] == {"X-Foo": "bar"}
+    assert config["provider"][opencode_agent._OPENCODE_PROVIDER]["options"]["headers"] == {"X-Foo": "bar"}
 
 
 def test_pi_cli_header_lands_in_models_json(cli, fake_server, tmp_path):
@@ -87,7 +87,7 @@ def test_pi_cli_header_lands_in_models_json(cli, fake_server, tmp_path):
     result = cli("pi", "--url", fake_server.base, "--header", "X-Foo=bar", "--no-launch")
     assert result.exit_code == 0, result.output
     models = json.loads((tmp_path / "agents" / "pi" / ".pi" / "agent" / "models.json").read_text())
-    assert models["providers"][start._PI_PROVIDER]["headers"] == {"X-Foo": "bar"}
+    assert models["providers"][pi_agent._PI_PROVIDER]["headers"] == {"X-Foo": "bar"}
 
 
 def test_invalid_header_pair_fails_before_contacting_the_server(cli, fake_server):

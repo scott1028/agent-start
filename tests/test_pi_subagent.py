@@ -55,7 +55,7 @@ setInterval(() => {}, 1000);
 """,
         encoding = "utf-8",
     )
-    extension = Path(__file__).parents[1] / "agent_switch" / "pi_subagent.ts"
+    extension = Path(__file__).parents[1] / "agent_switch" / "agents" / "pi_subagent.ts"
     test_file = tmp_path / "pi-cancel.test.ts"
     test_file.write_text(
         f"""
@@ -166,7 +166,7 @@ console.log(JSON.stringify(event));
 """,
         encoding = "utf-8",
     )
-    extension = Path(__file__).parents[1] / "agent_switch" / "pi_subagent.ts"
+    extension = Path(__file__).parents[1] / "agent_switch" / "agents" / "pi_subagent.ts"
     test_file = tmp_path / "pi-error.test.ts"
     test_file.write_text(
         f"""
@@ -301,7 +301,7 @@ console.log(JSON.stringify({{
 """,
         encoding = "utf-8",
     )
-    extension = Path(__file__).parents[1] / "agent_switch" / "pi_subagent.ts"
+    extension = Path(__file__).parents[1] / "agent_switch" / "agents" / "pi_subagent.ts"
     test_file = tmp_path / "pi-parallel.test.ts"
     test_file.write_text(
         f"""
@@ -407,7 +407,7 @@ console.log(JSON.stringify({{
 """,
         encoding = "utf-8",
     )
-    extension = Path(__file__).parents[1] / "agent_switch" / "pi_subagent.ts"
+    extension = Path(__file__).parents[1] / "agent_switch" / "agents" / "pi_subagent.ts"
     test_file = tmp_path / "pi-global-cap.test.ts"
     test_file.write_text(
         f"""

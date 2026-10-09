@@ -516,7 +516,7 @@ def test_timeout_can_be_disabled(monkeypatch):
 
 def test_local_child_is_spawned_through_the_shim_resolver(monkeypatch, tmp_path):
     # Pins the wiring: a Windows .cmd must reach the npm parser, not Popen (#9167). The parser
-    # behaviour itself is covered in test_start.py.
+    # behaviour itself is covered in tests/core/test_launch.py.
     _stub_env(monkeypatch, tmp_path)
     monkeypatch.setattr(bridge.shutil, "which", lambda _: r"C:\\nodejs\\claude.cmd")
     captured = {}

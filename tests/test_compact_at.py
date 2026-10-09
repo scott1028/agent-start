@@ -11,7 +11,10 @@ import pytest
 from typer.testing import CliRunner
 
 import agent_switch.start as start
-from test_start import BASE, MODEL, _assert_env_set, fake_vllm  # noqa: F401  (fixture import)
+from tests.cli_support import BASE, MODEL, _assert_env_set
+from agent_switch.core import options as core_options
+from agent_switch.agents import claude as claude_agent, codex as codex_agent, opencode as opencode_agent
+from tests.start_split import set_start_attr
 
 
 def test_claude_compact_at_sets_pct_override(fake_vllm):
@@ -29,7 +32,7 @@ def test_claude_compact_at_unset_keeps_90(fake_vllm):
 
 
 def _codex_profile(tmp_path) -> str:
-    return (tmp_path / "agents" / "codex" / f"{start._CODEX_PROFILE}.config.toml").read_text()
+    return (tmp_path / "agents" / "codex" / f"{codex_agent._CODEX_PROFILE}.config.toml").read_text()
 
 
 def test_codex_compact_at_sets_auto_compact_limit(fake_vllm, tmp_path):
@@ -105,17 +108,17 @@ def test_compact_at_range_accepted(fake_vllm, value):
 
 
 def test_check_compact_at_warns_without_a_window(capsys):
-    start._check_compact_at(0.85, {"id": "some-model"})
+    core_options._check_compact_at(0.85, {"id": "some-model"})
     assert "--compact-at is ignored" in capsys.readouterr().err
 
 
 def test_check_compact_at_silent_with_a_window(capsys):
-    start._check_compact_at(0.85, {"id": "some-model", "context_length": 32768})
+    core_options._check_compact_at(0.85, {"id": "some-model", "context_length": 32768})
     assert capsys.readouterr().err == ""
 
 
 def test_claude_local_env_pct_from_compact_at():
-    env = start._claude_local_env(
+    env = claude_agent._claude_local_env(
         BASE, "k", {"id": "m", "context_length": 32768}, compact_at = 0.85
     )
     assert env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "85"
@@ -123,7 +126,7 @@ def test_claude_local_env_pct_from_compact_at():
 
 def test_opencode_compaction_reserved_ratio_skips_cap_and_floor():
     # An explicit ratio is honored exactly: no output cap, no 8192 floor.
-    assert start.opencode_compaction_reserved(16_384, 4_096, 0.85) == 2_457  # 16384 * 0.15
+    assert opencode_agent.opencode_compaction_reserved(16_384, 4_096, 0.85) == 2_457  # 16384 * 0.15
 
 
 def test_opencode_subagent_compact_at_warns(fake_vllm):
@@ -143,7 +146,7 @@ def test_pi_subagent_compact_at_warns(fake_vllm):
 
 
 def test_claude_subagent_plugin_settings_carry_pct(tmp_path):
-    plugin = start.write_claude_subagent_plugin(
+    plugin = claude_agent.write_claude_subagent_plugin(
         tmp_path,
         {
             "AGENT_SWITCH_CLAUDE_SUBAGENT_BASE_URL": BASE,
@@ -191,9 +194,9 @@ def test_claude_subagent_child_gets_pct(monkeypatch, tmp_path):
 
 
 def test_codex_subagent_bridge_carries_compact_at(tmp_path, monkeypatch):
-    monkeypatch.setattr(start, "_codex_supports_model_catalog", lambda: False)
-    start.write_codex_subagent_bridge(
+    set_start_attr(monkeypatch, "_codex_supports_model_catalog", lambda: False)
+    codex_agent.write_codex_subagent_bridge(
         BASE, "sk-test", MODEL, tmp_path, yolo = False, compact_at = 0.85
     )
-    profile = (tmp_path / "child" / f"{start._CODEX_PROFILE}.config.toml").read_text()
+    profile = (tmp_path / "child" / f"{codex_agent._CODEX_PROFILE}.config.toml").read_text()
     assert "model_auto_compact_token_limit = 111411" in profile

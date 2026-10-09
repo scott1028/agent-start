@@ -15,20 +15,19 @@ from pathlib import Path
 from typing import Any
 
 from agent_switch.claude_subagent_mcp import _bounded, _stop_child, serve
-from agent_switch.start import (
+from agent_switch.agents.codex import (
     _CODEX_ENV_KEY,
     _CODEX_ENV_UNSET,
     _CODEX_PROFILE,
     _CODEX_SUBAGENT_CONFIG_ENV,
     _CODEX_SUBAGENT_MCP_TOOL,
-    _CODEX_SUBAGENT_TOOL_DESCRIPTION,
     _CODEX_SUBAGENT_ROUTING_INSTRUCTIONS,
-    _SUBAGENT_INSTRUCTIONS,
-    _merge_wslenv,
-    _prefer_windows_cmd_sibling,
-    _resolved_launch_command,
-    _wsl_shim_env,
+    _CODEX_SUBAGENT_TOOL_DESCRIPTION,
 )
+from agent_switch.core.install import _prefer_windows_cmd_sibling
+from agent_switch.core.launch import _resolved_launch_command, _wsl_shim_env
+from agent_switch.core.options import _SUBAGENT_INSTRUCTIONS
+from agent_switch.core.platform import _merge_wslenv
 
 _CANCEL_POLL_SECONDS = 0.1
 _SERVER_INSTRUCTIONS = _CODEX_SUBAGENT_ROUTING_INSTRUCTIONS

@@ -16,20 +16,18 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from agent_switch.start import (
+from agent_switch.agents.claude import (
     _CLAUDE_ENV_UNSET,
     _CLAUDE_SUBAGENT_SETTINGS_ENV,
-    _SUBAGENT_DESCRIPTION,
-    _SUBAGENT_INSTRUCTIONS,
     _SUBAGENT_PLAN_DESCRIPTION,
     _SUBAGENT_PLAN_INSTRUCTIONS,
-    _agent_config_path,
     _claude_flags,
     _claude_local_env,
-    _prefer_windows_cmd_sibling,
-    _resolved_launch_command,
-    _wsl_shim_env,
 )
+from agent_switch.core.install import _prefer_windows_cmd_sibling
+from agent_switch.core.launch import _resolved_launch_command, _wsl_shim_env
+from agent_switch.core.options import _SUBAGENT_DESCRIPTION, _SUBAGENT_INSTRUCTIONS
+from agent_switch.core.session import _agent_config_path
 
 _MAX_RESULT_CHARACTERS = 100_000
 _CANCEL_POLL_SECONDS = 0.1
@@ -190,7 +188,7 @@ def run_local_agent(
     # A custom Authorization only wins if no token, inherited or ours, can outrank it; local_env pins the token empty.
     bridged, wsl_names = _wsl_shim_env(command, local_env, _CLAUDE_ENV_UNSET)
     if wsl_names:
-        from agent_switch.start import _merge_wslenv
+        from agent_switch.core.platform import _merge_wslenv
 
         bridged = {**bridged, "PWD": os.getcwd()}
         child_env["WSLENV"] = _merge_wslenv(child_env.get("WSLENV", ""), wsl_names)

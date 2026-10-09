@@ -16,11 +16,12 @@ import sys
 
 import pytest
 
-from agent_switch import start
+from agent_switch.agents import claude as claude_agent
+from tests.start_split import set_start_attr
 
 
 def _plugin(tmp_path):
-    return start.write_claude_subagent_plugin(tmp_path, {"AGENT_SWITCH_CLAUDE_SUBAGENT_MODEL": "m"})
+    return claude_agent.write_claude_subagent_plugin(tmp_path, {"AGENT_SWITCH_CLAUDE_SUBAGENT_MODEL": "m"})
 
 
 def _run_gate(script, payload):
@@ -40,15 +41,15 @@ def test_plugin_registers_a_pretooluse_hook_on_the_editing_tool(tmp_path):
 
     [entry] = hooks
     # Only the destructive tool is gated; the read-only agent stays reachable.
-    assert entry["matcher"] == start._CLAUDE_SUBAGENT_TOOL
-    assert start._CLAUDE_SUBAGENT_PLAN_TOOL not in json.dumps(hooks)
+    assert entry["matcher"] == claude_agent._CLAUDE_SUBAGENT_TOOL
+    assert claude_agent._CLAUDE_SUBAGENT_PLAN_TOOL not in json.dumps(hooks)
     [hook] = entry["hooks"]
     assert hook["type"] == "command"
     assert sys.executable in hook["command"]
     # The interpreter is quoted: unquoted, any space in the path splits the command.
     assert f'"{sys.executable}"' in hook["command"]
     # The gate path rides as base64, never as a literal the shell can expand.
-    encoded = start._b64_path(plugin / "hooks" / "plan_gate.py")
+    encoded = claude_agent._b64_path(plugin / "hooks" / "plan_gate.py")
     assert encoded in hook["command"]
     assert str(plugin / "hooks" / "plan_gate.py") not in hook["command"]
     # A hook with no timeout stalls the parent for as long as it hangs.
@@ -113,7 +114,7 @@ def test_wsl_run_clears_a_gate_left_by_an_earlier_windows_run(tmp_path, monkeypa
     hooks = plugin / "hooks" / "hooks.json"
     assert gate.exists() and hooks.exists()
 
-    monkeypatch.setattr(start, "_wsl_windows_executable", lambda _argv: True)
+    set_start_attr(monkeypatch, "_wsl_windows_executable", lambda _argv: True)
     monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
     _plugin(tmp_path)
 

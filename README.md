@@ -173,4 +173,4 @@ To bring over a later upstream feature:
    | OpenCode `agent.unsloth`; `.unsloth-parent-overlay.json`; `.unsloth-user-resources.json` | `agent.local`; `.agent-switch-parent-overlay.json`; `.agent-switch-user-resources.json` |
 
 4. Port the matching upstream tests, run them against the fake vLLM-shaped server
-   (`fake_vllm` in `tests/test_start.py`), then update the commit above and `NOTICE.md`.
+   (`fake_vllm` in `tests/conftest.py`), then update the commit above and `NOTICE.md`.
