@@ -11,6 +11,8 @@ from agent_switch.providers.utils import error_detail, get_json, request_json, r
 
 LABEL = "Ollama"
 DEFAULT_URL = "http://127.0.0.1:11434"
+# Preloading and setting num_ctx need the native API (/api/generate, /api/create): the OpenAI API
+# can do neither.
 CAN_LOAD = True
 # --context-length becomes the loaded num_ctx rather than a cap.
 SETS_CONTEXT = True
@@ -33,6 +35,7 @@ def canonical(model: str) -> str:
 
 def models(base: str, key: Optional[str], headers: Optional[dict] = None) -> list:
     listed = require_json(LABEL, base, "/v1/models", key, headers)
+    # /v1/models has no load state or window; /api/ps reports what runs and its context length.
     ps = require_json(LABEL, base, "/api/ps", key, headers)
     running = {}
     for item in (ps or {}).get("models") or []:

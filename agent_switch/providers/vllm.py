@@ -12,6 +12,7 @@ LABEL = "vLLM"
 DEFAULT_URL = "http://127.0.0.1:8000"
 CAN_LOAD = False
 SETS_CONTEXT = False
+# OpenAI sampling fields pass as-is; enable_thinking goes in vLLM's chat_template_kwargs extension.
 SUPPORTED_FIELDS = None
 TEMPLATE_KWARGS = True
 
@@ -26,6 +27,7 @@ def fingerprint(base: str, key: Optional[str] = None, headers: Optional[dict] = 
 
 def models(base: str, key: Optional[str], headers: Optional[dict] = None) -> list:
     listing = require_json(LABEL, base, "/v1/models", key, headers)
+    # max_model_len is vLLM's runtime-window extension to the /v1/models listing.
     return [
         {"id": m["id"], "loaded": True, "context_length": m.get("max_model_len")}
         for m in (listing or {}).get("data") or []

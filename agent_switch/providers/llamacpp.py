@@ -15,6 +15,7 @@ CAN_LOAD = True
 # The window is fixed at server start (-c / a preset), so --context-length only caps it.
 SETS_CONTEXT = False
 SUPPORTED_FIELDS = None
+# llama-server spells this sampler repeat_penalty, and applies chat_template_kwargs to the template.
 RENAMED_FIELDS = {"repetition_penalty": "repeat_penalty"}
 TEMPLATE_KWARGS = True
 _LOAD_TIMEOUT_S = 900
@@ -31,6 +32,7 @@ def fingerprint(base: str, key: Optional[str] = None, headers: Optional[dict] = 
 
 
 def _router(base: str, key: Optional[str], headers: Optional[dict] = None) -> bool:
+    # Router mode exists only in the native API: /props names the role, and /models/load loads.
     props = get_json(base, "/props", key, headers = headers)
     return isinstance(props, dict) and props.get("role") == "router"
 

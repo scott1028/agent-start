@@ -174,6 +174,8 @@ _PROVIDER_OPTION = typer.Option(
     rich_help_panel = _PANEL_SERVER,
     help = "Server type, when detection should be skipped. Without --url, its usual local port.",
 )
+# --provider picks the model-server adapter in providers/, not the coding agent, so these server
+# names are intentional.
 ProviderName = Literal["ollama", "lmstudio", "llamacpp", "vllm", "openai"]
 _MODEL_LOAD_OPTION = typer.Option(
     True,

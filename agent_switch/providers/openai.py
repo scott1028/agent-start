@@ -9,6 +9,8 @@ from agent_switch.providers.types import ProviderError
 from agent_switch.providers.utils import require_json
 
 LABEL = "OpenAI-compatible server"
+# The generic fallback uses only the common OpenAI API and its optional metadata, never native model
+# management. It has no default URL, so --provider openai needs --url.
 CAN_LOAD = False
 SETS_CONTEXT = False
 SUPPORTED_FIELDS = None

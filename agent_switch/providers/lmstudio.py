@@ -10,6 +10,8 @@ from agent_switch.providers.utils import error_detail, get_json, request_json, r
 
 LABEL = "LM Studio"
 DEFAULT_URL = "http://127.0.0.1:1234"
+# The OpenAI listing gives no reliable load state or loaded context length; the native REST API
+# reports loaded instances and loads a model with a chosen context_length.
 CAN_LOAD = True
 SETS_CONTEXT = True
 # Its OpenAI API reads repeat_penalty and has no min_p, enable_thinking or reasoning_effort.

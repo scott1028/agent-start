@@ -14,6 +14,9 @@ from agent_switch.providers import llamacpp, lmstudio, ollama, openai, vllm
 from agent_switch.providers.types import ProviderError, Target
 from agent_switch.providers.utils import endpoint_exists, request_json
 
+# The native adapters are deliberate, independent HTTP integrations: the shared OpenAI-compatible
+# API does not uniformly say which models are loaded, their runtime window, how to load one, or
+# which request extensions a server reads. "openai" is the generic fallback for any other server.
 PROVIDERS = ("ollama", "lmstudio", "llamacpp", "vllm", "openai")
 _MODULES = {
     "ollama": ollama,
@@ -23,6 +26,7 @@ _MODULES = {
     "openai": openai,
 }
 # Checked in this order: each fingerprint is specific enough to skip the ones after it.
+# Native servers also answer /v1/models, so the generic fallback applies only when none matches.
 _DETECT_ORDER = ("ollama", "lmstudio", "llamacpp", "vllm")
 # Placeholder for servers without auth: every agent refuses an empty key.
 NO_KEY = "agent-switch"
@@ -80,6 +84,8 @@ def resolve_target(
 def scan_local_servers() -> list:
     """Servers answering on their usual local ports."""
     found = []
+    # Convenience discovery on the known local ports, whatever server answers there; a server
+    # anywhere else needs an explicit --url.
     for name in ("ollama", "lmstudio", "llamacpp", "vllm"):
         base = _MODULES[name].DEFAULT_URL
         detected = detect(base)
