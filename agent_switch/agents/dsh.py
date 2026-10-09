@@ -37,7 +37,7 @@ from agent_switch.core.options import (
     _MIN_P_OPTION,
     _MODEL_LOAD_OPTION,
     _MODEL_OPTION,
-    _PERSIST_OPTION,
+    _PANEL_SESSION,
     _PRESENCE_PENALTY_OPTION,
     _PROVIDER_OPTION,
     _REASONING_EFFORT_OPTION,
@@ -55,14 +55,18 @@ from agent_switch.core.options import (
     _fail,
     parse_headers,
 )
-from agent_switch.core.platform import _wsl_windows_executable
+from agent_switch.core.platform import (
+    _create_directory_junction,
+    _remove_overlay_entry,
+    _wsl_windows_executable,
+)
 from agent_switch.core.session import (
     _agent_config_path,
     _agents_config_root,
     _ephemeral_session_prefix,
     _session_config,
 )
-from agent_switch.core.storage import _write_private_json, _write_private_text
+from agent_switch.core.storage import _read_json_object, _write_private_json, _write_private_text
 
 
 _DSH_PROVIDER = "agent-switch"
@@ -101,6 +105,29 @@ _DSH_LAUNCHER_ARGS = frozenset(
 
 # Launcher invocations that boot no profile, so they take no --patch overlay.
 _DSH_NO_PROFILE_ARGS = frozenset("-V --version plugin".split())
+
+
+_DSH_USER_RESOURCES_MANIFEST = ".agent-switch-user-resources.json"
+
+
+# The only user DSH home entries a session sees; profiles, plugins, credentials and
+# settings stay isolated.
+_DSH_USER_RESOURCE_ENTRIES = ("AGENTS.md", "skills")
+
+
+# dsh-tui/dst keep their session home by default: settings, preferences, history and the
+# pnpm-installed profile live in it, so the shared --persist default does not fit them.
+_DSH_PERSIST_OPTION = typer.Option(
+    None,
+    "--persist/--no-persist",
+    rich_help_panel = _PANEL_SESSION,
+    help = (
+        "The session dir under the agent-switch agents dir keeps settings, preferences, "
+        "history and the installed profile, so `--resume <id>` / `-c` can reopen a session. "
+        "dsh-tui and dst keep it by default; --no-persist makes it a throwaway dir removed "
+        "on exit. dsh uses a throwaway dir unless --persist."
+    ),
+)
 
 
 def _dsh_command(args: list[str], patch: Optional[str] = None) -> list[str]:
@@ -322,6 +349,8 @@ def write_dsh_patch(
                 "config": {"thresholdRatio": compact_at},
             }
         )
+    # TODO: dsh >= 0.1.7 keeps /settings in the profile patch, and this row replaces the whole
+    # dsh-tui block, so settings changed there may be overridden on boot; verify on a 0.2.x harness.
     if is_tui:
         # A patch row replaces dsh-tui's whole config block (no deep merge), so restate the six
         # keys of the dsh-tui 0.14.0 row; the !!js bindings carry the launcher's workspace and
@@ -564,6 +593,65 @@ def _seed_dsh_tui_state(home: Path) -> None:
             _write_private_json(state / name, content)
 
 
+def _get_dsh_source_home(dsh_home: Path) -> Path:
+    """The user's own DSH home, resolved the way dsh resolves its own."""
+    configured = os.environ.get("DSH_HOME") or ""
+    # dsh trims only to decide the variable is set, then uses the raw value, ~-expanded.
+    if configured.strip():
+        source = Path(os.path.abspath(os.path.expanduser(configured)))
+    else:
+        source = Path.home() / ".dsh"
+    if source.resolve(strict = False) == dsh_home.resolve(strict = False):
+        # Do not treat this session as its own resource source.
+        return Path.home() / ".dsh"
+    return source
+
+
+def write_dsh_user_resources(dsh_home: Path, *, is_tui: bool) -> None:
+    """Link the user's AGENTS.md and skills into an isolated session DSH home."""
+    manifest_path = dsh_home / _DSH_USER_RESOURCES_MANIFEST
+    previous = _read_json_object(manifest_path)
+    managed = previous.get("entries") if isinstance(previous, dict) else []
+    if not isinstance(managed, list):
+        managed = []
+    for name in managed:
+        if name in _DSH_USER_RESOURCE_ENTRIES:
+            _remove_overlay_entry(dsh_home / name)
+    source_home = _get_dsh_source_home(dsh_home)
+    if not is_tui and _wsl_windows_executable(["dsh"]):
+        # A Windows dsh cannot follow WSL links, and a persisted session an earlier Linux dsh
+        # prepared still holds them, so clear those and link nothing.
+        manifest_path.unlink(missing_ok = True)
+        if any((source_home / name).exists() for name in _DSH_USER_RESOURCE_ENTRIES):
+            typer.echo(
+                "Warning: your AGENTS.md and skills won't load in this session: a Windows dsh "
+                "under WSL cannot follow links made from WSL.",
+                err = True,
+            )
+        return
+    dsh_home.mkdir(parents = True, exist_ok = True, mode = 0o700)
+    created = []
+    for name in _DSH_USER_RESOURCE_ENTRIES:
+        source = source_home / name
+        target = dsh_home / name
+        if not source.exists() or target.is_symlink() or target.exists():
+            # Gone from the source, or a real session entry owns the name now.
+            continue
+        try:
+            target.symlink_to(source, target_is_directory = source.is_dir())
+        except OSError:
+            if source.is_dir():
+                if not _create_directory_junction(source, target):
+                    typer.echo(
+                        f"Warning: couldn't link {source} into the dsh session.", err = True
+                    )
+                    continue
+            else:
+                shutil.copy2(source, target)
+        created.append(name)
+    _write_private_json(manifest_path, {"entries": created})
+
+
 def dsh(
     ctx: typer.Context,
     model: Optional[str] = _MODEL_OPTION,
@@ -585,12 +673,14 @@ def dsh(
     url: Optional[str] = _URL_OPTION,
     provider: Optional[ProviderName] = _PROVIDER_OPTION,
     yolo: bool = _YOLO_OPTION,
-    persist: bool = _PERSIST_OPTION,
+    persist: Optional[bool] = _DSH_PERSIST_OPTION,
 ):
     """Point DeepSeek Harness (dsh) at a local model server and start it."""
     # One handler for dsh and the TUI: they share the server route and differ in launch and home.
     agent = ctx.info_name
     is_tui = agent != "dsh"
+    # dsh-tui/dst keep their session home unless --no-persist; dsh stays throwaway unless --persist.
+    persist = is_tui if persist is None else persist
     model, ctx.args[:] = _consume_positional_model(model, ctx.args)
     if is_tui:
         launcher, harness = _check_dsh_tui_start(
@@ -633,6 +723,7 @@ def dsh(
         if is_tui:
             # Recheck the real home: an unwritable agents dir falls back to the system temp dir.
             _check_dsh_tui_home(agent, home)
+        dsh_home = home / ".dsh" if is_tui else home
         patch = home / _DSH_PATCH_FILE
         write_dsh_patch(
             base,
@@ -658,9 +749,10 @@ def dsh(
                 "Use --profile headless to apply it.",
                 err = True,
             )
+        write_dsh_user_resources(dsh_home, is_tui = is_tui)
         env = {
             _DSH_ENV_KEY: key,
-            "DSH_HOME": str(home / ".dsh" if is_tui else home),
+            "DSH_HOME": str(dsh_home),
             # dsh uploads session records once a user records /feedback.
             "DSH_TELEMETRY_DISABLED": "1",
             "DSH_PERMISSION_MODE": (

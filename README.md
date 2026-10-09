@@ -70,17 +70,25 @@ session dirs.
 
 dsh starts its web profile (`dsh web`) unless the arguments name another, e.g. `--profile headless`.
 Its `DSH_HOME` is moved to a session directory that is removed when dsh exits (`--persist` keeps
-it), so a session sees none of the profiles, plugins or DeepSeek API key in your `~/.dsh`. dsh
-replaces any `User-Agent` passed with `--header`. `--as-subagent` is not supported for dsh.
+it), so a session sees none of the profiles, plugins or DeepSeek API key in your `~/.dsh`. Your
+`AGENTS.md` and `skills/` from your DSH home (`$DSH_HOME` or `~/.dsh`) are the exception: they are
+linked into the session and read through the link. dsh replaces any `User-Agent` passed with
+`--header`. `--as-subagent` is not supported for dsh.
 
 `dsh-tui` and its alias `dst` start the DeepSeek Harness TUI (`@deepseek-harness-tui/dsh-tui`,
 tried with 0.14.0 on dsh 0.1.5-rc.2 and 0.2.0-rc.2) on the same route, in one session directory
 shared by both names. The TUI keeps its state in `~/.dsh-tui` under the home directory, so `HOME`
 and `USERPROFILE` move there along with `DSH_HOME`, and pnpm's store and cache stay inside it too:
 your own dsh and dsh-tui profiles, accounts, history and pnpm store are neither read nor written.
-A fresh session directory installs the TUI profile with pnpm on first start (about 9 s and 89 MB
-here); `--persist` keeps it, with the profile and store, for later runs and for resuming with
-`--resume <id>` or `-c`. It needs an interactive terminal; `--no-launch` prints the command, whose
+The same `AGENTS.md` and `skills/` links from your DSH home apply there. `HOME` is moved, so
+`~/.agents/skills` is not visible in a dsh-tui session; put such skills in `~/.dsh/skills` or
+the project.
+dsh-tui and dst keep their session directory (`~/.agent-switch/agents/dsh-tui`) by default, so
+settings changed with `/settings`, the TUI's preferences, history and the installed profile
+survive between runs, and `--resume <id>` or `-c` reopen a session; `--no-persist` uses a
+throwaway directory removed on exit, which installs the TUI profile with pnpm again on start
+(about 9 s and 89 MB here). The model stays pinned to the agent-switch route whatever the TUI's
+model picker saved. It needs an interactive terminal; `--no-launch` prints the command, whose
 last line clears the TUI's inherited handoff variables with `env -u` on Linux and macOS.
 
 - The session is pinned to the dsh backend and the agent-switch model route. `--profile`,
@@ -106,7 +114,7 @@ last line clears the TUI's inherited handoff variables with `env -u` on Linux an
   is passed through unchanged. Set the identity per repository with `git config user.name` /
   `user.email`. How SSH finds keys under the moved home is untested. Moving the home keeps the
   TUI's own state apart; it does not hide every global configuration and is not a sandbox.
-- To resume, use `agent-switch dsh-tui --persist --resume <id>`: the TUI's own exit hint runs
+- To resume, use `agent-switch dsh-tui --resume <id>`: the TUI's own exit hint runs
   `dsh` directly, outside agent-switch.
 
 `--header NAME=VALUE` (repeat the flag) adds an HTTP header to every request sent to the

@@ -4,6 +4,7 @@
 
 """`agent-switch dsh`: patch writing, command selection and permission modes."""
 
+import json
 import os
 import shutil
 import subprocess
@@ -19,6 +20,7 @@ from agent_switch.agents import (
 )
 from agent_switch.core import (
     install as core_install,
+    session as core_session,
 )
 from tests.cli_support import (
     BASE,
@@ -294,3 +296,233 @@ def test_start_dsh_forwards_reasoning_effort(fake_vllm, monkeypatch):
     assert "--reasoning-effort" not in captured["command"]
     provider = yaml.safe_load(captured["patch"])[0]["config"]["providers"][dsh_agent._DSH_PROVIDER]
     assert provider["compat"]["chatTemplateKwargs"] == {"reasoning_effort": "high"}
+
+
+# ── the user's own AGENTS.md and skills linked into the session DSH home ──
+
+
+def _dsh_user_home(tmp_path, monkeypatch) -> Path:
+    # Point the user's home and DSH home at tmp dirs; dsh ~-expands through HOME.
+    home = tmp_path / "user-home"
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("DSH_HOME", raising = False)
+    return home
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "asserts POSIX symlinks")
+def test_write_dsh_user_resources_links_agents_md_and_skills(tmp_path, monkeypatch):
+    user_home = _dsh_user_home(tmp_path, monkeypatch)
+    source = user_home / ".dsh"
+    (source / "skills" / "my-skill").mkdir(parents = True)
+    (source / "skills" / "my-skill" / "SKILL.md").write_text("skill body\n")
+    (source / "AGENTS.md").write_text("user instructions\n")
+    for private in (".credentials.yaml", "settings.yaml", "sessions", "storages"):
+        (source / private).write_text("keep me out\n")
+    dsh_home = tmp_path / "session"
+
+    dsh_agent.write_dsh_user_resources(dsh_home, is_tui = False)
+
+    assert (dsh_home / "AGENTS.md").is_symlink()
+    assert (dsh_home / "skills").is_symlink()
+    assert (dsh_home / "AGENTS.md").resolve() == (source / "AGENTS.md").resolve()
+    assert (dsh_home / "skills").resolve() == (source / "skills").resolve()
+    assert (dsh_home / "AGENTS.md").read_text() == "user instructions\n"
+    assert (dsh_home / "skills" / "my-skill" / "SKILL.md").read_text() == "skill body\n"
+    for private in (".credentials.yaml", "settings.yaml", "sessions", "storages"):
+        assert not (dsh_home / private).exists()
+    manifest = json.loads((dsh_home / dsh_agent._DSH_USER_RESOURCES_MANIFEST).read_text())
+    assert manifest == {"entries": ["AGENTS.md", "skills"]}
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "asserts POSIX symlinks and ~ expansion")
+def test_write_dsh_user_resources_uses_the_inherited_dsh_home(tmp_path, monkeypatch):
+    user_home = _dsh_user_home(tmp_path, monkeypatch)
+    configured = tmp_path / "custom-dsh"
+    configured.mkdir()
+    (configured / "AGENTS.md").write_text("custom\n")
+    monkeypatch.setenv("DSH_HOME", str(configured))
+    dsh_home = tmp_path / "session"
+
+    dsh_agent.write_dsh_user_resources(dsh_home, is_tui = False)
+
+    assert (dsh_home / "AGENTS.md").resolve() == (configured / "AGENTS.md").resolve()
+
+    # dsh ~-expands DSH_HOME, so the source follows it; a gone entry is not recreated.
+    (user_home / "tilde-dsh" / "skills").mkdir(parents = True)
+    monkeypatch.setenv("DSH_HOME", "~/tilde-dsh")
+    dsh_agent.write_dsh_user_resources(dsh_home, is_tui = False)
+
+    assert not (dsh_home / "AGENTS.md").exists()
+    assert (dsh_home / "skills").resolve() == (user_home / "tilde-dsh" / "skills").resolve()
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "asserts POSIX symlinks")
+def test_write_dsh_user_resources_refuses_the_session_as_its_own_source(tmp_path, monkeypatch):
+    user_home = _dsh_user_home(tmp_path, monkeypatch)
+    (user_home / ".dsh").mkdir(parents = True)
+    (user_home / ".dsh" / "AGENTS.md").write_text("real home\n")
+    dsh_home = tmp_path / "session"
+    monkeypatch.setenv("DSH_HOME", str(dsh_home))
+
+    dsh_agent.write_dsh_user_resources(dsh_home, is_tui = False)
+
+    assert (dsh_home / "AGENTS.md").resolve() == (user_home / ".dsh" / "AGENTS.md").resolve()
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "asserts POSIX symlinks")
+def test_write_dsh_user_resources_refreshes_a_persisted_session(tmp_path, monkeypatch):
+    user_home = _dsh_user_home(tmp_path, monkeypatch)
+    source = user_home / ".dsh"
+    (source / "skills").mkdir(parents = True)
+    (source / "AGENTS.md").write_text("one\n")
+    dsh_home = tmp_path / "session"
+    dsh_agent.write_dsh_user_resources(dsh_home, is_tui = False)
+    assert (dsh_home / "AGENTS.md").is_symlink()
+
+    (source / "AGENTS.md").unlink()
+    # A link that went stale between runs is replaced, not left dangling.
+    (dsh_home / "skills").unlink()
+    (dsh_home / "skills").symlink_to(tmp_path / "gone")
+
+    dsh_agent.write_dsh_user_resources(dsh_home, is_tui = False)
+
+    assert not (dsh_home / "AGENTS.md").exists()
+    assert (dsh_home / "skills").resolve() == (source / "skills").resolve()
+    manifest = json.loads((dsh_home / dsh_agent._DSH_USER_RESOURCES_MANIFEST).read_text())
+    assert manifest == {"entries": ["skills"]}
+
+
+def test_write_dsh_user_resources_keeps_session_owned_entries(tmp_path, monkeypatch):
+    user_home = _dsh_user_home(tmp_path, monkeypatch)
+    source = user_home / ".dsh"
+    (source / "skills").mkdir(parents = True)
+    (source / "AGENTS.md").write_text("user\n")
+    dsh_home = tmp_path / "session"
+    dsh_home.mkdir()
+    (dsh_home / "AGENTS.md").write_text("session\n")
+    (dsh_home / "skills").mkdir(parents = True)
+    (dsh_home / "skills" / "mine.txt").write_text("mine\n")
+
+    dsh_agent.write_dsh_user_resources(dsh_home, is_tui = False)
+
+    assert not (dsh_home / "AGENTS.md").is_symlink()
+    assert (dsh_home / "AGENTS.md").read_text() == "session\n"
+    assert (dsh_home / "skills" / "mine.txt").read_text() == "mine\n"
+    manifest = json.loads((dsh_home / dsh_agent._DSH_USER_RESOURCES_MANIFEST).read_text())
+    assert manifest == {"entries": []}
+
+
+def test_write_dsh_user_resources_falls_back_to_copy_and_junction(tmp_path, monkeypatch, capsys):
+    user_home = _dsh_user_home(tmp_path, monkeypatch)
+    source = user_home / ".dsh"
+    (source / "skills").mkdir(parents = True)
+    (source / "AGENTS.md").write_text("user\n")
+    dsh_home = tmp_path / "session"
+
+    def refuse_symlinks(self, target, target_is_directory = False):
+        raise OSError("this filesystem does not allow symlinks")
+
+    monkeypatch.setattr(Path, "symlink_to", refuse_symlinks)
+    junctions = []
+
+    def make_junction(source, target):
+        junctions.append((source, target))
+        return True
+
+    set_start_attr(monkeypatch, "_create_directory_junction", make_junction)
+    dsh_agent.write_dsh_user_resources(dsh_home, is_tui = False)
+
+    assert (dsh_home / "AGENTS.md").is_file() and not (dsh_home / "AGENTS.md").is_symlink()
+    assert (dsh_home / "AGENTS.md").read_text() == "user\n"
+    assert junctions == [(source / "skills", dsh_home / "skills")]
+    assert capsys.readouterr().err == ""
+
+    # When both link forms fail for skills, warn once and keep the rest.
+    set_start_attr(monkeypatch, "_create_directory_junction", lambda source, target: False)
+    dsh_agent.write_dsh_user_resources(dsh_home, is_tui = False)
+
+    assert not (dsh_home / "skills").exists()
+    assert "couldn't link" in capsys.readouterr().err
+    manifest = json.loads((dsh_home / dsh_agent._DSH_USER_RESOURCES_MANIFEST).read_text())
+    assert manifest == {"entries": ["AGENTS.md"]}
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "WSL scenario")
+def test_write_dsh_user_resources_clears_links_for_a_windows_dsh_under_wsl(
+    tmp_path, monkeypatch, capsys
+):
+    user_home = _dsh_user_home(tmp_path, monkeypatch)
+    source = user_home / ".dsh"
+    (source / "skills").mkdir(parents = True)
+    (source / "AGENTS.md").write_text("user\n")
+    dsh_home = tmp_path / "session"
+    dsh_agent.write_dsh_user_resources(dsh_home, is_tui = False)
+    assert (dsh_home / "AGENTS.md").is_symlink()
+
+    monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
+    monkeypatch.setattr(shutil, "which", lambda name, path = None: "/mnt/c/npm/dsh")
+    dsh_agent.write_dsh_user_resources(dsh_home, is_tui = False)
+
+    assert not (dsh_home / "AGENTS.md").exists()
+    assert not (dsh_home / "skills").exists()
+    assert not (dsh_home / dsh_agent._DSH_USER_RESOURCES_MANIFEST).exists()
+    assert "AGENTS.md and skills won't load" in capsys.readouterr().err
+    # dsh-tui refuses a Windows launcher under WSL, so its session still gets the links.
+    dsh_agent.write_dsh_user_resources(dsh_home, is_tui = True)
+    assert (dsh_home / "AGENTS.md").is_symlink()
+    assert (dsh_home / "skills").is_symlink()
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "WSL scenario")
+def test_write_dsh_user_resources_stays_quiet_under_wsl_without_user_resources(
+    tmp_path, monkeypatch, capsys
+):
+    # Warning only when there is something the session would have lost.
+    _dsh_user_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
+    monkeypatch.setattr(shutil, "which", lambda name, path = None: "/mnt/c/npm/dsh")
+
+    dsh_agent.write_dsh_user_resources(tmp_path / "session", is_tui = False)
+
+    assert capsys.readouterr().err == ""
+    assert not (tmp_path / "session").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "POSIX ephemeral sessions and symlinks")
+@pytest.mark.parametrize(("agent", "is_tui"), [("dsh", False), ("dsh-tui", True)])
+def test_ephemeral_session_removal_deletes_only_the_links(agent, is_tui, tmp_path, monkeypatch):
+    # The ephemeral launch home goes with shutil.rmtree; that must drop the links into the
+    # user's real ~/.dsh, never what they point at.
+    user_home = _dsh_user_home(tmp_path, monkeypatch)
+    source = user_home / ".dsh"
+    (source / "skills" / "my-skill").mkdir(parents = True)
+    (source / "skills" / "my-skill" / "SKILL.md").write_text("skill body\n")
+    (source / "AGENTS.md").write_text("user instructions\n")
+    set_start_attr(monkeypatch, "_agents_config_root", lambda: tmp_path / "agents")
+
+    with core_session._session_config(agent, True) as home:
+        dsh_home = home / ".dsh" if is_tui else home
+        dsh_agent.write_dsh_user_resources(dsh_home, is_tui = is_tui)
+        assert (dsh_home / "AGENTS.md").is_symlink()
+        assert (dsh_home / "skills").is_symlink()
+        assert (dsh_home / "skills" / "my-skill" / "SKILL.md").read_text() == "skill body\n"
+
+    assert not home.exists()
+    assert (source / "AGENTS.md").read_text() == "user instructions\n"
+    assert (source / "skills" / "my-skill" / "SKILL.md").read_text() == "skill body\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "asserts POSIX symlinks")
+def test_dsh_no_launch_links_user_resources_into_the_session(fake_vllm, tmp_path, monkeypatch):
+    user_home = _dsh_user_home(tmp_path, monkeypatch)
+    source = user_home / ".dsh"
+    (source / "skills" / "my-skill").mkdir(parents = True)
+    (source / "AGENTS.md").write_text("user instructions\n")
+
+    result = CliRunner().invoke(start.start_app, ["dsh", "--no-launch"])
+
+    assert result.exit_code == 0, result.output
+    dsh_home = tmp_path / "agents" / "dsh"
+    assert (dsh_home / "AGENTS.md").resolve() == (source / "AGENTS.md").resolve()
+    assert (dsh_home / "skills").resolve() == (source / "skills").resolve()

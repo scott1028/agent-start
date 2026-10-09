@@ -300,7 +300,7 @@ def test_launch_uses_the_real_tui_past_a_foreign_shadow(
     monkeypatch.setenv("DSH_PERMISSION_MODE", "danger-full-access")
     monkeypatch.setenv("DSH_TUI_BACKEND_HANDOFF", "claude")
     monkeypatch.setenv("DSH_TUI_WORKSPACE_TARGET", "/elsewhere")
-    result, captured = _launch(monkeypatch, [agent], returncode)
+    result, captured = _launch(monkeypatch, [agent, "--no-persist"], returncode)
     assert result.exit_code == returncode, result.output
     command, env = captured["command"], captured["env"]
     assert command[:2] == [str(dst), "--patch"]
@@ -313,6 +313,60 @@ def test_launch_uses_the_real_tui_past_a_foreign_shadow(
     # The ephemeral home exists for the run and is gone once it ends, success or failure.
     assert captured["home_existed"]
     assert not Path(env["HOME"]).exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "POSIX stub launchers")
+@pytest.mark.parametrize("agent", ["dsh-tui", "dst"])
+def test_launch_keeps_the_session_home_by_default(agent, fake_vllm, short_root, monkeypatch, tmp_path):
+    real = tmp_path / "real"
+    _stub(real, "dsh-tui", _TUI_MARKER)
+    _stub(real, "dst", _TUI_MARKER)
+    _stub(real, "dsh", _HARNESS_MARKER)
+    _launchable(monkeypatch, tmp_path, real)
+    result, captured = _launch(monkeypatch, [agent])
+    assert result.exit_code == 0, result.output
+    home = short_root / "agents" / "dsh-tui"
+    assert captured["env"]["HOME"] == str(home)
+    assert captured["home_existed"] and home.is_dir()
+
+    # What the TUI saved during one run is there for the next one.
+    (home / ".dsh").mkdir(parents = True, exist_ok = True)
+    (home / ".dsh" / "settings.yaml").write_text("theme: dark\n")
+    (home / ".dsh-tui").mkdir(parents = True, exist_ok = True)
+    (home / ".dsh-tui" / "theme.json").write_text('{"theme": "dark"}\n')
+    result, captured = _launch(monkeypatch, [agent])
+    assert result.exit_code == 0, result.output
+    assert captured["env"]["HOME"] == str(home)
+    assert (home / ".dsh" / "settings.yaml").read_text() == "theme: dark\n"
+    assert (home / ".dsh-tui" / "theme.json").read_text() == '{"theme": "dark"}\n'
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "POSIX stub launchers")
+def test_no_persist_launch_uses_a_throwaway_home(fake_vllm, short_root, monkeypatch, tmp_path):
+    real = tmp_path / "real"
+    _stub(real, "dsh-tui", _TUI_MARKER)
+    _stub(real, "dsh", _HARNESS_MARKER)
+    _launchable(monkeypatch, tmp_path, real)
+    result, captured = _launch(monkeypatch, ["dsh-tui", "--no-persist"])
+    assert result.exit_code == 0, result.output
+    home = Path(captured["env"]["HOME"])
+    assert home.parent == short_root / "agents" / ".tmp"
+    assert home.name.startswith("agent-switch-dsh-tui-")
+    assert captured["home_existed"]
+    assert not home.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "POSIX stub launchers")
+def test_persist_launch_still_keeps_the_home(fake_vllm, short_root, monkeypatch, tmp_path):
+    real = tmp_path / "real"
+    _stub(real, "dsh-tui", _TUI_MARKER)
+    _stub(real, "dsh", _HARNESS_MARKER)
+    _launchable(monkeypatch, tmp_path, real)
+    result, captured = _launch(monkeypatch, ["dsh-tui", "--persist"])
+    assert result.exit_code == 0, result.output
+    home = short_root / "agents" / "dsh-tui"
+    assert captured["env"]["HOME"] == str(home)
+    assert captured["home_existed"] and home.is_dir()
 
 
 @pytest.mark.skipif(os.name == "nt", reason = "POSIX stub launchers")
@@ -396,6 +450,28 @@ def test_dsh_keeps_its_own_home_and_no_tui_env(fake_vllm, tmp_path):
     patch = tmp_path / "agents" / "dsh" / dsh_agent._DSH_PATCH_FILE
     assert _launch_command(result.output) == ["dsh", "web", "--patch", str(patch)]
     assert "dsh-tui" not in patch.read_text()
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "asserts POSIX symlinks")
+def test_user_resources_are_linked_and_agents_skills_stays_out(fake_vllm, tmp_path, monkeypatch):
+    user_home = tmp_path / "user-home"
+    monkeypatch.setattr(Path, "home", lambda: user_home)
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.delenv("DSH_HOME", raising = False)
+    source = user_home / ".dsh"
+    (source / "skills" / "my-skill").mkdir(parents = True)
+    (source / "AGENTS.md").write_text("user instructions\n")
+
+    result = _invoke("dsh-tui", "--no-launch")
+
+    assert result.exit_code == 0, result.output
+    home = _home(tmp_path)
+    dsh_home = home / ".dsh"
+    assert (dsh_home / "AGENTS.md").resolve() == (source / "AGENTS.md").resolve()
+    assert (dsh_home / "skills").resolve() == (source / "skills").resolve()
+    # HOME moved, but the TUI session is not given the user's ~/.agents/skills.
+    assert not (home / ".agents").exists()
+    assert not (user_home / ".agents").exists()
 
 
 # ── dsh-tui's per-session socket must never land outside the session home ──
