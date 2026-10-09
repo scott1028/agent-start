@@ -18,7 +18,7 @@ def _write_config(tmp_path, *, bypass_permissions = False):
     path.write_text(
         json.dumps(
             {
-                "api_key": "sk-unsloth-test",
+                "api_key": "sk-test",
                 "codex_home": str(tmp_path / "child"),
                 "bypass_permissions": bypass_permissions,
             }
@@ -73,7 +73,7 @@ def test_protocol_uses_codex_specific_tool_name():
 
 @pytest.mark.parametrize("bypass_permissions", [False, True])
 @pytest.mark.parametrize("wsl_bridge", [False, True])
-def test_local_child_uses_explicit_unsloth_profile(
+def test_local_child_uses_explicit_local_profile(
     monkeypatch, tmp_path, bypass_permissions, wsl_bridge
 ):
     config = _write_config(tmp_path, bypass_permissions = bypass_permissions)
@@ -148,7 +148,7 @@ def test_local_child_uses_explicit_unsloth_profile(
         assert captured["start_new_session"] is True
     assert captured["env"]["CODEX_HOME"] == str(tmp_path / "child")
     assert captured["env"]["CODEX_SQLITE_HOME"] == str(tmp_path / "child")
-    assert captured["env"][bridge._CODEX_ENV_KEY] == "sk-unsloth-test"
+    assert captured["env"][bridge._CODEX_ENV_KEY] == "sk-test"
     if wsl_bridge:
         assert all(captured["env"][name] == "" for name in credential_names)
         wslenv = captured["env"]["WSLENV"].split(":")

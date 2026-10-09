@@ -31,8 +31,8 @@ target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]
-# Same correctness-only set as upstream unsloth, plus unused imports: the port keeps upstream's
-# formatting so it stays diffable against unsloth_cli, so no formatter runs here.
+# Correctness-only rules plus unused imports. No formatter runs here, so ported files keep their
+# original formatting and stay easy to diff against their source.
 select = ["E9", "F63", "F7", "F82", "F401"]
 
 [tool.pytest.ini_options]

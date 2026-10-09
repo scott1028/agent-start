@@ -3,21 +3,19 @@
 
 """Model-server providers: detection, model resolution and request-body translation.
 
-Unsloth keeps the ported `unsloth start` flow (agent_switch.start._connect); every other
-provider answers the same questions here: which models it serves, each one's runtime
+Each provider answers the same questions: which models it serves, each one's runtime
 window, how to load one, and which request fields it accepts.
 """
 
 from pathlib import PurePosixPath
 from typing import Optional
 
-from agent_switch.providers import llamacpp, lmstudio, ollama, openai, unsloth, vllm
+from agent_switch.providers import llamacpp, lmstudio, ollama, openai, vllm
 from agent_switch.providers.types import ProviderError, Target
 from agent_switch.providers.utils import endpoint_exists, request_json
 
-PROVIDERS = ("unsloth", "ollama", "lmstudio", "llamacpp", "vllm", "openai")
+PROVIDERS = ("ollama", "lmstudio", "llamacpp", "vllm", "openai")
 _MODULES = {
-    "unsloth": unsloth,
     "ollama": ollama,
     "lmstudio": lmstudio,
     "llamacpp": llamacpp,
@@ -25,7 +23,7 @@ _MODULES = {
     "openai": openai,
 }
 # Checked in this order: each fingerprint is specific enough to skip the ones after it.
-_DETECT_ORDER = ("unsloth", "ollama", "lmstudio", "llamacpp", "vllm")
+_DETECT_ORDER = ("ollama", "lmstudio", "llamacpp", "vllm")
 # Placeholder for servers without auth: every agent refuses an empty key.
 NO_KEY = "agent-switch"
 _NEEDS = {
@@ -72,8 +70,6 @@ def resolve_target(
         if name is None:
             raise ProviderError(f"Couldn't reach a model server at {url}.")
         return Target(name, base, headers or {})
-    if provider == "unsloth":
-        return Target("unsloth", None, headers or {})
     if provider == "openai":
         raise ProviderError("--provider openai has no usual port; pass the server with --url.")
     if provider:
@@ -82,12 +78,12 @@ def resolve_target(
 
 
 def scan_local_servers() -> list:
-    """Non-Unsloth servers answering on their usual local ports."""
+    """Servers answering on their usual local ports."""
     found = []
     for name in ("ollama", "lmstudio", "llamacpp", "vllm"):
         base = _MODULES[name].DEFAULT_URL
         detected = detect(base)
-        if detected is not None and detected != "unsloth":
+        if detected is not None:
             found.append(Target(detected, base))
     return found
 
@@ -117,7 +113,7 @@ def connect(
     needs: tuple = (),
     allow_load: bool = True,
 ) -> tuple:
-    """(base, key, entry) for a non-Unsloth target; entry is {"id", "context_length"}."""
+    """(base, key, entry) for a target; entry is {"id", "context_length"}."""
     module = _MODULES[target.name]
     base, key, headers = target.base, api_key or None, target.headers
     entries = module.models(base, key, headers)

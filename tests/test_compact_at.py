@@ -11,10 +11,10 @@ import pytest
 from typer.testing import CliRunner
 
 import agent_switch.start as start
-from test_start import BASE, MODEL, _assert_env_set, fake_studio  # noqa: F401  (fixture import)
+from test_start import BASE, MODEL, _assert_env_set, fake_vllm  # noqa: F401  (fixture import)
 
 
-def test_claude_compact_at_sets_pct_override(fake_studio):
+def test_claude_compact_at_sets_pct_override(fake_vllm):
     result = CliRunner().invoke(
         start.start_app, ["claude", "--no-launch", "--compact-at", "0.85"]
     )
@@ -22,7 +22,7 @@ def test_claude_compact_at_sets_pct_override(fake_studio):
     _assert_env_set(result.output, "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "85")
 
 
-def test_claude_compact_at_unset_keeps_90(fake_studio):
+def test_claude_compact_at_unset_keeps_90(fake_vllm):
     result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
     assert result.exit_code == 0, result.output
     _assert_env_set(result.output, "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "90")
@@ -32,7 +32,7 @@ def _codex_profile(tmp_path) -> str:
     return (tmp_path / "agents" / "codex" / f"{start._CODEX_PROFILE}.config.toml").read_text()
 
 
-def test_codex_compact_at_sets_auto_compact_limit(fake_studio, tmp_path):
+def test_codex_compact_at_sets_auto_compact_limit(fake_vllm, tmp_path):
     result = CliRunner().invoke(
         start.start_app, ["codex", "--no-launch", "--compact-at", "0.85"]
     )
@@ -40,13 +40,13 @@ def test_codex_compact_at_sets_auto_compact_limit(fake_studio, tmp_path):
     assert "model_auto_compact_token_limit = 111411" in _codex_profile(tmp_path)  # 131072 * 0.85
 
 
-def test_codex_compact_at_unset_omits_limit(fake_studio, tmp_path):
+def test_codex_compact_at_unset_omits_limit(fake_vllm, tmp_path):
     result = CliRunner().invoke(start.start_app, ["codex", "--no-launch"])
     assert result.exit_code == 0, result.output
     assert "model_auto_compact_token_limit" not in _codex_profile(tmp_path)
 
 
-def test_opencode_compact_at_scales_reserved(fake_studio, tmp_path):
+def test_opencode_compact_at_scales_reserved(fake_vllm, tmp_path):
     result = CliRunner().invoke(
         start.start_app, ["opencode", "--no-launch", "--compact-at", "0.85"]
     )
@@ -55,7 +55,7 @@ def test_opencode_compact_at_scales_reserved(fake_studio, tmp_path):
     assert config["compaction"] == {"auto": True, "reserved": 19660}  # 131072 * 0.15
 
 
-def test_opencode_compact_at_unset_keeps_default_reserved(fake_studio, tmp_path):
+def test_opencode_compact_at_unset_keeps_default_reserved(fake_vllm, tmp_path):
     result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
     assert result.exit_code == 0, result.output
     config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
@@ -67,7 +67,7 @@ def _pi_settings(tmp_path) -> dict:
     return json.loads(path.read_text()) if path.exists() else {}
 
 
-def test_pi_compact_at_sets_reserve(fake_studio, tmp_path):
+def test_pi_compact_at_sets_reserve(fake_vllm, tmp_path):
     result = CliRunner().invoke(
         start.start_app, ["pi", "--no-launch", "--compact-at", "0.85"]
     )
@@ -76,13 +76,13 @@ def test_pi_compact_at_sets_reserve(fake_studio, tmp_path):
     assert _pi_settings(tmp_path)["compaction"] == {"enabled": True, "reserveTokens": 19660}  # 131072 * 0.15
 
 
-def test_pi_compact_at_unset_omits_compaction(fake_studio, tmp_path):
+def test_pi_compact_at_unset_omits_compaction(fake_vllm, tmp_path):
     result = CliRunner().invoke(start.start_app, ["pi", "--no-launch"])
     assert result.exit_code == 0, result.output
     assert "compaction" not in _pi_settings(tmp_path)
 
 
-def test_pi_compact_at_cleared_on_rerun_without_flag(fake_studio, tmp_path):
+def test_pi_compact_at_cleared_on_rerun_without_flag(fake_vllm, tmp_path):
     result = CliRunner().invoke(start.start_app, ["pi", "--no-launch", "--compact-at", "0.85"])
     assert result.exit_code == 0, result.output
     assert "compaction" in _pi_settings(tmp_path)
@@ -92,14 +92,14 @@ def test_pi_compact_at_cleared_on_rerun_without_flag(fake_studio, tmp_path):
 
 
 @pytest.mark.parametrize("value", ["0.3", "0.99", "1.5", "-0.1"])
-def test_compact_at_out_of_range_rejected(fake_studio, value):
+def test_compact_at_out_of_range_rejected(fake_vllm, value):
     result = CliRunner().invoke(start.start_app, ["claude", "--no-launch", "--compact-at", value])
     assert result.exit_code != 0
     assert "Invalid value for '--compact-at'" in result.output
 
 
 @pytest.mark.parametrize("value", ["0.5", "0.95"])
-def test_compact_at_range_accepted(fake_studio, value):
+def test_compact_at_range_accepted(fake_vllm, value):
     result = CliRunner().invoke(start.start_app, ["claude", "--no-launch", "--compact-at", value])
     assert result.exit_code == 0, result.output
 
@@ -126,11 +126,7 @@ def test_opencode_compaction_reserved_ratio_skips_cap_and_floor():
     assert start.opencode_compaction_reserved(16_384, 4_096, 0.85) == 2_457  # 16384 * 0.15
 
 
-def test_get_compaction_reserve_small_window():
-    assert start._get_compaction_reserve(16_384, 0.85) == 2_457
-
-
-def test_opencode_subagent_compact_at_warns(fake_studio):
+def test_opencode_subagent_compact_at_warns(fake_vllm):
     result = CliRunner().invoke(
         start.start_app, ["opencode", "--no-launch", "--as-subagent", "--compact-at", "0.85"]
     )
@@ -138,7 +134,7 @@ def test_opencode_subagent_compact_at_warns(fake_studio):
     assert "--compact-at does not apply with --as-subagent for OpenCode" in result.stderr
 
 
-def test_pi_subagent_compact_at_warns(fake_studio):
+def test_pi_subagent_compact_at_warns(fake_vllm):
     result = CliRunner().invoke(
         start.start_app, ["pi", "--no-launch", "--as-subagent", "--compact-at", "0.85"]
     )

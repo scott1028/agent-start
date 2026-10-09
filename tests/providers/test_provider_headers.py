@@ -4,50 +4,13 @@
 """`--header NAME=VALUE` on agent-switch's own requests to the model server."""
 
 import json
-import shlex
 
 import pytest
-from typer.testing import CliRunner
 
 import agent_switch.start as start
 from agent_switch import providers
 from agent_switch.providers.utils import request_json, require_json
-
-
-@pytest.fixture
-def cli(tmp_path, monkeypatch):
-    """Same isolation as test_cli_providers_tdd.py's fixture, kept local to this TDD file."""
-    monkeypatch.setattr(start, "_agents_config_root", lambda: tmp_path / "agents")
-    monkeypatch.setattr(start, "_key_cache_path", lambda: tmp_path / "agent_api_key.json")
-    monkeypatch.setattr(start, "_require_agent_for_launch", lambda *args: None)
-    monkeypatch.setattr(start, "_opencode_command", lambda *_: ("opencode", False))
-    monkeypatch.setattr(start.shutil, "which", lambda _: None)
-    monkeypatch.setattr(start, "find_studio_server", lambda *a, **k: pytest.fail("no Unsloth lookup"))
-    monkeypatch.delenv("UNSLOTH_API_KEY", raising = False)
-    monkeypatch.delenv("AGENT_SWITCH_API_KEY", raising = False)
-
-    def invoke(*argv):
-        return CliRunner().invoke(start.start_app, list(argv))
-
-    return invoke
-
-
-def _exports(output):
-    env = {}
-    for line in output.splitlines():
-        if line.startswith("export "):
-            name, _, value = line[len("export "):].partition("=")
-            env[name] = shlex.split(value)[0] if value else ""
-    return env
-
-
-def _ollama(server, model = "smollm2:135m", ctx = 8192, responses = False):
-    server.route("GET", "/api/version", body = {"version": "0.34.3"})
-    server.route("GET", "/api/ps", body = {"models": [{"name": model, "model": model, "context_length": ctx}]})
-    server.route("GET", "/v1/models", body = {"object": "list", "data": [{"id": model}]})
-    server.route("POST", "/v1/messages", status = 400, body = {"error": "model is required"})
-    if responses:
-        server.route("POST", "/v1/responses", status = 400, body = {"error": "model is required"})
+from test_cli_providers import _exports, _ollama, cli  # noqa: F401  (fixture import)
 
 
 def _last_headers(server, path):

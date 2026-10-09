@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the agent-switch authors. See LICENSE.
 
-"""`agent-switch <agent> --url ...` against non-Unsloth servers, end to end through the CLI."""
+"""`agent-switch <agent> --url ...` against model servers, end to end through the CLI."""
 
 import json
 import shlex
+import urllib.request
 
 import pytest
 from typer.testing import CliRunner
@@ -17,13 +18,10 @@ from agent_switch.providers.types import Target
 @pytest.fixture
 def cli(tmp_path, monkeypatch):
     monkeypatch.setattr(start, "_agents_config_root", lambda: tmp_path / "agents")
-    monkeypatch.setattr(start, "_key_cache_path", lambda: tmp_path / "agent_api_key.json")
     monkeypatch.setattr(start, "_require_agent_for_launch", lambda *args: None)
     monkeypatch.setattr(start, "_opencode_command", lambda *_: ("opencode", False))
     # No agent binaries: version probes assume a current build, as for a recipe run elsewhere.
     monkeypatch.setattr(start.shutil, "which", lambda _: None)
-    monkeypatch.setattr(start, "find_studio_server", lambda *a, **k: pytest.fail("no Unsloth lookup"))
-    monkeypatch.delenv("UNSLOTH_API_KEY", raising = False)
     monkeypatch.delenv("AGENT_SWITCH_API_KEY", raising = False)
 
     def invoke(*argv):
@@ -157,7 +155,6 @@ def test_codex_needs_the_responses_endpoint(cli, fake_server):
 
 def test_no_url_uses_the_only_local_server_found(cli, fake_server, monkeypatch):
     _ollama(fake_server)
-    monkeypatch.setattr(start, "find_studio_server", lambda *a, **k: None)
     monkeypatch.setattr(start.providers, "scan_local_servers", lambda: [Target("ollama", fake_server.base)])
     result = cli("claude", "--no-launch")
     assert result.exit_code == 0, result.output
@@ -165,7 +162,6 @@ def test_no_url_uses_the_only_local_server_found(cli, fake_server, monkeypatch):
 
 
 def test_no_url_with_several_local_servers_asks_which(cli, monkeypatch):
-    monkeypatch.setattr(start, "find_studio_server", lambda *a, **k: None)
     monkeypatch.setattr(
         start.providers,
         "scan_local_servers",
@@ -178,12 +174,17 @@ def test_no_url_with_several_local_servers_asks_which(cli, monkeypatch):
     assert "--url" in result.output
 
 
-def test_no_url_prefers_a_running_unsloth(cli, monkeypatch):
-    monkeypatch.setattr(start, "find_studio_server", lambda *a, **k: "http://127.0.0.1:8888")
-    monkeypatch.setattr(start.providers, "scan_local_servers", lambda: pytest.fail("Unsloth found first"))
-    monkeypatch.setattr(start, "_connect", lambda *a, **k: (_ for _ in ()).throw(SystemExit(7)))
-    result = cli("claude", "--no-launch")
-    assert result.exit_code == 7
+@pytest.mark.parametrize("agent", ["claude", "codex", "opencode", "pi", "dsh"])
+def test_no_url_without_a_local_server_says_how_to_name_one(cli, monkeypatch, agent):
+    # The usual-port scan (empty here) is the only default: no other server is probed.
+    monkeypatch.setattr(
+        urllib.request.OpenerDirector, "open", lambda *a, **k: pytest.fail("no other server may be probed")
+    )
+    result = cli(agent, "--no-launch")
+    assert result.exit_code == 1
+    assert "No model server found" in result.output
+    assert "--url" in result.output
+    assert "Unsloth" not in result.output
 
 
 def test_api_key_is_remembered_for_that_server(cli, fake_server):
@@ -196,6 +197,8 @@ def test_api_key_is_remembered_for_that_server(cli, fake_server):
     assert all(auth == "Bearer secret" for _, path, _, auth in fake_server.requests if path == "/v1/models")
 
 
-def test_unknown_provider_is_a_usage_error(cli):
-    result = cli("claude", "--provider", "nope", "--no-launch")
+# "unsloth" names the removed Studio integration.
+@pytest.mark.parametrize("name", ["nope", "unsloth"])
+def test_unknown_provider_is_a_usage_error(cli, name):
+    result = cli("claude", "--provider", name, "--no-launch")
     assert result.exit_code == 2

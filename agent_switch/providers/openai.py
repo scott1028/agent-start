@@ -12,7 +12,7 @@ LABEL = "OpenAI-compatible server"
 CAN_LOAD = False
 SETS_CONTEXT = False
 SUPPORTED_FIELDS = None
-# Window fields used by servers that report one (Unsloth, OpenRouter-style, vLLM, llama.cpp).
+# Window fields used by servers that report one (OpenRouter-style, vLLM, llama.cpp).
 _WINDOW_FIELDS = ("context_length", "max_context_length", "context_window", "max_model_len")
 
 

@@ -11,7 +11,7 @@ class ProviderError(Exception):
 
 
 class Target(NamedTuple):
-    """Which server to use. base None means "discover Unsloth"."""
+    """Which server to use."""
 
     name: str
     base: Optional[str] = None

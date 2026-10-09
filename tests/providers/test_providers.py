@@ -43,11 +43,6 @@ def _vllm(server, max_model_len = 32768):
 # ── detection ──
 
 
-def test_detect_unsloth_by_its_health_marker(fake_server):
-    fake_server.route("GET", "/api/health", body = {"status": "healthy", "service": "Unsloth UI Backend"})
-    assert providers.detect(fake_server.base) == "unsloth"
-
-
 def test_detect_ollama(fake_server):
     _ollama(fake_server)
     assert providers.detect(fake_server.base) == "ollama"
@@ -467,7 +462,7 @@ _BODY = {
 }
 
 
-@pytest.mark.parametrize("name", ["unsloth", "openai"])
+@pytest.mark.parametrize("name", ["openai"])
 def test_request_body_passes_through(name):
     assert providers.request_body(name, _BODY) == (_BODY, [])
 

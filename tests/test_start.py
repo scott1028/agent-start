@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Tests for `unsloth start` — config merging and launch env, no network."""
+"""Tests for `agent-switch <agent>` — config merging and launch env, no network."""
 
 from __future__ import annotations
 
-import http.client
-import http.server
-import io
 import json
 import os
 import re
@@ -16,8 +13,6 @@ import shutil
 import signal
 import sys
 import time
-import urllib.error
-import urllib.parse
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,13 +22,14 @@ if str(_REPO_ROOT) not in sys.path:
 
 
 import pytest
-import typer
 from typer.testing import CliRunner
 
+import agent_switch.providers.utils as provider_utils
 import agent_switch.start as start
 
 BASE = "http://127.0.0.1:8888"
-MODEL = {"id": "unsloth/gemma-4-26B-A4B-it-GGUF", "context_length": 131072}
+MODEL = {"id": "org/gemma-4-26B-A4B-it-GGUF", "context_length": 131072}
+KEY = "sk-test-feedfacefeedface"
 
 
 # --no-launch prints shell setup as POSIX (export/unset) on Unix/WSL and
@@ -143,7 +139,7 @@ def test_claude_flags_detected_when_version_not_first_token(monkeypatch):
 
 def test_claude_settings_overlay_pins_served_model():
     # The session overlay must pin availableModels to the served model: a user's allowlist
-    # in ~/.claude/settings.json otherwise rejects the Unsloth --model ("restricted by your
+    # in ~/.claude/settings.json otherwise rejects the local --model ("restricted by your
     # organization's settings"), and no env var can bypass it. The override must be a
     # NON-EMPTY array to take effect (an empty [] is ignored and the user's list still
     # applies), so it lists exactly this model, for this session only.
@@ -152,12 +148,12 @@ def test_claude_settings_overlay_pins_served_model():
 
 
 def test_claude_settings_overlay_pins_local_routing_and_auth():
-    local_env = start._claude_local_env(BASE, "sk-unsloth-test", MODEL)
+    local_env = start._claude_local_env(BASE, "sk-test", MODEL)
     overlay = json.loads(start._claude_settings_overlay(MODEL["id"], local_env))
     for name, value in local_env.items():
         assert overlay["env"][name] == value
     assert overlay["env"]["ANTHROPIC_BASE_URL"] == BASE
-    assert overlay["env"]["ANTHROPIC_AUTH_TOKEN"] == "sk-unsloth-test"
+    assert overlay["env"]["ANTHROPIC_AUTH_TOKEN"] == "sk-test"
     for name in start._CLAUDE_ENV_UNSET:
         assert overlay["env"][name] == ""
     # The attribution-header suppression is preserved alongside it.
@@ -183,7 +179,6 @@ def test_install_agent_prompts_then_installs(monkeypatch):
     monkeypatch.setattr(start.sys, "stdin", SimpleNamespace(isatty = lambda: True))
     monkeypatch.setattr(start.typer, "confirm", lambda *a, **k: True)
     monkeypatch.setattr(start, "_npm_executable", lambda: "/usr/local/bin/npm")
-    monkeypatch.setattr(start, "_managed_node_tools", lambda: None)
     ran = []
     monkeypatch.setattr(
         start.subprocess,
@@ -248,7 +243,7 @@ def test_install_agent_windows_failure_hints_execution_policy(monkeypatch, capsy
 
 def test_install_command_uses_resolved_npm_cmd_on_windows(monkeypatch):
     _simulate_windows(monkeypatch)
-    monkeypatch.setattr(start, "_npm_executable", lambda: r"C:\Managed Node\npm.cmd")
+    monkeypatch.setattr(start, "_npm_executable", lambda: r"C:\Program Files\nodejs\npm.cmd")
 
     command, env = start._install_command(start._npm_install_hint("@openai/codex"))
 
@@ -258,7 +253,7 @@ def test_install_command_uses_resolved_npm_cmd_on_windows(monkeypatch):
         "-ExecutionPolicy",
         "Bypass",
         "-Command",
-        "& 'C:\\Managed Node\\npm.cmd' install -g '@openai/codex'",
+        "& 'C:\\Program Files\\nodejs\\npm.cmd' install -g '@openai/codex'",
     ]
     assert env is not None
 
@@ -298,23 +293,6 @@ def test_npm_install_hint_uses_user_prefix_on_posix(monkeypatch, tmp_path):
     ]
 
 
-@pytest.mark.skipif(os.name == "nt", reason = "managed node layout is POSIX")
-def test_npm_executable_uses_studio_managed_node(monkeypatch, tmp_path):
-
-    managed_bin = tmp_path / "node" / "bin"
-    managed_bin.mkdir(parents = True)
-    node = managed_bin / "node"
-    npm = managed_bin / "npm"
-    node.touch()
-    npm.touch()
-    node.chmod(0o755)
-    npm.chmod(0o755)
-    monkeypatch.setattr(start.shutil, "which", lambda _: None)
-    monkeypatch.setattr(start.unsloth_bridge, "managed_node_paths", lambda: (str(node), str(node)))
-
-    assert start._npm_executable() == str(npm)
-
-
 @pytest.mark.skipif(os.name == "nt", reason = "WSL scenario")
 def test_npm_executable_skips_wsl_shim_and_finds_native_npm(monkeypatch):
     # WSL inherits the Windows PATH, so a shim can precede a usable native npm.
@@ -322,7 +300,6 @@ def test_npm_executable_skips_wsl_shim_and_finds_native_npm(monkeypatch):
     shim = "/mnt/c/Program Files/nodejs/npm"
     monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
     monkeypatch.setenv("PATH", "/mnt/c/Program Files/nodejs:/usr/bin")
-    monkeypatch.setattr(start, "_managed_node_tools", lambda: None)
 
     found = {"/mnt/c/Program Files/nodejs": shim, "/usr/bin": native}
 
@@ -351,75 +328,6 @@ def test_npm_install_hint_without_resolvable_home(monkeypatch):
     assert start._npm_install_hint("@openai/codex") == "npm install -g @openai/codex"
 
 
-def test_managed_node_probe_tolerates_an_unavailable_unsloth(monkeypatch):
-    # No Unsloth install (or a failing bridge call) means "no managed Node", never a broken launch.
-    monkeypatch.setattr(start.unsloth_bridge, "managed_node_paths", lambda: None)
-
-    assert start._managed_node_tools() is None
-
-
-@pytest.mark.skipif(os.name == "nt", reason = "managed node layout is POSIX")
-def test_npm_executable_uses_managed_npm_when_system_node_has_none(monkeypatch, tmp_path):
-
-    managed_bin = tmp_path / "node" / "bin"
-    managed_bin.mkdir(parents = True)
-    node = managed_bin / "node"
-    npm = managed_bin / "npm"
-    node.touch()
-    npm.touch()
-    node.chmod(0o755)
-    npm.chmod(0o755)
-    monkeypatch.setattr(
-        start.shutil,
-        "which",
-        lambda name: "/usr/bin/node" if name == "node" else None,
-    )
-    monkeypatch.setattr(start.unsloth_bridge, "managed_node_paths", lambda: (str(node), str(node)))
-
-    assert start._npm_executable() == str(npm)
-
-
-@pytest.mark.skipif(os.name == "nt", reason = "WSL scenario")
-def test_npm_executable_prefers_managed_npm_over_windows_npm_in_wsl(monkeypatch, tmp_path):
-
-    managed_bin = tmp_path / "node" / "bin"
-    managed_bin.mkdir(parents = True)
-    node = managed_bin / "node"
-    npm = managed_bin / "npm"
-    node.touch(mode = 0o755)
-    npm.touch(mode = 0o755)
-    windows_npm = "/mnt/c/Program Files/nodejs/npm"
-    monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
-    monkeypatch.setattr(
-        start.shutil,
-        "which",
-        lambda name: windows_npm if name in ("npm", windows_npm) else None,
-    )
-    monkeypatch.setattr(start.unsloth_bridge, "managed_node_paths", lambda: (str(node), str(node)))
-
-    assert start._npm_executable() == str(npm)
-
-
-@pytest.mark.skipif(os.name == "nt", reason = "managed node layout is POSIX")
-def test_augment_path_includes_studio_managed_node(monkeypatch, tmp_path):
-
-    managed_bin = tmp_path / "node" / "bin"
-    managed_bin.mkdir(parents = True)
-    node = managed_bin / "node"
-    npm = managed_bin / "npm"
-    node.touch(mode = 0o755)
-    npm.touch(mode = 0o755)
-    monkeypatch.setattr(start.Path, "home", lambda: tmp_path / "home")
-    monkeypatch.setattr(start.unsloth_bridge, "managed_node_paths", lambda: (str(node), str(node)))
-    monkeypatch.setenv("PATH", os.pathsep.join([os.defpath, str(managed_bin)]))
-
-    start._augment_path_with_install_dirs()
-
-    path = os.environ["PATH"].split(os.pathsep)
-    assert path[0] == str(managed_bin)
-    assert path.count(str(managed_bin)) == 1
-
-
 def test_install_agent_missing_npm_names_node_requirement(monkeypatch, capsys):
     monkeypatch.setattr(start.sys, "stdin", SimpleNamespace(isatty = lambda: True))
     monkeypatch.setattr(start.typer, "confirm", lambda *a, **k: True)
@@ -435,7 +343,7 @@ def test_install_agent_missing_npm_names_node_requirement(monkeypatch, capsys):
 
     err = capsys.readouterr().err
     assert "npm is required" in err
-    assert "Unsloth-managed Node" in err
+    assert "no native system npm was found" in err
     assert "Install Node.js with npm" in err
 
 
@@ -458,12 +366,12 @@ def test_install_agent_reports_os_error_without_traceback(monkeypatch, capsys):
 
 
 @pytest.mark.skipif(os.name == "nt", reason = "POSIX install command")
-def test_install_agent_runs_managed_npm_with_its_node_on_path(monkeypatch, tmp_path):
+def test_install_agent_runs_npm_with_its_node_on_path(monkeypatch, tmp_path):
     monkeypatch.setattr(start.os, "name", "posix")
     monkeypatch.setattr(start.Path, "home", lambda: tmp_path)
     monkeypatch.setattr(start.sys, "stdin", SimpleNamespace(isatty = lambda: True))
     monkeypatch.setattr(start.typer, "confirm", lambda *a, **k: True)
-    npm = tmp_path / "managed-node" / "bin" / "npm"
+    npm = tmp_path / "node" / "bin" / "npm"
     monkeypatch.setattr(start, "_npm_executable", lambda: str(npm))
     monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/codex")
     captured = {}
@@ -500,7 +408,7 @@ def test_install_agent_warns_remote_installer_is_unverified_third_party(monkeypa
     assert "Security warning" in err
     assert "unverified third-party script" in err
     assert "https://hermes-agent.nousresearch.com/install.ps1" in err
-    assert "Unsloth does not pin or verify the downloaded content" in err
+    assert "agent-switch does not pin or verify the downloaded content" in err
     assert "Continue only if you trust this source" in err
 
 
@@ -590,7 +498,7 @@ def test_refresh_windows_path_merges_registry_hives(monkeypatch):
 
 def test_augment_path_adds_existing_local_bin(monkeypatch, tmp_path):
     # Claude's installer drops its binary in ~/.local/bin but only *suggests* adding it to
-    # PATH, so Unsloth appends it in-process to resolve the freshly installed agent.
+    # PATH, so agent-switch appends it in-process to resolve the freshly installed agent.
     local_bin = tmp_path / ".local" / "bin"
     local_bin.mkdir(parents = True)
     monkeypatch.setattr(start.Path, "home", lambda: tmp_path)
@@ -815,17 +723,12 @@ def test_project_declares_direct_cli_dependencies():
     assert "click>=8.0" in project["project"]["dependencies"]
 
 
-def test_agent_paths_use_agent_switch_home_and_share_unsloth_key_cache(monkeypatch, tmp_path):
-    # Session homes live under agent-switch's own root; the key cache is `unsloth start`'s
-    # when Unsloth is installed, so neither tool mints a duplicate key for the same server.
+def test_agent_paths_use_agent_switch_home(monkeypatch, tmp_path):
+    # Session homes and the per-server key cache both live under agent-switch's own root.
     monkeypatch.setenv("AGENT_SWITCH_HOME", str(tmp_path / "home"))
-    monkeypatch.setattr(start.unsloth_bridge, "studio_home", lambda: tmp_path / "studio")
 
-    assert start._key_cache_path() == tmp_path / "studio" / "auth" / "agent_api_key.json"
+    assert start._provider_key_cache_path() == tmp_path / "home" / "api_keys.json"
     assert start._agents_config_root() == tmp_path / "home" / "agents"
-
-    monkeypatch.setattr(start.unsloth_bridge, "studio_home", lambda: None)
-    assert start._key_cache_path() == tmp_path / "home" / "agent_api_key.json"
 
 
 def test_merge_codex_config_fresh():
@@ -925,11 +828,11 @@ def test_write_codex_config_profile(tmp_path, monkeypatch):
 
 def test_write_codex_config_catalog_without_context_length(tmp_path, monkeypatch):
     monkeypatch.setattr(start, "_codex_supports_model_catalog", lambda: True)
-    start.write_codex_config(BASE, {"id": "unsloth/no-window"}, tmp_path)
+    start.write_codex_config(BASE, {"id": "org/no-window"}, tmp_path)
     profile = _parse_toml((tmp_path / "agent_switch.config.toml").read_text())
     catalog = json.loads((tmp_path / profile["model_catalog_json"]).read_text())
     entry = catalog["models"][0]
-    assert entry["slug"] == "unsloth/no-window"
+    assert entry["slug"] == "org/no-window"
     assert "context_window" not in entry
     assert "max_context_window" not in entry
 
@@ -1218,7 +1121,7 @@ def test_codex_subagent_bridge_uses_wsl_for_windows_codex(monkeypatch, tmp_path)
 
 @pytest.mark.skipif(os.name == "nt", reason = "WSL scenario")
 def test_agent_config_path_translates_for_windows_agent(monkeypatch, tmp_path):
-    windows_path = r"\\wsl.localhost\Ubuntu\tmp\unsloth.toml"
+    windows_path = r"\\wsl.localhost\Ubuntu\tmp\agent-switch.toml"
     monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
     monkeypatch.setattr(
         start.shutil,
@@ -1227,37 +1130,7 @@ def test_agent_config_path_translates_for_windows_agent(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(start.subprocess, "check_output", lambda *args, **kwargs: windows_path)
 
-    assert start._agent_config_path(tmp_path / "unsloth.toml", ["codex"]) == windows_path
-
-
-def test_subagent_model_id_preserves_explicit_variant(monkeypatch):
-    monkeypatch.setattr(
-        start,
-        "_http_json",
-        lambda *args, **kwargs: pytest.fail("explicit variant should not need status"),
-    )
-    assert (
-        start._subagent_model_id(BASE, "key", MODEL, MODEL["id"] + ":UD-Q4_K_XL")
-        == MODEL["id"] + ":UD-Q4_K_XL"
-    )
-
-
-def test_subagent_model_id_uses_loaded_variant(monkeypatch):
-    monkeypatch.setattr(
-        start,
-        "_http_json",
-        lambda *args, **kwargs: {"is_gguf": True, "gguf_variant": "Q5_K_M"},
-    )
-    assert start._subagent_model_id(BASE, "key", MODEL, None) == MODEL["id"] + ":Q5_K_M"
-
-
-def test_subagent_model_id_warns_when_status_unavailable(monkeypatch, capsys):
-    def raise_error(*args, **kwargs):
-        raise OSError("connection refused")
-
-    monkeypatch.setattr(start, "_http_json", raise_error)
-    assert start._subagent_model_id(BASE, "key", MODEL, None) == MODEL["id"]
-    assert "could not verify the loaded GGUF variant" in capsys.readouterr().err
+    assert start._agent_config_path(tmp_path / "agent-switch.toml", ["codex"]) == windows_path
 
 
 @pytest.mark.parametrize("agent", ["dsh"])
@@ -1268,6 +1141,13 @@ def test_unsupported_agents_reject_as_subagent(agent, flag):
     assert f"--as-subagent is not supported for {agent}." in result.output
 
 
+@pytest.fixture()
+def one_local_server(monkeypatch):
+    """The no-url scan finds one server; enough for tests that stop before connecting."""
+    monkeypatch.setattr(start.providers, "scan_local_servers", lambda: [start.Target("vllm", BASE)])
+
+
+@pytest.mark.usefixtures("one_local_server")
 @pytest.mark.parametrize(
     "agent", ["claude", "codex", "opencode", "pi", "dsh"]
 )
@@ -1295,6 +1175,7 @@ def test_launch_preflights_agent_before_connect(agent, monkeypatch):
     assert events == ["agent", "connect"]
 
 
+@pytest.mark.usefixtures("one_local_server")
 def test_dsh_rejects_an_unrelated_executable_before_connect(monkeypatch):
     monkeypatch.setattr(start, "_which_with_install_dirs", lambda _: "/usr/bin/dsh")
     monkeypatch.setattr(start, "is_deepseek_harness_executable", lambda _: False)
@@ -1325,7 +1206,6 @@ def test_dsh_resolver_searches_past_an_unrelated_earlier_path_entry(monkeypatch,
 
     monkeypatch.setenv("PATH", os.pathsep.join((str(shadow_dir), str(harness_dir))))
     monkeypatch.setattr(start.Path, "home", lambda: tmp_path / "missing-home")
-    monkeypatch.setattr(start, "_managed_node_tools", lambda: None)
     monkeypatch.setattr(
         start,
         "is_deepseek_harness_executable",
@@ -1346,6 +1226,7 @@ def test_dsh_resolver_searches_past_an_unrelated_earlier_path_entry(monkeypatch,
     assert Path(resolved).parent == harness_dir
 
 
+@pytest.mark.usefixtures("one_local_server")
 def test_declined_opencode_subagent_install_stops_before_connect(monkeypatch):
     installs = []
     monkeypatch.setattr(start, "_which_with_install_dirs", lambda _: None)
@@ -1367,6 +1248,7 @@ def test_declined_opencode_subagent_install_stops_before_connect(monkeypatch):
     assert installs[0][0] == "opencode"
 
 
+@pytest.mark.usefixtures("one_local_server")
 @pytest.mark.parametrize(
     "agent", ["claude", "codex", "opencode", "pi"]
 )
@@ -1389,6 +1271,7 @@ def test_noninteractive_missing_agent_stops_before_connect(agent, monkeypatch):
     assert f"`{agent}` not found on PATH" in result.output
 
 
+@pytest.mark.usefixtures("one_local_server")
 @pytest.mark.parametrize("agent", ["claude", "codex", "pi", "dsh"])
 def test_no_launch_skips_agent_resolution(agent, monkeypatch):
     monkeypatch.setattr(
@@ -1413,6 +1296,7 @@ def test_no_launch_skips_agent_resolution(agent, monkeypatch):
     assert isinstance(result.exception, RuntimeError)
 
 
+@pytest.mark.usefixtures("one_local_server")
 def test_opencode_no_launch_resolves_generation_without_installing(monkeypatch):
     resolved = []
     monkeypatch.setattr(
@@ -1437,6 +1321,7 @@ def test_opencode_no_launch_resolves_generation_without_installing(monkeypatch):
     assert resolved == ["opencode2"]
 
 
+@pytest.mark.usefixtures("one_local_server")
 def test_missing_pi_subagent_extension_fails_before_install_or_connect(monkeypatch, tmp_path):
     monkeypatch.setattr(start, "_PI_SUBAGENT_EXTENSION", tmp_path / "missing.ts")
     monkeypatch.setattr(
@@ -1459,68 +1344,42 @@ def test_missing_pi_subagent_extension_fails_before_install_or_connect(monkeypat
 
 
 @pytest.fixture()
-def fake_studio(tmp_path, monkeypatch):
+def fake_vllm(tmp_path, monkeypatch):
+    """A vLLM-shaped server at BASE that the no-url scan finds, holding a key given before."""
     calls = []
-    state = {"models": [MODEL]}
 
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
+    def request_json(method, url, key = None, payload = None, timeout = 10, headers = None):
         calls.append((method, url, payload))
-        if url.endswith("/api/inference/loaded-models"):
-            return {"object": "list", "data": state["models"]}
-        if url.endswith("/api/inference/status"):
-            return {"is_gguf": True, "model_identifier": state["models"][0]["id"]}
-        if url.endswith("/api/auth/api-keys"):
-            if method == "GET":
-                return {"api_keys": [{"key_prefix": "feedface"}]}
-            return {"key": "sk-unsloth-feedfacefeedface"}
-        if url.endswith("/api/settings/embedding-model"):
-            return {"embedding_model": "unsloth/bge-small-en-v1.5"}
-        if url.endswith("/api/inference/load"):
-            already_loaded = state["models"][0]["id"] == payload["model_path"]
-            state["models"] = [{"id": payload["model_path"], "context_length": 4096}]
-            return {
-                "status": "already_loaded" if already_loaded else "loaded",
-                "model": payload["model_path"],
-                "display_name": payload["model_path"],
-            }
-        raise AssertionError(f"unexpected request: {method} {url}")
+        if method == "GET" and url == f"{BASE}/v1/models":
+            listing = {"id": MODEL["id"], "owned_by": "vllm", "max_model_len": MODEL["context_length"]}
+            return 200, {"object": "list", "data": [listing]}
+        if method == "POST" and url in (f"{BASE}/v1/messages", f"{BASE}/v1/responses"):
+            # A real route rejects the empty probe body.
+            return 400, {"error": {"message": "model is required"}}
+        return 404, {"detail": "Not Found"}
 
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: BASE)
-    # Identity handshake has its own tests; trust the loopback server here.
-    monkeypatch.setattr(start, "verify_studio_identity", lambda base: True)
-    # Hub listing unavailable: the Codex preflight defers to the stubbed post-connect check.
-    monkeypatch.setattr(start, "_hub_gguf_files", lambda repo: None)
-    # _studio_token / api-keys are faked so the mint flow stays offline.
-    monkeypatch.setattr(start, "_studio_token", lambda: "jwt-token")
-    monkeypatch.setattr(start, "_http_json", http_json)
-    monkeypatch.setattr(start, "_key_cache_path", lambda: tmp_path / "agent_api_key.json")
-    # --no-launch session configs land under tmp instead of the real Unsloth dir.
+    monkeypatch.setattr(provider_utils, "request_json", request_json)
+    monkeypatch.setattr(start.providers, "request_json", request_json)
+    monkeypatch.setattr(start.providers, "scan_local_servers", lambda: [start.Target("vllm", BASE)])
+    start._remember_key(start._provider_key_cache_path(), BASE, KEY)
+    # --no-launch session configs land under tmp instead of the real agent-switch dir.
     monkeypatch.setattr(start, "_agents_config_root", lambda: tmp_path / "agents")
     monkeypatch.setattr(start, "_require_agent_for_launch", lambda *args: None)
     # Most existing assertions cover the stable V1 command; V2 has focused cases below.
     monkeypatch.setattr(start, "_opencode_command", lambda *_: ("opencode", False))
     # No `claude` on PATH, so _claude_flags never probes the real binary.
     monkeypatch.setattr(start.shutil, "which", lambda _: None)
-    monkeypatch.delenv("UNSLOTH_API_KEY", raising = False)
+    monkeypatch.delenv("AGENT_SWITCH_API_KEY", raising = False)
     return calls
 
 
-def test_connect_claude_no_launch(fake_studio):
+def test_connect_claude_no_launch(fake_vllm):
     result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
     assert result.exit_code == 0, result.output
     for name in start._CLAUDE_ENV_UNSET:
         _assert_env_unset(result.output, name)
     _assert_env_set(result.output, "ANTHROPIC_BASE_URL", BASE)
-    _assert_env_set(result.output, "ANTHROPIC_AUTH_TOKEN", "sk-unsloth-feedfacefeedface")
+    _assert_env_set(result.output, "ANTHROPIC_AUTH_TOKEN", KEY)
     _assert_env_set(result.output, "ANTHROPIC_MODEL", MODEL["id"])
     _assert_env_set(result.output, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
     _assert_env_set(result.output, "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1")
@@ -1542,7 +1401,7 @@ def test_connect_claude_no_launch(fake_studio):
     settings = json.loads(settings_path.read_text())
     assert settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] == "inherit"
     assert settings["env"]["ANTHROPIC_BASE_URL"] == BASE
-    assert settings["env"]["ANTHROPIC_AUTH_TOKEN"] == "sk-unsloth-feedfacefeedface"
+    assert settings["env"]["ANTHROPIC_AUTH_TOKEN"] == KEY
     for name in start._CLAUDE_ENV_UNSET:
         assert settings["env"][name] == ""
     if os.name != "nt":
@@ -1551,65 +1410,7 @@ def test_connect_claude_no_launch(fake_studio):
     assert ".claude/settings.json" not in result.output
 
 
-def test_connect_prints_the_running_models_load_warning(fake_studio, monkeypatch):
-    notice = (
-        "Not enough disk space to download BF16 (7.5 GB needed, 7.5 GB free), "
-        "so Q4_1 (2.4 GB) was loaded instead."
-    )
-    http_json = start._http_json
-
-    def with_warning(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/status"):
-            return {"is_gguf": True, "model_identifier": MODEL["id"], "memory_warning": notice}
-        return http_json(method, url, token, payload, timeout, error, internal_auth = internal_auth)
-
-    monkeypatch.setattr(start, "_http_json", with_warning)
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch", "--model", MODEL["id"]])
-
-    assert result.exit_code == 0, result.output
-    assert f"Warning: {notice}" in result.stderr
-    assert f"Warning: {notice}" not in result.stdout
-
-
-def test_connect_skips_the_load_warning_of_another_active_model(fake_studio, monkeypatch):
-    http_json = start._http_json
-
-    def other_model_warns(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/status"):
-            return {
-                "is_gguf": True,
-                "active_model": "unsloth/Other-GGUF",
-                "model_identifier": "unsloth/Other-GGUF",
-                "memory_warning": "Not enough disk space to download BF16, so Q4_1 was loaded instead.",
-            }
-        return http_json(method, url, token, payload, timeout, error, internal_auth = internal_auth)
-
-    monkeypatch.setattr(start, "_http_json", other_model_warns)
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch", "--model", MODEL["id"]])
-
-    assert result.exit_code == 0, result.output
-    assert "Warning: Not enough disk space" not in result.output
-
-
-def test_connect_claude_session_settings_follow_forwarded_settings(fake_studio):
+def test_connect_claude_session_settings_follow_forwarded_settings(fake_vllm):
     forwarded = json.dumps({"env": {"CLAUDE_CODE_USE_FOUNDRY": "1"}})
     result = CliRunner().invoke(
         start.start_app,
@@ -1630,7 +1431,7 @@ def test_connect_claude_session_settings_follow_forwarded_settings(fake_studio):
         lambda value: [f"--settings={value}"],
     ],
 )
-def test_connect_claude_session_settings_precede_subcommand(fake_studio, settings_arg):
+def test_connect_claude_session_settings_precede_subcommand(fake_vllm, settings_arg):
     forwarded = json.dumps({"env": {"CLAUDE_CODE_USE_FOUNDRY": "1"}})
     result = CliRunner().invoke(
         start.start_app,
@@ -1649,7 +1450,7 @@ def test_connect_claude_session_settings_precede_subcommand(fake_studio, setting
     assert settings_positions[0] < settings_positions[1] < subcommand
 
 
-def test_connect_claude_session_settings_precede_forwarded_delimiter(fake_studio):
+def test_connect_claude_session_settings_precede_forwarded_delimiter(fake_vllm):
     forwarded = json.dumps({"env": {"CLAUDE_CODE_USE_FOUNDRY": "1"}})
     result = CliRunner().invoke(
         start.start_app,
@@ -1663,7 +1464,7 @@ def test_connect_claude_session_settings_precede_forwarded_delimiter(fake_studio
     assert Path(command[positions[0] + 1]).name.startswith("settings-")
 
 
-def test_connect_claude_as_subagent_preserves_cloud_parent(fake_studio, tmp_path):
+def test_connect_claude_as_subagent_preserves_cloud_parent(fake_vllm, tmp_path):
     result = CliRunner().invoke(
         start.start_app,
         [
@@ -1671,7 +1472,7 @@ def test_connect_claude_as_subagent_preserves_cloud_parent(fake_studio, tmp_path
             "--as-subagent",
             "--no-launch",
             "--model",
-            MODEL["id"] + ":UD-Q4_K_XL",
+            MODEL["id"],
             "hello",
         ],
     )
@@ -1694,7 +1495,7 @@ def test_connect_claude_as_subagent_preserves_cloud_parent(fake_studio, tmp_path
     assert parent_token not in result.output
     assert "unset ANTHROPIC_API_KEY" not in result.output
     assert "AGENT_SWITCH_CLAUDE_SUBAGENT_API_KEY" not in result.output
-    assert "sk-unsloth-feedfacefeedface" not in result.output
+    assert KEY not in result.output
     assert json.loads((plugin / ".claude-plugin" / "plugin.json").read_text())["name"] == (
         "local-agent"
     )
@@ -1704,16 +1505,16 @@ def test_connect_claude_as_subagent_preserves_cloud_parent(fake_studio, tmp_path
     assert mcp["args"] == ["-m", start._CLAUDE_SUBAGENT_MCP_MODULE]
     assert mcp["env"] == {
         "AGENT_SWITCH_CLAUDE_SUBAGENT_BASE_URL": BASE,
-        "AGENT_SWITCH_CLAUDE_SUBAGENT_API_KEY": "sk-unsloth-feedfacefeedface",
-        "AGENT_SWITCH_CLAUDE_SUBAGENT_MODEL": MODEL["id"] + ":UD-Q4_K_XL",
+        "AGENT_SWITCH_CLAUDE_SUBAGENT_API_KEY": KEY,
+        "AGENT_SWITCH_CLAUDE_SUBAGENT_MODEL": MODEL["id"],
         "AGENT_SWITCH_CLAUDE_SUBAGENT_BYPASS_PERMISSIONS": "0",
-        "AGENT_SWITCH_CLAUDE_SUBAGENT_CONTEXT_WINDOW": "4096",
+        "AGENT_SWITCH_CLAUDE_SUBAGENT_CONTEXT_WINDOW": str(MODEL["context_length"]),
         start._CLAUDE_SUBAGENT_SETTINGS_ENV: str(settings_path),
     }
     settings = json.loads(settings_path.read_text())
-    assert settings["availableModels"] == [MODEL["id"] + ":UD-Q4_K_XL"]
+    assert settings["availableModels"] == [MODEL["id"]]
     assert settings["env"]["ANTHROPIC_BASE_URL"] == BASE
-    assert settings["env"]["ANTHROPIC_AUTH_TOKEN"] == "sk-unsloth-feedfacefeedface"
+    assert settings["env"]["ANTHROPIC_AUTH_TOKEN"] == KEY
     for name in start._CLAUDE_ENV_UNSET:
         assert settings["env"][name] == ""
     skill = (plugin / "skills" / "local-agent" / "SKILL.md").read_text()
@@ -1759,18 +1560,7 @@ def test_claude_subagent_plugin_uses_wsl_for_windows_claude(monkeypatch, tmp_pat
     ]
 
 
-def test_connect_claude_compact_window_omitted_without_context(fake_studio, monkeypatch):
-    # A model that doesn't report a context length -> leave Claude's default window
-    # rather than guessing one.
-    monkeypatch.setattr(start, "_resolve_model", lambda *a, **k: {"id": "local-model"})
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
-    assert result.exit_code == 0, result.output
-    assert "CLAUDE_CODE_MAX_CONTEXT_TOKENS" not in result.output
-    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in result.output
-    assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in result.output
-
-
-def test_launch_native_posix_child_gets_current_pwd(fake_studio, monkeypatch, tmp_path):
+def test_launch_native_posix_child_gets_current_pwd(fake_vllm, monkeypatch, tmp_path):
     captured = {}
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PWD", "/stale/outer/repo")
@@ -1810,7 +1600,7 @@ def test_launch_leaves_child_able_to_handle_sigint(monkeypatch, tmp_path):
     assert signal.getsignal(signal.SIGINT) is before
 
 
-def test_connect_claude_launch_scrubs_conflicting_auth_env(fake_studio, monkeypatch):
+def test_connect_claude_launch_scrubs_conflicting_auth_env(fake_vllm, monkeypatch):
     captured = {}
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-anthropic-stale")
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-stale")
@@ -1841,7 +1631,7 @@ def test_connect_claude_launch_scrubs_conflicting_auth_env(fake_studio, monkeypa
     assert captured["command"] == ["/usr/local/bin/claude", "--model", MODEL["id"]]
     for name in start._CLAUDE_ENV_UNSET:
         assert name not in captured["env"]
-    assert captured["env"]["ANTHROPIC_AUTH_TOKEN"] == "sk-unsloth-feedfacefeedface"
+    assert captured["env"]["ANTHROPIC_AUTH_TOKEN"] == KEY
     assert captured["env"]["ANTHROPIC_BASE_URL"] == BASE
     assert captured["env"]["ANTHROPIC_MODEL"] == MODEL["id"]
     assert captured["env"]["CLAUDE_CODE_ATTRIBUTION_HEADER"] == "0"
@@ -1853,9 +1643,9 @@ def test_connect_claude_launch_scrubs_conflicting_auth_env(fake_studio, monkeypa
     reason = "WSL-from-Linux scenario (calling a Windows agent .exe from inside WSL); "
     "os.name is 'posix' under WSL, so this path can't run on a native Windows runner.",
 )
-def test_connect_claude_windows_shim_from_wsl_bridges_env(fake_studio, monkeypatch, tmp_path):
+def test_connect_claude_windows_shim_from_wsl_bridges_env(fake_vllm, monkeypatch, tmp_path):
     captured = {}
-    windows_settings = r"C:\\Users\\samle\\AppData\\Local\\unsloth\\settings.json"
+    windows_settings = r"C:\\Users\\samle\\AppData\\Local\\agent-switch\\settings.json"
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PWD", "/stale/outer/repo")
     monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
@@ -1889,7 +1679,7 @@ def test_connect_claude_windows_shim_from_wsl_bridges_env(fake_studio, monkeypat
     ]
     for name in start._CLAUDE_ENV_UNSET:
         assert captured["env"][name] == ""
-    assert captured["env"]["ANTHROPIC_AUTH_TOKEN"] == "sk-unsloth-feedfacefeedface"
+    assert captured["env"]["ANTHROPIC_AUTH_TOKEN"] == KEY
     assert captured["env"]["ANTHROPIC_BASE_URL"] == BASE
     assert captured["env"]["ANTHROPIC_MODEL"] == MODEL["id"]
     assert captured["env"]["PWD"] == str(tmp_path)
@@ -2288,9 +2078,9 @@ def test_resolved_launch_command_leaves_non_npm_batch_file_unchanged(monkeypatch
     "os.name is 'posix' under WSL, so this path can't run on a native Windows runner.",
 )
 def test_connect_claude_no_launch_windows_shim_from_wsl_prints_wslenv(
-    fake_studio, monkeypatch, tmp_path
+    fake_vllm, monkeypatch, tmp_path
 ):
-    windows_settings = r"C:\\Users\\samle\\AppData\\Local\\unsloth\\settings.json"
+    windows_settings = r"C:\\Users\\samle\\AppData\\Local\\agent-switch\\settings.json"
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PWD", "/stale/outer/repo")
     monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
@@ -2315,12 +2105,12 @@ def test_connect_claude_no_launch_windows_shim_from_wsl_prints_wslenv(
     assert command[command.index("--settings") + 1] == windows_settings
 
 
-def test_connect_codex_no_launch(fake_studio, tmp_path):
+def test_connect_codex_no_launch(fake_vllm, tmp_path):
     result = CliRunner().invoke(start.start_app, ["codex", "--no-launch"])
     assert result.exit_code == 0, result.output
     for name in start._CODEX_ENV_UNSET:
         _assert_env_unset(result.output, name)
-    _assert_env_set(result.output, "AGENT_SWITCH_AUTH_TOKEN", "sk-unsloth-feedfacefeedface")
+    _assert_env_set(result.output, "AGENT_SWITCH_AUTH_TOKEN", KEY)
     assert "codex --oss --profile agent_switch" in result.output
     # Config lands in the session-scoped CODEX_HOME, not the user's ~/.codex.
     home = tmp_path / "agents" / "codex"
@@ -2329,7 +2119,7 @@ def test_connect_codex_no_launch(fake_studio, tmp_path):
     assert (home / "agent_switch.config.toml").exists()
 
 
-def test_connect_codex_as_subagent_preserves_cloud_parent(fake_studio, tmp_path, monkeypatch):
+def test_connect_codex_as_subagent_preserves_cloud_parent(fake_vllm, tmp_path, monkeypatch):
     monkeypatch.setattr(start, "_codex_supports_model_catalog", lambda: True)
     source_home = tmp_path / "user-codex"
     source_home.mkdir()
@@ -2343,7 +2133,7 @@ def test_connect_codex_as_subagent_preserves_cloud_parent(fake_studio, tmp_path,
             "--as-subagent",
             "--no-launch",
             "--model",
-            MODEL["id"] + ":UD-Q4_K_XL",
+            MODEL["id"],
         ],
     )
     assert result.exit_code == 0, result.output
@@ -2357,15 +2147,15 @@ def test_connect_codex_as_subagent_preserves_cloud_parent(fake_studio, tmp_path,
     for name in start._CODEX_ENV_UNSET:
         _assert_env_kept(result.output, name)
     assert start._CODEX_ENV_KEY not in result.output
-    assert "sk-unsloth-feedfacefeedface" not in result.output
+    assert KEY not in result.output
     home = tmp_path / "agents" / "codex-subagent"
     bridge_path = home / "subagent.json"
     bridge = json.loads(bridge_path.read_text())
-    assert bridge["api_key"] == "sk-unsloth-feedfacefeedface"
+    assert bridge["api_key"] == KEY
     assert bridge["codex_home"] == str(home / "child")
     assert bridge["bypass_permissions"] is False
     profile = _parse_toml((home / "child" / "agent_switch.config.toml").read_text())
-    assert profile["model"] == MODEL["id"] + ":UD-Q4_K_XL"
+    assert profile["model"] == MODEL["id"]
     prefix = f"mcp_servers.{start._CODEX_SUBAGENT_MCP_SERVER}="
     override = next(value for value in command if value.startswith(prefix))
     assert override.startswith(prefix)
@@ -2382,14 +2172,14 @@ def test_connect_codex_as_subagent_preserves_cloud_parent(fake_studio, tmp_path,
     assert "Ask Codex to spawn a local agent." in result.output
 
 
-def test_connect_codex_matches_requested_model_case_insensitively(fake_studio, tmp_path):
+def test_connect_codex_matches_requested_model_case_insensitively(fake_vllm, tmp_path):
     result = CliRunner().invoke(
         start.start_app,
         [
             "codex",
             "--no-launch",
             "--model",
-            "unsloth/gemma-4-26b-a4b-it-gguf",
+            "org/gemma-4-26b-a4b-it-gguf",
         ],
     )
     assert result.exit_code == 0, result.output
@@ -2398,299 +2188,7 @@ def test_connect_codex_matches_requested_model_case_insensitively(fake_studio, t
     assert profile["model"] == MODEL["id"]
 
 
-def test_resolve_model_matches_loaded_canonical_case_after_load(monkeypatch, capsys):
-    calls = []
-    state = {"loaded": False}
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        calls.append((method, url, payload))
-        if url.endswith("/api/inference/loaded-models"):
-            return {
-                "data": [
-                    {
-                        "id": "unsloth/gemma-4-E2B-it-GGUF" if state["loaded"] else "other/model",
-                        "context_length": 131072,
-                    }
-                ]
-            }
-        if url.endswith("/api/inference/load"):
-            state["loaded"] = True
-            return {"model": "unsloth/gemma-4-E2B-it-GGUF"}
-        raise AssertionError(f"unexpected request: {method} {url}")
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-
-    entry = start._resolve_model(
-        BASE,
-        "sk-test",
-        "unsloth/gemma-4-e2b-it-gguf",
-        start.LoadOptions(gguf_variant = "UD-Q4_K_XL"),
-    )
-
-    assert entry["id"] == "unsloth/gemma-4-E2B-it-GGUF"
-    assert any(c[1].endswith("/api/inference/load") for c in calls)
-    output = capsys.readouterr().out
-    assert "please wait" not in output
-
-
-def test_resolve_model_matches_snapshot_path_by_public_id(monkeypatch):
-    """A GGUF loaded by snapshot path is advertised by its basename, not the path."""
-    snapshot = "/home/u/.cache/legacy/models--Org--Model/snapshots/abc123"
-    state = {"loaded": False}
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/loaded-models"):
-            return {"data": [{"id": "abc123"}] if state["loaded"] else []}
-        if url.endswith("/api/inference/load"):
-            state["loaded"] = True
-            # The load echoes the path it was given, which /v1/models never lists.
-            return {"model": snapshot, "display_name": snapshot}
-        raise AssertionError(f"unexpected request: {method} {url}")
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-
-    entry = start._resolve_model(BASE, "sk-test", snapshot, start.LoadOptions())
-
-    assert entry["id"] == "abc123"
-
-
-def test_subagent_model_id_warns_when_a_path_load_cannot_pin_the_quant(capsys):
-    """A path is advertised as a bare basename, so the quant cannot be recorded."""
-    model_id = start._subagent_model_id(
-        BASE, "sk-test", {"id": "abc123"}, "some/model-dir:UD-Q4_K_XL"
-    )
-
-    assert model_id == "abc123"
-    assert "cannot pin the UD-Q4_K_XL quant" in capsys.readouterr().err
-
-
-def test_subagent_model_id_pins_the_quant_for_repo_ids(capsys):
-    model_id = start._subagent_model_id(
-        BASE, "sk-test", {"id": "unsloth/gemma-4-E4B-it-GGUF"},
-        "unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL",
-    )
-
-    assert model_id == "unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL"
-    assert capsys.readouterr().err == ""
-
-
-def test_public_model_id_leaves_repo_ids_alone():
-    """Only a path gets reduced; a repo id must not match some unrelated model.
-
-    Relative and multi-segment paths are covered too: _looks_like_path is defined
-    twice in this module (the WSLENV one wins), so this must use its own classifier.
-    """
-    assert start._public_model_id("unsloth/gemma-4-E4B-it-GGUF") is None
-    assert start._public_model_id("org/model") is None
-    assert start._public_model_id("/srv/models/Qwen3-Q4_K_M.gguf") == "Qwen3-Q4_K_M"
-    assert start._public_model_id("/a/b/snapshots/rev1") == "rev1"
-    assert start._public_model_id("./models/foo") == "foo"
-    assert start._public_model_id("cache/snapshots/rev") == "rev"
-    assert start._public_model_id("a/b/c") == "c"
-
-
-def test_resolve_model_loads_when_catalog_hit_is_not_loaded(monkeypatch):
-    # A cached-but-unloaded catalog entry (loaded == False) that only case-differs must
-    # not be treated as ready; the load endpoint must still be called so the requested
-    # model becomes resident instead of the agent preflighting a different backend.
-    calls = []
-    state = {"loaded": False}
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        calls.append((method, url))
-        if url.endswith("/api/inference/loaded-models"):
-            return {
-                "data": [
-                    {
-                        "id": "unsloth/Gemma-4-GGUF",
-                        "loaded": state["loaded"],
-                        "context_length": 131072,
-                    }
-                ]
-            }
-        if url.endswith("/api/inference/load"):
-            state["loaded"] = True
-            return {"model": "unsloth/Gemma-4-GGUF"}
-        raise AssertionError(f"unexpected request: {method} {url}")
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-
-    entry = start._resolve_model(BASE, "sk-test", "unsloth/gemma-4-gguf")
-
-    assert entry["id"] == "unsloth/Gemma-4-GGUF"
-    assert any(u.endswith("/api/inference/load") for _, u in calls)
-
-
-def test_resolve_model_does_not_attach_if_catalog_stays_unloaded(monkeypatch):
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/loaded-models"):
-            return {
-                "data": [
-                    {
-                        "id": "unsloth/Gemma-4-GGUF",
-                        "loaded": False,
-                        "context_length": 131072,
-                    }
-                ]
-            }
-        if url.endswith("/api/inference/load"):
-            return {"status": "loaded", "model": "unsloth/Gemma-4-GGUF"}
-        raise AssertionError(f"unexpected request: {method} {url}")
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-
-    with pytest.raises(typer.Exit):
-        start._resolve_model(BASE, "sk-test", "unsloth/gemma-4-gguf")
-
-
-def test_resolve_model_attaches_to_loaded_catalog_hit_without_reload(monkeypatch):
-    # The mirror case: a loaded entry (loaded == True) that case-matches attaches with
-    # no /api/inference/load call.
-    calls = []
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        calls.append((method, url))
-        if url.endswith("/api/inference/loaded-models"):
-            return {
-                "data": [{"id": "unsloth/Gemma-4-GGUF", "loaded": True, "context_length": 131072}]
-            }
-        raise AssertionError(f"unexpected request: {method} {url}")
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-
-    entry = start._resolve_model(BASE, "sk-test", "unsloth/gemma-4-gguf")
-
-    assert entry["id"] == "unsloth/Gemma-4-GGUF"
-    assert not any(u.endswith("/api/inference/load") for _, u in calls)
-
-
-def test_resolve_model_without_request_rejects_unloaded_catalog(monkeypatch):
-    monkeypatch.setattr(
-        start,
-        "_http_json",
-        lambda *a, **k: {
-            "data": [
-                {
-                    "id": "unsloth/Gemma-4-GGUF",
-                    "loaded": False,
-                    "context_length": 131072,
-                }
-            ]
-        },
-    )
-
-    with pytest.raises(typer.Exit):
-        start._resolve_model(BASE, "sk-test", None)
-
-
-def test_resolve_model_remote_studio_does_not_casefold_attach(monkeypatch):
-    # Against a remote Unsloth the local existence probe cannot see server-side paths,
-    # so a case-variant loaded id must NOT attach without a load: it could be a distinct
-    # server-side path on a case-sensitive host. The load endpoint resolves the request.
-    calls = []
-    state = {"loaded": False}
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        calls.append((method, url))
-        if url.endswith("/api/inference/loaded-models"):
-            return {
-                "data": [{"id": "unsloth/Gemma-4-GGUF", "loaded": True, "context_length": 131072}]
-            }
-        if url.endswith("/api/inference/load"):
-            state["loaded"] = True
-            return {"model": "unsloth/Gemma-4-GGUF"}
-        raise AssertionError(f"unexpected request: {method} {url}")
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-
-    entry = start._resolve_model("http://10.0.0.5:8888", "sk-test", "unsloth/gemma-4-gguf")
-
-    # The load endpoint was consulted (no casefold shortcut), and we still attach to the
-    # server's canonical id it reports back.
-    assert entry["id"] == "unsloth/Gemma-4-GGUF"
-    assert any(u.endswith("/api/inference/load") for _, u in calls)
-
-
-def test_model_id_matching_does_not_casefold_local_paths(tmp_path):
-    existing_local = tmp_path / "Org" / "Foo"
-    existing_local.mkdir(parents = True)
-
-    assert start._model_id_matches("Org/Foo", "org/foo")
-    assert not start._model_id_matches(str(existing_local), str(existing_local).lower())
-    assert not start._model_id_matches("./Models/Foo", "./models/foo")
-    assert not start._model_id_matches(r".\Models\Foo", r".\models\foo")
-    # A server-side relative path (extra path segments) is not a hub id even when it
-    # does not exist on the CLI host, so it must not casefold-match a differently
-    # cased path on a case-sensitive server filesystem.
-    assert not start._is_hub_model_id("models/Llama/Foo.gguf")
-    assert not start._model_id_matches("models/Llama/Foo.gguf", "models/llama/foo.gguf")
-    # A genuine two-segment hub id still matches case-insensitively.
-    assert start._is_hub_model_id("unsloth/Gemma-3-4b-it-GGUF")
-    assert start._model_id_matches("unsloth/Gemma-3-4b-it-GGUF", "unsloth/gemma-3-4b-it-gguf")
-    # Casefolding is gated to loopback studios (allow_casefold). With it disabled (a
-    # remote studio, where a two-segment string could be a server-side path), even a
-    # genuine hub-id case variant must not match, so the load endpoint resolves it.
-    assert not start._model_id_matches(
-        "unsloth/Gemma-3-4b-it-GGUF", "unsloth/gemma-3-4b-it-gguf", allow_casefold = False
-    )
-    assert start._model_id_matches("unsloth/Foo", "unsloth/Foo", allow_casefold = False)
-
-
-def test_connect_codex_launch_uses_ephemeral_home(fake_studio, monkeypatch):
+def test_connect_codex_launch_uses_ephemeral_home(fake_vllm, monkeypatch):
     # Launch mode writes config to a throwaway temp CODEX_HOME and removes it after
     # the agent exits; the user's real ~/.codex is never the target.
     captured = {}
@@ -2715,20 +2213,20 @@ def test_connect_codex_launch_uses_ephemeral_home(fake_studio, monkeypatch):
     os.name == "nt",
     reason = "the #6547 CI parser is bash-only; on Windows --no-launch prints PowerShell",
 )
-def test_no_launch_output_is_parseable(fake_studio):
+def test_no_launch_output_is_parseable(fake_vllm):
     # Mirror the #6547 CI parser: status lines, then `export`/`unset`, then exactly
     # one launch command on the last line (now an inline-env one-liner, so the parser
     # matches by substring rather than prefix).
     result = CliRunner().invoke(start.start_app, ["codex", "--no-launch"])
     assert result.exit_code == 0, result.output
     lines = [ln for ln in result.output.splitlines() if ln.strip()]
-    skip = ("export ", "unset ", "Unsloth ", "Updated ", "Disabled ", "Warning", "Loading")
+    skip = ("export ", "unset ", "vLLM ", "Updated ", "Disabled ", "Warning", "Loading")
     body = [ln for ln in lines if not ln.startswith(skip)]
     assert "codex --oss --profile agent_switch" in body[-1]
     assert any(ln.startswith("export CODEX_HOME=") for ln in lines)
 
 
-def test_no_launch_last_line_is_self_contained(fake_studio, tmp_path):
+def test_no_launch_last_line_is_self_contained(fake_vllm, tmp_path):
     # People copy just the last line. A bare `codex` there would run against the user's
     # real ~/.codex (e.g. a pre-existing damaged state DB) with zero isolation, so the
     # last line must inline every session env var ahead of the command.
@@ -2746,12 +2244,12 @@ def test_no_launch_last_line_is_self_contained(fake_studio, tmp_path):
         assignments[name] = value
     assert command and command[0] == "codex"
     assert assignments["CODEX_HOME"] == str(tmp_path / "agents" / "codex")
-    assert assignments["AGENT_SWITCH_AUTH_TOKEN"].startswith("sk-unsloth-")
+    assert assignments["AGENT_SWITCH_AUTH_TOKEN"] == KEY
 
 
-def test_no_launch_claude_last_line_blanks_conflicting_auth(fake_studio):
+def test_no_launch_claude_last_line_blanks_conflicting_auth(fake_vllm):
     # The unset vars must be neutralized inline too, or a partial copy would send the
-    # user's own ANTHROPIC_API_KEY to the Unsloth base.
+    # user's own ANTHROPIC_API_KEY to the local base.
     result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
     assert result.exit_code == 0, result.output
     last = [ln for ln in result.output.splitlines() if ln.strip()][-1]
@@ -2760,7 +2258,7 @@ def test_no_launch_claude_last_line_blanks_conflicting_auth(fake_studio):
     assert "ANTHROPIC_AUTH_TOKEN=" in last  # the real key still applied after the blanks
 
 
-def test_opencode_inline_config_beats_project_config(fake_studio):
+def test_opencode_inline_config_beats_project_config(fake_vllm):
     # A project's opencode.json outranks OPENCODE_CONFIG, so the model pin (and --yolo
     # permissions) ride in OPENCODE_CONFIG_CONTENT, which outranks project config.
     result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", "--yolo"])
@@ -2773,10 +2271,10 @@ def test_opencode_inline_config_beats_project_config(fake_studio):
         "webfetch": "allow",
         "external_directory": {"*": "allow"},
     }
-    assert "sk-unsloth" not in result.output  # key stays in the private file, not the env
+    assert KEY not in result.output  # key stays in the private file, not the env
 
 
-def test_opencode_inline_config_omits_permission_without_yolo(fake_studio):
+def test_opencode_inline_config_omits_permission_without_yolo(fake_vllm):
     # A non-yolo session carries no permission inline. OPENCODE_CONFIG_CONTENT outranks the
     # project opencode.json we cannot read, so forcing any value there would override the
     # user's project rules; clearing our own config is the fix, and the inline pins the model.
@@ -2787,293 +2285,25 @@ def test_opencode_inline_config_omits_permission_without_yolo(fake_studio):
     assert "permission" not in inline
 
 
-def test_connect_key_minted_once_then_cached(fake_studio, tmp_path):
-    CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
-    CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
-    # First run mints; second reuses the minted key cached for this server.
-    mints = [c for c in fake_studio if c[0] == "POST" and c[1].endswith("/api/auth/api-keys")]
-    assert len(mints) == 1
-    cached = json.loads((tmp_path / "agent_api_key.json").read_text())
-    assert cached["servers"][BASE]["minted"] == ["sk-unsloth-feedfacefeedface"]
-
-
-def test_connect_skips_a_minted_key_the_owner_does_not_hold(fake_studio, tmp_path):
-    cache = tmp_path / "agent_api_key.json"
-    cache.write_text(json.dumps({"servers": {BASE: {"minted": ["sk-unsloth-a11ce000a11ce000"]}}}))
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
-    assert result.exit_code == 0, result.output
-    _assert_env_set(result.output, "ANTHROPIC_AUTH_TOKEN", "sk-unsloth-feedfacefeedface")
-
-
-def test_connect_explicit_key_remembered_for_keyless_runs(fake_studio, tmp_path):
+def test_connect_explicit_key_remembered_for_keyless_runs(fake_vllm, tmp_path):
     CliRunner().invoke(
         start.start_app,
-        ["claude", "--no-launch", "--api-key", "sk-unsloth-deadbeefdeadbeef"],
+        ["claude", "--no-launch", "--api-key", "sk-test-deadbeefdeadbeef"],
     )
     result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
     assert result.exit_code == 0, result.output
-    # Reused, not re-minted (a mint would return the feedface stand-in).
-    _assert_env_set(result.output, "ANTHROPIC_AUTH_TOKEN", "sk-unsloth-deadbeefdeadbeef")
-    cached = json.loads((tmp_path / "agent_api_key.json").read_text())
-    # An explicit key is remembered as "saved" so it replays without the handshake.
-    assert cached["servers"][BASE]["saved"] == ["sk-unsloth-deadbeefdeadbeef"]
-
-
-def test_connect_skips_cached_keys_the_server_rejects(fake_studio, tmp_path, monkeypatch):
-    cache = tmp_path / "agent_api_key.json"
-    cache.write_text(
-        json.dumps(
-            {"servers": {BASE: {"minted": ["sk-unsloth-stale", "sk-unsloth-feedfacefeedface"]}}}
-        )
-    )
-    inner = start._http_json
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/loaded-models") and token == "sk-unsloth-stale":
-            raise urllib.error.HTTPError(url, 401, "Unauthorized", None, None)
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
-    assert result.exit_code == 0, result.output
-    _assert_env_set(result.output, "ANTHROPIC_AUTH_TOKEN", "sk-unsloth-feedfacefeedface")
-    # The working key moves to the front so the next run tries it first.
-    cached = json.loads(cache.read_text())
-    assert cached["servers"][BASE]["minted"] == ["sk-unsloth-feedfacefeedface", "sk-unsloth-stale"]
-
-
-def test_connect_saved_key_server_outage_surfaces_not_reminted(fake_studio, tmp_path, monkeypatch):
-    # A 5xx/timeout while checking a saved key is a server outage, not a rejected key:
-    # surface it instead of discarding the key and minting a new one against a sick server.
-    cache = tmp_path / "agent_api_key.json"
-    cache.write_text(json.dumps({"servers": {BASE: {"saved": ["sk-unsloth-saved"]}}}))
-    inner = start._http_json
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/loaded-models") and token == "sk-unsloth-saved":
-            raise urllib.error.HTTPError(url, 503, "Service Unavailable", None, None)
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
-    assert result.exit_code != 0, result.output
-    # The outage did not cause a fresh key to be minted.
-    mints = [c for c in fake_studio if c[1].endswith("/api/auth/api-keys")]
-    assert mints == []
-
-
-def test_connect_legacy_unscoped_cache_not_replayed(fake_studio, tmp_path):
-    # Legacy unscoped caches have no server binding (could leak across servers),
-    # so they're ignored: a fresh key is minted and stored scoped to this server.
-    (tmp_path / "agent_api_key.json").write_text(json.dumps({"key": "sk-unsloth-oldformat"}))
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
-    assert result.exit_code == 0, result.output
-    _assert_env_set(result.output, "ANTHROPIC_AUTH_TOKEN", "sk-unsloth-feedfacefeedface")
-    cached = json.loads((tmp_path / "agent_api_key.json").read_text())
-    assert cached["servers"][BASE]["minted"] == ["sk-unsloth-feedfacefeedface"]
-    assert "key" not in cached  # legacy field collapsed away
-
-
-def test_connect_model_flag_loads_on_server(fake_studio):
-    result = CliRunner().invoke(
-        start.start_app, ["claude", "--no-launch", "--model", "unsloth/Qwen3.5-35B-A3B"]
-    )
-    assert result.exit_code == 0, result.output
-    loads = [c for c in fake_studio if c[1].endswith("/api/inference/load")]
-    assert loads == [
-        ("POST", f"{BASE}/api/inference/load", {"model_path": "unsloth/Qwen3.5-35B-A3B"})
-    ]
-    assert result.output.index(
-        f"Switching the Unsloth server from {MODEL['id']} to unsloth/Qwen3.5-35B-A3B.\n"
-    ) < result.output.index("This unloads the current model for every attached session.\n")
-    _assert_env_set(result.output, "ANTHROPIC_MODEL", "unsloth/Qwen3.5-35B-A3B")
-
-
-def _fake_path_resident(
-    monkeypatch,
-    listed_id,
-    load_status,
-    *,
-    load_error = None,
-    after_failure = "kept",
-):
-    # API-key status exposes an opaque ref instead of the resident path.
-    inner = start._http_json
-    state = {"after": None, "listed": listed_id}
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/loaded-models"):
-            if state["after"] == "unreachable":
-                raise TimeoutError("timed out")
-            return {"data": [{"id": state["listed"], "loaded": state["after"] != "gone"}]}
-        if url.endswith("/api/inference/status"):
-            return {"is_gguf": True, "active_model": listed_id, "model_identifier": "ref:0123"}
-        if url.endswith("/api/inference/load"):
-            if load_error is not None:
-                state["after"] = after_failure
-                raise load_error
-            # Load responses use the path and short name; snapshot listings use the repo ID.
-            name = os.path.basename(payload["model_path"]).removesuffix(".gguf")
-            if load_status == "loaded":
-                state["listed"] = name
-            return {"status": load_status, "model": payload["model_path"], "display_name": name}
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-
-
-@pytest.mark.parametrize(
-    "requested, listed_id",
-    [
-        ("/models/old/foo-Q4_K_M.gguf", "foo-Q4_K_M"),
-        (
-            "/cache/hub/models--unsloth--Foo-GGUF/snapshots/abc123/Foo-UD-IQ1_S.gguf",
-            "unsloth/Foo-GGUF",
-        ),
-    ],
-)
-def test_connect_model_path_reattach_announces_no_switch(
-    fake_studio, monkeypatch, requested, listed_id
-):
-    _fake_path_resident(monkeypatch, listed_id, "already_loaded")
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch", "--model", requested])
-    assert result.exit_code == 0, result.output
-    assert "Switching" not in result.output
-    assert "unload" not in result.output
-    assert f"Reusing loaded model: {requested}" in result.output
-
-
-def test_connect_model_path_same_name_switch_announced_after_load(fake_studio, monkeypatch):
-    _fake_path_resident(monkeypatch, "foo-Q4_K_M", "loaded")
-    requested = "/models/new/foo-Q4_K_M.gguf"
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch", "--model", requested])
-    assert result.exit_code == 0, result.output
-    assert "Switching" not in result.output
-    assert f"Loaded {requested} in place of foo-Q4_K_M.\n" in result.output
-    assert "This unloaded the previous model for every attached session.\n" in result.output
-
-
-def test_connect_model_path_other_name_switch_announced_before_load(fake_studio, monkeypatch):
-    _fake_path_resident(monkeypatch, "foo-Q4_K_M", "loaded")
-    requested = "/models/bar-Q4_K_M.gguf"
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch", "--model", requested])
-    assert result.exit_code == 0, result.output
-    assert f"Switching the Unsloth server from foo-Q4_K_M to {requested}.\n" in result.output
-    assert "in place of" not in result.output
-
-
-@pytest.mark.parametrize("after_failure", ["kept", "gone", "unreachable"])
-def test_connect_model_path_failed_same_name_load_reports_eviction(
-    fake_studio, monkeypatch, after_failure
-):
-    # An unreachable listing must not be treated as evidence of eviction.
-    failure = urllib.error.HTTPError(
-        f"{BASE}/api/inference/load", 500, "Internal Server Error", None, None
-    )
-    _fake_path_resident(
-        monkeypatch, "foo-Q4_K_M", None, load_error = failure, after_failure = after_failure
-    )
-    result = CliRunner().invoke(
-        start.start_app, ["claude", "--no-launch", "--model", "/models/new/foo-Q4_K_M.gguf"]
-    )
-    assert result.exit_code != 0
-    evicted = "foo-Q4_K_M was unloaded for every attached session." in result.output
-    assert evicted is (after_failure == "gone")
-    assert "Nothing was unloaded" not in result.output
-
-
-def test_connect_model_flag_forwards_load_options(fake_studio):
-    # The remaining load knobs (variant shorthand + context length) reach /api/inference/load.
-    result = CliRunner().invoke(
-        start.start_app,
-        [
-            "claude",
-            "--no-launch",
-            "--model",
-            "unsloth/Qwen3-4B-GGUF:UD-Q4_K_XL",
-            "--context-length",
-            "8192",
-        ],
-    )
-    assert result.exit_code == 0, result.output
-    loads = [c for c in fake_studio if c[1].endswith("/api/inference/load")]
-    assert loads == [
-        (
-            "POST",
-            f"{BASE}/api/inference/load",
-            {
-                "model_path": "unsloth/Qwen3-4B-GGUF",
-                "gguf_variant": "UD-Q4_K_XL",
-                "max_seq_length": 8192,
-            },
-        )
-    ]
-
-
-def test_connect_model_flag_matches_canonical_id(fake_studio, monkeypatch):
-    # Unsloth registers a loaded model under a canonical id (resolved identifier
-    # / casing) that can differ from the path we passed. The agent must connect
-    # to that model, not silently fall through to the first loaded one.
-    requested = "Unsloth/Qwen3.5-35B-A3B"
-    canonical = "unsloth/Qwen3.5-35B-A3B"
-    inner = start._http_json
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/load"):
-            return {"model": canonical, "display_name": canonical}
-        if url.endswith("/api/inference/loaded-models"):
-            # Decoy sorts first, so models[0] is the wrong pick on the old code.
-            return {"object": "list", "data": [MODEL, {"id": canonical, "context_length": 4096}]}
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch", "--model", requested])
-    assert result.exit_code == 0, result.output
-    _assert_env_set(result.output, "ANTHROPIC_MODEL", canonical)
+    # Reused ahead of the key the server was given before.
+    _assert_env_set(result.output, "ANTHROPIC_AUTH_TOKEN", "sk-test-deadbeefdeadbeef")
+    cached = json.loads(start._provider_key_cache_path().read_text())
+    assert cached["servers"][BASE]["saved"] == ["sk-test-deadbeefdeadbeef", KEY]
 
 
 @pytest.mark.parametrize(
     "model, expected",
     [
-        ("unsloth/Qwen3-1.7B-GGUF:UD-Q4_K_XL", ("unsloth/Qwen3-1.7B-GGUF", "UD-Q4_K_XL")),
-        ("unsloth/gemma-4-E2B-it-GGUF:Q8_0", ("unsloth/gemma-4-E2B-it-GGUF", "Q8_0")),
-        ("unsloth/Qwen3-1.7B-GGUF", ("unsloth/Qwen3-1.7B-GGUF", None)),  # no suffix
+        ("org/Qwen3-1.7B-GGUF:UD-Q4_K_XL", ("org/Qwen3-1.7B-GGUF", "UD-Q4_K_XL")),
+        ("org/gemma-4-E2B-it-GGUF:Q8_0", ("org/gemma-4-E2B-it-GGUF", "Q8_0")),
+        ("org/Qwen3-1.7B-GGUF", ("org/Qwen3-1.7B-GGUF", None)),  # no suffix
         ("/models/local.gguf", ("/models/local.gguf", None)),  # absolute path
         ("./rel.gguf", ("./rel.gguf", None)),  # relative path
         ("C:\\models\\x.gguf", ("C:\\models\\x.gguf", None)),  # Windows drive
@@ -3088,8 +2318,8 @@ def test_split_repo_variant(model, expected):
 @pytest.mark.parametrize(
     "token, expected",
     [
-        ("unsloth/gemma-4-E2B-it-GGUF", True),
-        ("unsloth/gemma-4-E2B-it-GGUF:UD-Q4_K_XL", True),
+        ("org/gemma-4-E2B-it-GGUF", True),
+        ("org/gemma-4-E2B-it-GGUF:UD-Q4_K_XL", True),
         ("some-org/model.name_1", True),
         ("--continue", False),  # flag
         ("resume", False),  # single word, no slash
@@ -3106,8 +2336,8 @@ def test_looks_like_model(token, expected):
 
 def test_consume_positional_model_leading_token():
     # A leading org/name positional routes to --model and is dropped from the passthrough.
-    model, rest = start._consume_positional_model(None, ["unsloth/Model-GGUF", "--continue"])
-    assert model == "unsloth/Model-GGUF"
+    model, rest = start._consume_positional_model(None, ["org/Model-GGUF", "--continue"])
+    assert model == "org/Model-GGUF"
     assert rest == ["--continue"]
 
 
@@ -3132,7 +2362,7 @@ def test_consume_positional_model_ignores_non_leading_and_explicit_model():
     assert model == "explicit/model" and rest == ["owner/repo"]
 
 
-def test_start_separator_preserves_model_shaped_agent_argument(fake_studio):
+def test_start_separator_preserves_model_shaped_agent_argument(fake_vllm):
     result = CliRunner().invoke(
         start.start_app,
         ["codex", "--no-launch", "--", "owner/repo"],
@@ -3152,7 +2382,8 @@ def test_start_separator_preserves_model_shaped_agent_argument(fake_studio):
 
 
 _SESSION_FLAGS = ["--temperature", "0.3", "--top-k", "40", "--reasoning", "off"]
-_SESSION_BODY = {"temperature": 0.3, "top_k": 40, "enable_thinking": False}
+# vLLM reads the reasoning switch from chat_template_kwargs.
+_SESSION_BODY = {"temperature": 0.3, "top_k": 40, "chat_template_kwargs": {"enable_thinking": False}}
 
 
 def _session_request_body(agent, root, output):
@@ -3175,7 +2406,7 @@ def _session_request_body(agent, root, output):
 
 @pytest.mark.parametrize("agent", ["pi", "opencode", "claude"])
 def test_session_flags_ride_in_the_agent_config_on_a_running_server(
-    agent, fake_studio, tmp_path, monkeypatch
+    agent, fake_vllm, tmp_path, monkeypatch
 ):
     monkeypatch.chdir(tmp_path)
     result = CliRunner().invoke(start.start_app, [agent, "--no-launch", *_SESSION_FLAGS])
@@ -3185,7 +2416,7 @@ def test_session_flags_ride_in_the_agent_config_on_a_running_server(
 
 
 @pytest.mark.parametrize("agent", ["pi", "opencode", "claude"])
-def test_session_flags_from_an_earlier_run_do_not_stick(agent, fake_studio, tmp_path, monkeypatch):
+def test_session_flags_from_an_earlier_run_do_not_stick(agent, fake_vllm, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     for argv in ([agent, "--no-launch", *_SESSION_FLAGS], [agent, "--no-launch"]):
         result = CliRunner().invoke(start.start_app, argv)
@@ -3193,7 +2424,7 @@ def test_session_flags_from_an_earlier_run_do_not_stick(agent, fake_studio, tmp_
     assert not _session_request_body(agent, tmp_path, result.output)
 
 
-def test_opencode_session_temperature_needs_the_capability(fake_studio, tmp_path, monkeypatch):
+def test_opencode_session_temperature_needs_the_capability(fake_vllm, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     config_path = tmp_path / "agents" / "opencode" / "opencode.json"
     for argv, capability in ((["--temperature", "0.3"], True), (["--top-k", "40"], None)):
@@ -3203,15 +2434,14 @@ def test_opencode_session_temperature_needs_the_capability(fake_studio, tmp_path
         assert provider["models"][MODEL["id"]].get("temperature") is capability
 
 
-def test_unsloth_session_carries_the_custom_header_to_the_agent(fake_studio, tmp_path, monkeypatch):
-    # A custom Authorization now wins over the Studio key on agent-switch's own requests too, so the
-    # agent config must carry it, drop the apiKey it no longer sends, and mint no Studio key at all.
+def test_session_carries_the_custom_header_to_the_agent(fake_vllm, tmp_path, monkeypatch):
+    # A custom Authorization wins over the API key on agent-switch's own requests too, so the
+    # agent config must carry it and drop the apiKey it no longer sends.
     monkeypatch.chdir(tmp_path)
     result = CliRunner().invoke(
         start.start_app, ["opencode", "--no-launch", "--header", "Authorization=Bearer gateway-token"]
     )
     assert result.exit_code == 0, result.output
-    assert not [call for call in fake_studio if call[1].endswith("/api/auth/api-keys")]
     provider = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())["provider"][
         start._OPENCODE_PROVIDER
     ]
@@ -3219,24 +2449,7 @@ def test_unsloth_session_carries_the_custom_header_to_the_agent(fake_studio, tmp
     assert "apiKey" not in provider["options"]
 
 
-def test_unsloth_provider_flag_carries_the_custom_header(fake_studio, tmp_path, monkeypatch):
-    # `--provider unsloth` names the target without a URL; it must carry the pairs like --url does,
-    # not mint a Studio key the agent never sends.
-    monkeypatch.chdir(tmp_path)
-    result = CliRunner().invoke(
-        start.start_app,
-        ["opencode", "--no-launch", "--provider", "unsloth", "--header", "Authorization=Bearer gateway-token"],
-    )
-    assert result.exit_code == 0, result.output
-    assert not [call for call in fake_studio if call[1].endswith("/api/auth/api-keys")]
-    provider = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())["provider"][
-        start._OPENCODE_PROVIDER
-    ]
-    assert provider["options"]["headers"] == {"Authorization": "Bearer gateway-token"}
-    assert "apiKey" not in provider["options"]
-
-
-def test_pi_subagent_carries_the_session_flags(fake_studio, tmp_path, monkeypatch):
+def test_pi_subagent_carries_the_session_flags(fake_vllm, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     result = CliRunner().invoke(
         start.start_app, ["pi", "--as-subagent", "--no-launch", *_SESSION_FLAGS]
@@ -3247,7 +2460,7 @@ def test_pi_subagent_carries_the_session_flags(fake_studio, tmp_path, monkeypatc
     assert config["samplingParams"] == _SESSION_BODY
 
 
-def test_codex_carries_reasoning_and_warns_about_sampling(fake_studio, tmp_path, monkeypatch):
+def test_codex_carries_reasoning_and_warns_about_sampling(fake_vllm, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     result = CliRunner().invoke(start.start_app, ["codex", "--no-launch", *_SESSION_FLAGS])
     assert result.exit_code == 0, result.output
@@ -3261,7 +2474,7 @@ def test_codex_carries_reasoning_and_warns_about_sampling(fake_studio, tmp_path,
     assert "model_reasoning_effort" not in profile
 
 
-def test_codex_warns_about_reasoning_it_cannot_express(fake_studio, tmp_path, monkeypatch):
+def test_codex_warns_about_reasoning_it_cannot_express(fake_vllm, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     result = CliRunner().invoke(start.start_app, ["codex", "--no-launch", "--reasoning", "on"])
     assert result.exit_code == 0, result.output
@@ -3273,7 +2486,7 @@ def test_codex_warns_about_reasoning_it_cannot_express(fake_studio, tmp_path, mo
 @pytest.mark.parametrize("mode", ["--persist", "--no-launch"])
 @pytest.mark.parametrize("agent, version", [("codex", (0, 144, 0)), ("pi", (0, 83, 0))])
 def test_agent_too_old_to_send_the_flags_warns_and_ignores(
-    agent, version, mode, fake_studio, tmp_path, monkeypatch
+    agent, version, mode, fake_vllm, tmp_path, monkeypatch
 ):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(start, "_which_with_install_dirs", lambda name: f"/bin/{name}")
@@ -3294,7 +2507,7 @@ def test_agent_too_old_to_send_the_flags_warns_and_ignores(
 
 
 def test_opencode_v1_reads_the_effort_as_reasoning_effort_option(
-    fake_studio, tmp_path, monkeypatch
+    fake_vllm, tmp_path, monkeypatch
 ):
     monkeypatch.chdir(tmp_path)
     result = CliRunner().invoke(
@@ -3307,7 +2520,7 @@ def test_opencode_v1_reads_the_effort_as_reasoning_effort_option(
     assert provider["options"]["body"] == {"reasoning_effort": "low"}
 
 
-def test_dsh_carries_reasoning_and_warns_about_sampling(fake_studio, tmp_path, monkeypatch):
+def test_dsh_carries_reasoning_and_warns_about_sampling(fake_vllm, tmp_path, monkeypatch):
     yaml = pytest.importorskip("yaml")
     monkeypatch.chdir(tmp_path)
     result = CliRunner().invoke(start.start_app, ["dsh", "--no-launch", *_SESSION_FLAGS])
@@ -3321,937 +2534,7 @@ def test_dsh_carries_reasoning_and_warns_about_sampling(fake_studio, tmp_path, m
     assert "off" in provider["models"][0]["reasoningEfforts"]
 
 
-def test_connect_model_bare_id_matches_loaded_without_reload(fake_studio):
-    # A bare `--model <loaded repo>` (no load knobs) attaches to the already-loaded model
-    # without touching /api/inference/load, so it can never evict another session.
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch", "--model", MODEL["id"]])
-    assert result.exit_code == 0, result.output
-    loads = [c for c in fake_studio if c[1].endswith("/api/inference/load")]
-    assert loads == []
-    assert f"Reusing loaded model: {MODEL['id']}\n" in result.output
-    _assert_env_set(result.output, "ANTHROPIC_MODEL", MODEL["id"])
-
-
-def test_connect_model_variant_suffix_defers_to_server_dedup(fake_studio):
-    # `--model repo:QUANT` splits into a VALID load payload (bare repo + gguf_variant),
-    # never the `:`-suffixed repo id Unsloth rejects. The variant knob defers to
-    # /api/inference/load, whose already-loaded dedup answers without reloading when the
-    # active variant+settings match -- so a second session running the same command
-    # attaches without evicting the first, while a genuinely different quant reloads.
-    result = CliRunner().invoke(
-        start.start_app, ["claude", "--no-launch", "--model", MODEL["id"] + ":UD-Q4_K_XL"]
-    )
-    assert result.exit_code == 0, result.output
-    loads = [c for c in fake_studio if c[1].endswith("/api/inference/load")]
-    assert loads == [
-        (
-            "POST",
-            f"{BASE}/api/inference/load",
-            {"model_path": MODEL["id"], "gguf_variant": "UD-Q4_K_XL"},
-        )
-    ]
-    assert f"Reusing loaded model: {MODEL['id']}:UD-Q4_K_XL\n" in result.output
-    _assert_env_set(result.output, "ANTHROPIC_MODEL", MODEL["id"])
-
-
-def _status_with(monkeypatch, **fields):
-    # The fake status lacks the runtime fields the --no-model-load gate compares; layer them on.
-    inner = start._http_json
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/status"):
-            return {
-                "is_gguf": True,
-                "model_identifier": MODEL["id"],
-                "active_model": MODEL["id"],
-                **fields,
-            }
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-
-
-def _no_load_requests(fake_studio):
-    return [c for c in fake_studio if c[1].endswith("/api/inference/load")]
-
-
-def test_no_model_load_keeps_the_default_resident_selection(fake_studio):
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch", "--no-model-load"])
-    assert result.exit_code == 0, result.output
-    _assert_env_set(result.output, "ANTHROPIC_MODEL", MODEL["id"])
-    assert _no_load_requests(fake_studio) == []
-
-
-def test_no_model_load_attaches_a_loaded_model(fake_studio):
-    result = CliRunner().invoke(
-        start.start_app, ["claude", "--no-launch", "--no-model-load", "--model", MODEL["id"]]
-    )
-    assert result.exit_code == 0, result.output
-    assert f"Reusing loaded model: {MODEL['id']}" in result.output
-    assert _no_load_requests(fake_studio) == []
-
-
-def test_no_model_load_refuses_an_unloaded_model_and_lists_candidates(fake_studio):
-    result = CliRunner().invoke(
-        start.start_app,
-        ["claude", "--no-launch", "--no-model-load", "--model", "unsloth/Qwen3-4B-GGUF"],
-    )
-    assert result.exit_code == 1
-    assert "--no-model-load" in result.output
-    assert MODEL["id"] in result.output
-    assert _no_load_requests(fake_studio) == []
-
-
-def test_no_model_load_attaches_a_matching_resident_variant(fake_studio, monkeypatch):
-    _status_with(monkeypatch, gguf_variant = "UD-Q4_K_XL")
-    result = CliRunner().invoke(
-        start.start_app,
-        ["claude", "--no-launch", "--no-model-load", "--model", MODEL["id"] + ":UD-Q4_K_XL"],
-    )
-    assert result.exit_code == 0, result.output
-    assert _no_load_requests(fake_studio) == []
-
-
-def test_no_model_load_refuses_a_different_resident_variant(fake_studio, monkeypatch):
-    _status_with(monkeypatch, gguf_variant = "UD-Q4_K_XL")
-    result = CliRunner().invoke(
-        start.start_app,
-        ["claude", "--no-launch", "--no-model-load", "--model", MODEL["id"] + ":Q8_0"],
-    )
-    assert result.exit_code == 1
-    assert "--no-model-load" in result.output
-    assert _no_load_requests(fake_studio) == []
-
-
-def test_no_model_load_attaches_a_matching_context_length(fake_studio, monkeypatch):
-    _status_with(monkeypatch, requested_context_length = 8192)
-    result = CliRunner().invoke(
-        start.start_app,
-        [
-            "claude",
-            "--no-launch",
-            "--no-model-load",
-            "--model",
-            MODEL["id"],
-            "--context-length",
-            "8192",
-        ],
-    )
-    assert result.exit_code == 0, result.output
-    assert _no_load_requests(fake_studio) == []
-
-
-def test_no_model_load_refuses_a_mismatched_context_length(fake_studio, monkeypatch):
-    _status_with(monkeypatch, requested_context_length = 4096)
-    result = CliRunner().invoke(
-        start.start_app,
-        [
-            "claude",
-            "--no-launch",
-            "--no-model-load",
-            "--model",
-            MODEL["id"],
-            "--context-length",
-            "8192",
-        ],
-    )
-    assert result.exit_code == 1
-    assert "--no-model-load" in result.output
-    assert _no_load_requests(fake_studio) == []
-
-
-def test_no_model_load_gates_the_inferred_settings_reload(fake_studio, monkeypatch):
-    # No --model but a knob: the resident is inferred as the target, and a settings
-    # mismatch that would reload is refused instead.
-    _status_with(monkeypatch, requested_context_length = 4096)
-    result = CliRunner().invoke(
-        start.start_app,
-        ["claude", "--no-launch", "--no-model-load", "--context-length", "8192"],
-    )
-    assert result.exit_code == 1
-    assert "--no-model-load" in result.output
-    assert _no_load_requests(fake_studio) == []
-
-
-def test_no_model_load_attaches_inferred_matching_settings(fake_studio, monkeypatch):
-    # The inferred resident already runs with the requested settings, so the gate attaches.
-    _status_with(monkeypatch, requested_context_length = 8192)
-    result = CliRunner().invoke(
-        start.start_app,
-        ["claude", "--no-launch", "--no-model-load", "--context-length", "8192"],
-    )
-    assert result.exit_code == 0, result.output
-    assert _no_load_requests(fake_studio) == []
-
-
-def test_no_model_load_attaches_a_resident_path(fake_studio, monkeypatch, tmp_path):
-    # A path load is listed by basename only; status proves which path the resident came from.
-    resident = tmp_path / "models" / "foo-Q4_K_M.gguf"
-    resident.parent.mkdir()
-    resident.write_bytes(b"GGUF")
-    inner = start._http_json
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/loaded-models"):
-            return {"object": "list", "data": [{"id": "foo-Q4_K_M", "loaded": True}]}
-        if url.endswith("/api/inference/status"):
-            return {"is_gguf": True, "model_identifier": os.fspath(resident)}
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    result = CliRunner().invoke(
-        start.start_app,
-        ["claude", "--no-launch", "--no-model-load", "--model", os.fspath(resident)],
-    )
-    assert result.exit_code == 0, result.output
-    assert _no_load_requests(fake_studio) == []
-
-
-def test_no_model_load_refuses_a_different_resident_path(fake_studio, monkeypatch, tmp_path):
-    # The listing shows only the basename; status proves the resident came from ANOTHER path,
-    # so the same-named request must be refused rather than attached.
-    old = tmp_path / "old" / "foo-Q4_K_M.gguf"
-    old.parent.mkdir()
-    old.write_bytes(b"GGUF")
-    new = tmp_path / "new" / "foo-Q4_K_M.gguf"
-    new.parent.mkdir()
-    new.write_bytes(b"GGUF")
-    inner = start._http_json
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/loaded-models"):
-            return {"object": "list", "data": [{"id": "foo-Q4_K_M", "loaded": True}]}
-        if url.endswith("/api/inference/status"):
-            return {"is_gguf": True, "model_identifier": os.fspath(old)}
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    result = CliRunner().invoke(
-        start.start_app,
-        ["claude", "--no-launch", "--no-model-load", "--model", os.fspath(new)],
-    )
-    assert result.exit_code == 1
-    assert "--no-model-load" in result.output
-    assert _no_load_requests(fake_studio) == []
-
-
-def test_no_model_load_refuses_a_loaded_but_inactive_model(fake_studio, monkeypatch):
-    # Status describes the ACTIVE chat model; another resident entry's settings cannot be
-    # proven from it, so an entry that is loaded but not active is refused, not attached.
-    inner = start._http_json
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/loaded-models"):
-            return {"object": "list", "data": [MODEL, {"id": "unsloth/other-GGUF", "loaded": True}]}
-        if url.endswith("/api/inference/status"):
-            return {
-                "is_gguf": True,
-                "active_model": "unsloth/other-GGUF",
-                "model_identifier": "unsloth/other-GGUF",
-                "gguf_variant": "Q4_K_M",
-            }
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    result = CliRunner().invoke(
-        start.start_app,
-        ["claude", "--no-launch", "--no-model-load", "--model", MODEL["id"] + ":Q4_K_M"],
-    )
-    assert result.exit_code == 1
-    assert "--no-model-load" in result.output
-    assert _no_load_requests(fake_studio) == []
-
-
-def test_no_model_load_refuses_when_status_is_unavailable(fake_studio, monkeypatch):
-    # Without status the server cannot prove the settings match, even for a listed resident.
-    inner = start._http_json
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/status"):
-            return {}
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    result = CliRunner().invoke(
-        start.start_app,
-        ["claude", "--no-launch", "--no-model-load", "--model", MODEL["id"] + ":Q4_K_M"],
-    )
-    assert result.exit_code == 1
-    assert "--no-model-load" in result.output
-    assert _no_load_requests(fake_studio) == []
-
-
-def test_connect_model_variant_suffix_loads_split_repo(fake_studio):
-    # When the model is not already loaded, the `:QUANT` suffix becomes the gguf_variant
-    # and the load uses the bare (valid) repo id, mirroring `unsloth run repo --gguf-variant`.
-    result = CliRunner().invoke(
-        start.start_app,
-        ["claude", "--no-launch", "--model", "unsloth/Qwen3-4B-GGUF:UD-Q4_K_XL"],
-    )
-    assert result.exit_code == 0, result.output
-    loads = [c for c in fake_studio if c[1].endswith("/api/inference/load")]
-    assert loads == [
-        (
-            "POST",
-            f"{BASE}/api/inference/load",
-            {"model_path": "unsloth/Qwen3-4B-GGUF", "gguf_variant": "UD-Q4_K_XL"},
-        )
-    ]
-
-
-def test_connect_no_model_loaded_errors(fake_studio, monkeypatch):
-    monkeypatch.setattr(
-        start,
-        "_http_json",
-        lambda method, url, token, *rest, **_: (
-            {"key": "sk-unsloth-feedfacefeedface"}
-            if url.endswith("/api/auth/api-keys")
-            else {"object": "list", "data": []}
-        ),
-    )
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
-    assert result.exit_code == 1
-    assert "No model is loaded" in result.output
-
-
-def test_connect_requested_model_not_loaded_fails(fake_studio, monkeypatch):
-    # Unsloth never surfaces the requested model; fail loudly rather than
-    # silently connecting to whatever else happens to be loaded.
-    inner = start._http_json
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/load"):
-            return {}
-        if url.endswith("/api/inference/loaded-models"):
-            return {"object": "list", "data": [MODEL]}  # decoy; request never appears
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    result = CliRunner().invoke(
-        start.start_app, ["claude", "--no-launch", "--model", "unsloth/Missing-7B"]
-    )
-    assert result.exit_code == 1
-    assert "unsloth/Missing-7B" in result.output
-
-
-def test_connect_gguf_only_agents_reject_non_gguf_model(fake_studio, monkeypatch):
-    # opencode is the control: /v1/chat/completions serves this model, so it must pass.
-    inner = start._http_json
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/status"):
-            return {"is_gguf": False, "model_identifier": "unsloth/Qwen3-0.6B"}
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    result = CliRunner().invoke(start.start_app, ["codex", "--no-launch"])
-    assert result.exit_code == 1
-    assert "Codex needs a GGUF model" in result.output
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
-    assert result.exit_code == 1
-    assert "Claude Code needs a GGUF model" in result.output
-    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
-    assert result.exit_code == 0, result.output
-
-
-def test_connect_nonloopback_keyless_refuses_to_send_credential(fake_studio, monkeypatch):
-    # A server known only by URL + health check is unverified: keyless connect
-    # must refuse and make no request at all.
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: "http://studio.evil.example:8888")
-    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
-    assert result.exit_code == 1
-    assert "Settings → API" in result.output
-    assert "--api-key" in result.output
-    assert fake_studio == []  # no HTTP request of any kind (no mint, no /v1/models)
-
-
-def test_connect_nonloopback_explicit_key_is_allowed(fake_studio, monkeypatch):
-    # User named both server and key, so it's their choice; only auto-send is blocked.
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: "http://studio.example:8888")
-    result = CliRunner().invoke(
-        start.start_app,
-        ["opencode", "--no-launch", "--api-key", "sk-unsloth-deadbeefdeadbeef"],
-    )
-    assert result.exit_code == 0, result.output
-
-
-def test_connect_nonloopback_replays_saved_key(fake_studio, tmp_path, monkeypatch):
-    # A key saved for a remote (non-loopback) Unsloth is replayed on keyless runs;
-    # auto-minting stays blocked for non-loopback.
-    remote = "http://studio.example:8888"
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: remote)
-    (tmp_path / "agent_api_key.json").write_text(
-        json.dumps({"servers": {remote: {"saved": ["sk-unsloth-deadbeefdeadbeef"]}}})
-    )
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
-    assert result.exit_code == 0, result.output
-    _assert_env_set(result.output, "ANTHROPIC_AUTH_TOKEN", "sk-unsloth-deadbeefdeadbeef")
-    assert not any(c[1].endswith("/api/auth/api-keys") for c in fake_studio)  # never minted
-
-
-def test_connect_unverified_loopback_without_cached_key_refuses_to_mint(
-    fake_studio, tmp_path, monkeypatch
-):
-    # With no saved key, the next step would auto-mint; an unverified loopback
-    # server (port squatter) must be refused, with nothing sent.
-    monkeypatch.setattr(start, "verify_studio_identity", lambda base: False)
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
-    assert result.exit_code == 1
-    assert "--api-key" in result.output
-    assert not any(c[1].endswith("/api/auth/api-keys") for c in fake_studio)  # never minted
-
-
-def test_connect_replays_saved_key_without_identity_check(fake_studio, tmp_path, monkeypatch):
-    # A "saved" key (e.g. for an SSH-tunnelled Unsloth the handshake can't match)
-    # replays on keyless runs without the handshake, scoped to its own base.
-    cache = tmp_path / "agent_api_key.json"
-    cache.write_text(json.dumps({"servers": {BASE: {"saved": ["sk-unsloth-deadbeefdeadbeef"]}}}))
-    monkeypatch.setattr(start, "verify_studio_identity", lambda base: False)
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
-    assert result.exit_code == 0, result.output
-    _assert_env_set(result.output, "ANTHROPIC_AUTH_TOKEN", "sk-unsloth-deadbeefdeadbeef")
-    assert not any(c[1].endswith("/api/auth/api-keys") for c in fake_studio)  # reused, not minted
-
-
-def test_connect_minted_cache_requires_identity_check(fake_studio, tmp_path, monkeypatch):
-    # A "minted" key is NOT replayed to an unverified loopback server: minting and
-    # minted-key replay both sit behind the handshake, so a squatter can't grab it.
-    cache = tmp_path / "agent_api_key.json"
-    cache.write_text(json.dumps({"servers": {BASE: {"minted": ["sk-unsloth-feedfacefeedface"]}}}))
-    monkeypatch.setattr(start, "verify_studio_identity", lambda base: False)
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
-    assert result.exit_code == 1
-    assert "--api-key" in result.output
-    assert not any(
-        c[1].endswith("/api/inference/loaded-models") for c in fake_studio
-    )  # minted key never sent
-
-
-def test_connect_explicit_key_skips_identity_check(fake_studio, monkeypatch):
-    # An explicit key is the user's deliberate choice, so it does not require
-    # the automatic identity handshake.
-    monkeypatch.setattr(start, "verify_studio_identity", lambda base: False)
-    result = CliRunner().invoke(
-        start.start_app,
-        ["claude", "--no-launch", "--api-key", "sk-unsloth-deadbeefdeadbeef"],
-    )
-    assert result.exit_code == 0, result.output
-    _assert_env_set(result.output, "ANTHROPIC_AUTH_TOKEN", "sk-unsloth-deadbeefdeadbeef")
-
-
-@pytest.mark.parametrize(
-    "url, loopback",
-    [
-        ("http://127.0.0.1:8888", True),
-        ("http://localhost:8888", True),
-        ("http://[::1]:8888", True),
-        ("http://127.0.0.5:9001", True),  # SSH tunnels can land anywhere in 127/8
-        ("http://0.0.0.0:8888", False),
-        ("http://10.0.0.5:8888", False),
-        ("http://studio.evil.example:8888", False),
-        ("https://studio.example.com", False),
-    ],
-)
-def test_is_loopback_url(url, loopback):
-    assert start.is_loopback_url(url) is loopback
-
-
-def test_connect_no_studio_errors(fake_studio, monkeypatch):
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
-    assert result.exit_code == 1
-    assert "No running Unsloth server" in result.output
-
-
-@pytest.fixture(autouse = True)
-def _studio_is_this_machine(monkeypatch):
-    # 127.0.0.1 can be a tunnel, so the gate judges the local filesystem only once the server
-    # is confirmed to be this machine's. Default to local; the tunneled case overrides this.
-    monkeypatch.setattr(start, "verify_studio_identity", lambda base, **_kw: True)
-
-
-@pytest.fixture(autouse = True)
-def _reset_auto_served():
-    # Never let a test leave a fake server in the module slot (an atexit backstop would
-    # otherwise try to signal it at interpreter shutdown).
-    yield
-    start._auto_served_server = None
-
-
-def test_load_model_with_progress_uses_selected_gguf_size(monkeypatch, capsys):
-    release = start.threading.Event()
-    calls = []
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        calls.append((method, url, payload))
-        if url.endswith("/api/inference/load"):
-            assert release.wait(timeout = 2)
-            return {"model": "owner/model-GGUF"}
-        if "/api/hub/gguf-variants?" in url:
-            return {
-                "default_variant": "Q8_0",
-                "variants": [
-                    {
-                        "quant": "UD-Q4_K_XL",
-                        "filename": "model-UD-Q4_K_XL.gguf",
-                        "size_bytes": 4 * 1024**3,
-                        "download_size_bytes": 4 * 1024**3,
-                    }
-                ],
-            }
-        if "/api/hub/gguf-download-progress?" in url:
-            release.set()
-            return {
-                "downloaded_bytes": 2 * 1024**3,
-                "expected_bytes": 4 * 1024**3,
-                "progress": 0.5,
-            }
-        raise AssertionError(f"unexpected request: {method} {url}")
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    monkeypatch.setattr(start, "_DOWNLOAD_POLL_INTERVAL_S", 0.001)
-    result = start._load_model_with_progress(
-        BASE,
-        "sk-test",
-        "owner/model-GGUF",
-        start.LoadOptions(gguf_variant = "UD-Q4_K_XL"),
-        {"model_path": "owner/model-GGUF", "gguf_variant": "UD-Q4_K_XL"},
-    )
-
-    assert result == {"model": "owner/model-GGUF"}
-    output = capsys.readouterr().out
-    assert "Downloading model" in output
-    assert "100%" in output
-    progress_url = next(url for method, url, _ in calls if "gguf-download-progress" in url)
-    assert "variant=UD-Q4_K_XL" in progress_url
-    assert f"expected_bytes={4 * 1024**3}" in progress_url
-
-
-# ── A load slower than the proxy timer (routes/inference.py _tunnel_safe_json) ──
-#
-# /api/inference/load pads its body so a proxy cannot time a slow load out, committing
-# the 200 before the load finishes. A failure after that travels only in the body, as
-# `_deferred_error`, so `_http_json` must raise on it or a late OOM reads as success.
-
-_DEFERRED_OOM = {
-    "_deferred_error": {"status_code": 507, "detail": "CUDA out of memory"},
-}
-
-
-def _padded(body: dict) -> io.BytesIO:
-    """A padded response body: keepalive spaces, then the JSON payload."""
-    return io.BytesIO(b"   " + json.dumps(body).encode())
-
-
-def test_http_json_reads_a_padded_success(monkeypatch):
-    """Leading pad bytes are legal JSON, so a slow success is unchanged."""
-    monkeypatch.setattr(
-        start, "urlopen_no_redirect", lambda request, timeout: _padded({"status": "loaded"})
-    )
-    assert start._http_json("POST", f"{BASE}/api/inference/load", "sk-test") == {"status": "loaded"}
-
-
-def test_http_json_raises_a_deferred_error_as_an_http_error(monkeypatch):
-    monkeypatch.setattr(
-        start, "urlopen_no_redirect", lambda request, timeout: _padded(_DEFERRED_OOM)
-    )
-    with pytest.raises(urllib.error.HTTPError) as excinfo:
-        start._http_json("POST", f"{BASE}/api/inference/load", "sk-test")
-    # The same class every caller already handles for an early HTTP failure.
-    assert excinfo.value.code == 507
-    assert "CUDA out of memory" in str(excinfo.value)
-
-
-def test_http_json_deferred_error_fails_like_an_http_failure(monkeypatch, capsys):
-    """With `error` set, a late failure exits 1 with the server's detail, as an early 507
-    does, via the same _fail path."""
-    monkeypatch.setattr(
-        start, "urlopen_no_redirect", lambda request, timeout: _padded(_DEFERRED_OOM)
-    )
-    with pytest.raises(typer.Exit) as excinfo:
-        start._http_json(
-            "POST",
-            f"{BASE}/api/inference/load",
-            "sk-test",
-            error = "Model load failed",
-        )
-    assert excinfo.value.exit_code == 1
-    # _http_error_detail reads the raised error's body, so the detail survives.
-    assert "Model load failed: CUDA out of memory" in capsys.readouterr().err
-
-
-def test_load_model_with_progress_fails_on_a_deferred_error(monkeypatch):
-    """The real /load caller: a late failure must not be returned as a result."""
-
-    def urlopen(request, timeout):
-        if request.full_url.endswith("/api/inference/load"):
-            return _padded(_DEFERRED_OOM)
-        # Progress polling is best-effort; 404 it so the display just disables.
-        raise urllib.error.HTTPError(request.full_url, 404, "not found", None, None)
-
-    monkeypatch.setattr(start, "urlopen_no_redirect", urlopen)
-    monkeypatch.setattr(start, "_DOWNLOAD_POLL_INTERVAL_S", 0.001)
-    with pytest.raises(typer.Exit) as excinfo:
-        start._load_model_with_progress(
-            BASE,
-            "sk-test",
-            "owner/model-GGUF",
-            start.LoadOptions(),
-            {"model_path": "owner/model-GGUF"},
-        )
-    assert excinfo.value.exit_code == 1
-
-
-@pytest.mark.parametrize(
-    ("body", "what"),
-    [
-        (b"", "an empty body"),
-        (b"   ", "pad bytes only"),
-        (b'  {"status": "loa', "a payload cut in half"),
-    ],
-)
-def test_load_model_with_progress_rejects_a_truncated_padded_body(monkeypatch, body, what):
-    """A proxy that gives up mid-pad leaves a 200 the load never finished under.
-
-    Measured: one byte at t=90s, silence, killed ~125s later, a 200 with an EMPTY body.
-    `_http_json` decodes a blank body as `{}`, so without the check this returned a
-    successful-looking result and the agent connected to whatever was still resident.
-    """
-
-    def urlopen(request, timeout):
-        if request.full_url.endswith("/api/inference/load"):
-            return io.BytesIO(body)
-        # Progress polling is best-effort; 404 it so the display just disables.
-        raise urllib.error.HTTPError(request.full_url, 404, "not found", None, None)
-
-    monkeypatch.setattr(start, "urlopen_no_redirect", urlopen)
-    monkeypatch.setattr(start, "_DOWNLOAD_POLL_INTERVAL_S", 0.001)
-    with pytest.raises(RuntimeError) as excinfo:
-        start._load_model_with_progress(
-            BASE,
-            "sk-test",
-            "owner/model-GGUF",
-            start.LoadOptions(),
-            {"model_path": "owner/model-GGUF"},
-        )
-    assert "did not report completion" in str(excinfo.value), what
-    assert "/api/inference/load" in str(excinfo.value)
-
-
-def test_download_progress_ignores_fully_cached_bytes(capsys):
-    display = start._DownloadProgressDisplay()
-    display.update(
-        {
-            "downloaded_bytes": 4 * 1024**3,
-            "completed_bytes": 4 * 1024**3,
-            "expected_bytes": 4 * 1024**3,
-            "progress": 0.99,
-        }
-    )
-    display.close()
-
-    assert capsys.readouterr().out == ""
-
-
-def test_resolve_model_warns_on_same_repo_quant_switch(monkeypatch, capsys):
-    models = [{"id": "owner/model-GGUF", "loaded": True}]
-
-    def http_json(
-        method,
-        url,
-        key,
-        payload = None,
-        timeout = 30,
-        error = None,
-    ):
-        assert url.endswith("/api/inference/status"), url
-        return {"is_gguf": True, "gguf_variant": "Q4_K_M"}
-
-    monkeypatch.setattr(start, "_loaded_models", lambda base, key: models)
-    monkeypatch.setattr(start, "_http_json", http_json)
-    monkeypatch.setattr(
-        start,
-        "_load_model_with_progress",
-        lambda base, key, model, load, payload: {"status": "loaded", "model": "owner/model-GGUF"},
-    )
-
-    start._resolve_model(BASE, "key", "owner/model-GGUF", start.LoadOptions(gguf_variant = "Q8_0"))
-
-    out = capsys.readouterr().out
-    assert (
-        "Switching the Unsloth server from owner/model-GGUF:Q4_K_M to owner/model-GGUF:Q8_0." in out
-    )
-    assert "every attached session" in out
-
-
-def test_resolve_model_same_quant_prints_no_switch_warning(monkeypatch, capsys):
-    models = [{"id": "owner/model-GGUF", "loaded": True}]
-
-    monkeypatch.setattr(start, "_loaded_models", lambda base, key: models)
-    monkeypatch.setattr(
-        start,
-        "_http_json",
-        lambda *a, **k: {"is_gguf": True, "gguf_variant": "Q8_0"},
-    )
-    monkeypatch.setattr(
-        start,
-        "_load_model_with_progress",
-        lambda base, key, model, load, payload: {
-            "status": "already_loaded",
-            "model": "owner/model-GGUF",
-        },
-    )
-
-    start._resolve_model(BASE, "key", "owner/model-GGUF", start.LoadOptions(gguf_variant = "Q8_0"))
-
-    out = capsys.readouterr().out
-    assert "Switching" not in out
-    assert "Reusing loaded model: owner/model-GGUF:Q8_0" in out
-
-
-def test_resolve_model_refused_load_reports_survivor(monkeypatch, capsys):
-    models = [{"id": "owner/model-GGUF", "loaded": True}]
-
-    def http_json(
-        method,
-        url,
-        key,
-        payload = None,
-        timeout = 30,
-        error = None,
-    ):
-        if url.endswith("/api/inference/status"):
-            return {"is_gguf": True, "gguf_variant": "Q4_K_M"}
-        assert url.endswith("/api/inference/loaded-models"), url
-        return {"data": models}
-
-    def refuse_load(base, key, model, load, payload):
-        typer.echo("Model load failed: GGUF variant 'NOPE_Q9' not found", err = True)
-        raise typer.Exit(code = 1)
-
-    monkeypatch.setattr(start, "_loaded_models", lambda base, key: models)
-    monkeypatch.setattr(start, "_http_json", http_json)
-    monkeypatch.setattr(start, "_load_model_with_progress", refuse_load)
-
-    with pytest.raises(typer.Exit):
-        start._resolve_model(
-            BASE, "key", "owner/model-GGUF", start.LoadOptions(gguf_variant = "NOPE_Q9")
-        )
-
-    captured = capsys.readouterr()
-    assert "This unloads the current model" in captured.out
-    assert "Nothing was unloaded; owner/model-GGUF is still serving." in captured.err
-
-
-def _other_account_studio(
-    monkeypatch,
-    capsys,
-    load_status = "loaded",
-):
-    state = {"models": [], "loads": []}
-
-    def http_json(
-        method,
-        url,
-        key,
-        payload = None,
-        timeout = 30,
-        error = None,
-    ):
-        if url.endswith("/api/inference/loaded-models"):
-            return {"object": "list", "data": state["models"]}
-        assert url.endswith("/api/inference/status"), url
-        if state["models"]:
-            return {"is_gguf": True, "active_model": "owner/model-GGUF", "gguf_variant": "Q4_K_M"}
-        return {"loaded": [], "loading": [], "yours": False}
-
-    def load_model(base, key, model, load, payload):
-        state["loads"].append((payload, capsys.readouterr().out))
-        state["models"] = [{"id": model, "loaded": True}]
-        return {"status": load_status, "model": model}
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    monkeypatch.setattr(start, "_load_model_with_progress", load_model)
-    return state
-
-
-@pytest.mark.parametrize(
-    "load",
-    [start.LoadOptions(), start.LoadOptions(max_seq_length = 4096)],
-    ids = ["no-settings", "settings-only"],
-)
-def test_resolve_model_says_another_account_holds_the_resident(monkeypatch, capsys, load):
-    state = _other_account_studio(monkeypatch, capsys)
-
-    with pytest.raises(typer.Exit):
-        start._resolve_model(BASE, "key", None, load)
-
-    err = capsys.readouterr().err
-    assert "belongs to another account" in err
-    assert "No model is loaded" not in err and "No chat model" not in err
-    assert state["loads"] == []
-
-
-def test_resolve_model_warns_before_replacing_another_accounts_resident(monkeypatch, capsys):
-    state = _other_account_studio(monkeypatch, capsys)
-
-    start._resolve_model(BASE, "key", "owner/model-GGUF")
-
-    [(payload, before_load)] = state["loads"]
-    assert payload == {"model_path": "owner/model-GGUF"}
-    assert "from another account's model to owner/model-GGUF." in before_load
-    assert "unloads it for every attached session" in before_load
-
-
-def test_resolve_model_exact_match_shares_another_accounts_resident(monkeypatch, capsys):
-    state = _other_account_studio(monkeypatch, capsys, load_status = "already_loaded")
-
-    entry = start._resolve_model(
-        BASE, "key", "owner/model-GGUF", start.LoadOptions(gguf_variant = "Q4_K_M")
-    )
-
-    assert entry["id"] == "owner/model-GGUF"
-    assert state["loads"][0][0]["gguf_variant"] == "Q4_K_M"
-    assert "Reusing loaded model: owner/model-GGUF:Q4_K_M" in capsys.readouterr().out
-
-
-def test_resolve_model_interrupt_skips_survivor_probe(monkeypatch, capsys):
-    models = [{"id": "owner/model-GGUF", "loaded": True}]
-    probes = []
-
-    def http_json(
-        method,
-        url,
-        key,
-        payload = None,
-        timeout = 30,
-        error = None,
-    ):
-        return {"is_gguf": True, "gguf_variant": "Q4_K_M"}
-
-    def interrupted_load(base, key, model, load, payload):
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(start, "_loaded_models", lambda base, key: models)
-    monkeypatch.setattr(start, "_http_json", http_json)
-    monkeypatch.setattr(start, "_load_model_with_progress", interrupted_load)
-    monkeypatch.setattr(
-        start, "_model_still_loaded", lambda base, key, model_id: probes.append(model_id) or True
-    )
-
-    with pytest.raises(KeyboardInterrupt):
-        start._resolve_model(
-            BASE, "key", "owner/model-GGUF", start.LoadOptions(gguf_variant = "Q8_0")
-        )
-
-    assert probes == []
-    assert "Nothing was unloaded" not in capsys.readouterr().err
-
-
-def test_resolve_model_failed_load_stays_quiet_when_model_gone(monkeypatch, capsys):
-    models = [{"id": "owner/model-GGUF", "loaded": True}]
-
-    def http_json(
-        method,
-        url,
-        key,
-        payload = None,
-        timeout = 30,
-        error = None,
-    ):
-        if url.endswith("/api/inference/status"):
-            return {"is_gguf": True, "gguf_variant": "Q4_K_M"}
-        assert url.endswith("/api/inference/loaded-models"), url
-        return {"data": []}
-
-    def failing_load(base, key, model, load, payload):
-        raise typer.Exit(code = 1)
-
-    monkeypatch.setattr(start, "_loaded_models", lambda base, key: models)
-    monkeypatch.setattr(start, "_http_json", http_json)
-    monkeypatch.setattr(start, "_load_model_with_progress", failing_load)
-
-    with pytest.raises(typer.Exit):
-        start._resolve_model(
-            BASE, "key", "owner/model-GGUF", start.LoadOptions(gguf_variant = "Q8_0")
-        )
-
-    assert "Nothing was unloaded" not in capsys.readouterr().err
-
-
-def test_attached_server_prints_stop_hint_after_agent_exits(fake_studio, monkeypatch):
+def test_launch_prints_the_ready_line_and_exits_with_the_agent(fake_vllm, monkeypatch):
     monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/claude")
     monkeypatch.setattr(start, "_claude_flags", lambda *a, **k: [])
     monkeypatch.setattr(
@@ -4263,18 +2546,11 @@ def test_attached_server_prints_stop_hint_after_agent_exits(fake_studio, monkeyp
     result = CliRunner().invoke(start.start_app, ["claude"])
 
     assert result.exit_code == 0, result.output
-    assert f"Unsloth ready at {BASE} · model {MODEL['id']}\n" in result.output
-    assert f"Unsloth Studio is still running at {BASE}." in result.output
-    assert "Stop it with: unsloth studio stop\n" in result.output
+    assert f"vLLM ready at {BASE} · model {MODEL['id']}\n" in result.output
+    assert "still running" not in result.output
 
 
-def test_no_launch_recipe_does_not_print_stop_hint(fake_studio):
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
-    assert result.exit_code == 0, result.output
-    assert "is still running" not in result.output
-
-
-def test_nonzero_agent_exit_notes_code_before_stop_hint(fake_studio, monkeypatch):
+def test_nonzero_agent_exit_notes_code(fake_vllm, monkeypatch):
     monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/claude")
     monkeypatch.setattr(start, "_claude_flags", lambda *a, **k: [])
     monkeypatch.setattr(
@@ -4287,25 +2563,15 @@ def test_nonzero_agent_exit_notes_code_before_stop_hint(fake_studio, monkeypatch
 
     assert result.exit_code == 3
     assert "The agent exited with code 3." in result.output
-    assert f"Unsloth Studio is still running at {BASE}." in result.output
 
 
-def test_no_server_hints_starting_one(fake_studio, monkeypatch):
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
-    result = CliRunner().invoke(start.start_app, ["claude"])
-    assert result.exit_code == 1
-    assert "No running Unsloth server found" in result.output
-    assert "unsloth studio" in result.output
-
-
-def test_connect_explicit_api_key_skips_mint(fake_studio):
+def test_connect_explicit_api_key_wins_over_a_saved_one(fake_vllm):
     result = CliRunner().invoke(
         start.start_app,
-        ["claude", "--no-launch", "--api-key", "sk-unsloth-deadbeefdeadbeef"],
+        ["claude", "--no-launch", "--api-key", "sk-test-deadbeefdeadbeef"],
     )
     assert result.exit_code == 0, result.output
-    _assert_env_set(result.output, "ANTHROPIC_AUTH_TOKEN", "sk-unsloth-deadbeefdeadbeef")
-    assert not any(c[1].endswith("/api/auth/api-keys") for c in fake_studio)
+    _assert_env_set(result.output, "ANTHROPIC_AUTH_TOKEN", "sk-test-deadbeefdeadbeef")
 
 
 # ── OpenClaw (Anthropic /v1/messages) ────────────────────────────────
@@ -4316,11 +2582,11 @@ def test_connect_explicit_api_key_skips_mint(fake_studio):
 
 def test_write_opencode_config_fresh(tmp_path):
     path = tmp_path / "opencode.json"
-    start.write_opencode_config(BASE, "sk-unsloth-abc", MODEL, path)
+    start.write_opencode_config(BASE, "sk-test-abc", MODEL, path)
     config = json.loads(path.read_text())
     provider = config["provider"][start._OPENCODE_PROVIDER]
     assert provider["npm"] == "@ai-sdk/openai-compatible"
-    assert provider["options"] == {"baseURL": f"{BASE}/v1", "apiKey": "sk-unsloth-abc"}
+    assert provider["options"] == {"baseURL": f"{BASE}/v1", "apiKey": "sk-test-abc"}
     # Context limit must be declared, or OpenCode treats it as 0 and disables compaction.
     assert provider["models"] == {
         MODEL["id"]: {
@@ -4352,7 +2618,7 @@ def test_opencode_output_limit(window, max_tokens, expected):
     assert start.opencode_output_limit(window, max_tokens) == expected
 
 
-def test_opencode_max_tokens_sets_limit_and_raises_opencode_ceiling(fake_studio, tmp_path):
+def test_opencode_max_tokens_sets_limit_and_raises_opencode_ceiling(fake_vllm, tmp_path):
     result = CliRunner().invoke(
         start.start_app, ["opencode", "--no-launch", "--max-tokens", "65536"]
     )
@@ -4367,7 +2633,7 @@ def test_opencode_max_tokens_sets_limit_and_raises_opencode_ceiling(fake_studio,
 def test_opencode_limit_input_keeps_compaction_off_the_output_limit(tmp_path):
     # Without input, OpenCode compacts at context - output and a 65,536 limit compacts at half full.
     path = tmp_path / "opencode.json"
-    start.write_opencode_config(BASE, "sk-unsloth-abc", MODEL, path, max_tokens = 65536)
+    start.write_opencode_config(BASE, "sk-test-abc", MODEL, path, max_tokens = 65536)
     config = json.loads(path.read_text())
     limit = config["provider"][start._OPENCODE_PROVIDER]["models"][MODEL["id"]]["limit"]
     assert limit["input"] == limit["context"] == 131072
@@ -4392,9 +2658,9 @@ def test_opencode_compaction_reserved(window, expected_reserved, expected_compac
 def test_opencode_subagent_drops_the_compaction_a_normal_session_wrote(tmp_path):
     path = tmp_path / "opencode.json"
     small = {**MODEL, "context_length": 16_384}
-    start.write_opencode_config(BASE, "sk-unsloth-abc", small, path)
+    start.write_opencode_config(BASE, "sk-test-abc", small, path)
     assert json.loads(path.read_text())["compaction"] == {"auto": True, "reserved": 4_096}
-    start.write_opencode_config(BASE, "sk-unsloth-abc", small, path, as_subagent = True)
+    start.write_opencode_config(BASE, "sk-test-abc", small, path, as_subagent = True)
     assert "compaction" not in json.loads(path.read_text())
 
 
@@ -4403,7 +2669,7 @@ def test_opencode_max_tokens_without_a_window_warns(capsys):
     assert "--max-tokens is ignored" in capsys.readouterr().err
 
 
-def test_opencode_max_tokens_under_ceiling_leaves_opencode_env_alone(fake_studio, tmp_path):
+def test_opencode_max_tokens_under_ceiling_leaves_opencode_env_alone(fake_vllm, tmp_path):
     result = CliRunner().invoke(
         start.start_app, ["opencode", "--no-launch", "--max-tokens", "16000"]
     )
@@ -4414,7 +2680,7 @@ def test_opencode_max_tokens_under_ceiling_leaves_opencode_env_alone(fake_studio
     assert "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX" not in result.output
 
 
-def test_opencode_max_tokens_raises_a_smaller_inherited_ceiling(fake_studio, monkeypatch):
+def test_opencode_max_tokens_raises_a_smaller_inherited_ceiling(fake_vllm, monkeypatch):
     monkeypatch.setenv("OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX", "8000")
     result = CliRunner().invoke(
         start.start_app, ["opencode", "--no-launch", "--max-tokens", "16000"]
@@ -4423,7 +2689,7 @@ def test_opencode_max_tokens_raises_a_smaller_inherited_ceiling(fake_studio, mon
     _assert_env_set(result.output, "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX", "16000")
 
 
-def test_opencode_max_tokens_recipe_keeps_a_larger_inherited_ceiling(fake_studio, monkeypatch):
+def test_opencode_max_tokens_recipe_keeps_a_larger_inherited_ceiling(fake_vllm, monkeypatch):
     # The --no-launch recipe must carry the ceiling, or a shell without the export reverts to 32,000.
     monkeypatch.setenv("OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX", "100000")
     result = CliRunner().invoke(
@@ -4433,7 +2699,7 @@ def test_opencode_max_tokens_recipe_keeps_a_larger_inherited_ceiling(fake_studio
     _assert_env_set(result.output, "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX", "100000")
 
 
-def test_opencode_max_tokens_past_half_the_window_is_capped(fake_studio, tmp_path):
+def test_opencode_max_tokens_past_half_the_window_is_capped(fake_vllm, tmp_path):
     result = CliRunner().invoke(
         start.start_app, ["opencode", "--no-launch", "--max-tokens", "120000"]
     )
@@ -4455,7 +2721,7 @@ def test_write_opencode_config_preserves_and_idempotent(tmp_path):
             }
         )
     )
-    start.write_opencode_config(BASE, "sk-unsloth-abc", MODEL, path)
+    start.write_opencode_config(BASE, "sk-test-abc", MODEL, path)
     config = json.loads(path.read_text())
     assert config["theme"] == "tokyonight"
     # The overlay no longer edits disabled_providers; re-enabling agent-switch is done in
@@ -4464,17 +2730,17 @@ def test_write_opencode_config_preserves_and_idempotent(tmp_path):
     assert config["provider"]["anthropic"]["name"] == "Anthropic"
     assert config["provider"][start._OPENCODE_PROVIDER]["options"]["baseURL"] == f"{BASE}/v1"
     before = path.read_text()
-    start.write_opencode_config(BASE, "sk-unsloth-abc", MODEL, path)
+    start.write_opencode_config(BASE, "sk-test-abc", MODEL, path)
     assert path.read_text() == before
 
 
 def test_write_opencode_config_keeps_foreign_disabled_providers(tmp_path):
-    # A user who disabled other providers (but not unsloth) must keep them disabled:
+    # A user who disabled other providers (but not ours) must keep them disabled:
     # the overlay must not rewrite disabled_providers, or those providers get silently
     # re-enabled for the session.
     path = tmp_path / "opencode.json"
     path.write_text(json.dumps({"disabled_providers": ["openai", "gemini"]}))
-    start.write_opencode_config(BASE, "sk-unsloth-abc", MODEL, path)
+    start.write_opencode_config(BASE, "sk-test-abc", MODEL, path)
     config = json.loads(path.read_text())
     assert config["disabled_providers"] == ["openai", "gemini"]
 
@@ -4493,7 +2759,7 @@ def test_write_opencode_config_as_subagent_preserves_parent_model(tmp_path):
     local = {**MODEL, "id": MODEL["id"] + ":UD-Q4_K_XL"}
     start.write_opencode_config(
         BASE,
-        "sk-unsloth-abc",
+        "sk-test-abc",
         local,
         path,
         as_subagent = True,
@@ -4638,10 +2904,10 @@ def _opencode_inline_config(output: str) -> dict:
     raise AssertionError(f"{name} not found in:\n{output}")
 
 
-def test_opencode_inline_scopes_session_to_studio_provider(fake_studio):
+def test_opencode_inline_scopes_session_to_our_provider(fake_vllm):
     # opencode filters even config-defined providers through enabled/disabled_providers,
     # and a model pin does not bypass that gate. The inline overlay (session-only, highest
-    # layer, arrays replace) allowlists our provider and clears the denylist so the Unsloth
+    # layer, arrays replace) allowlists our provider and clears the denylist so the local
     # model always loads regardless of the user's config, without reading or editing it.
     result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
     assert result.exit_code == 0, result.output
@@ -4654,7 +2920,7 @@ def test_opencode_inline_scopes_session_to_studio_provider(fake_studio):
     assert inline["small_model"] == f"{start._OPENCODE_PROVIDER}/{MODEL['id']}"
 
 
-def test_opencode_passthrough_flags_omit_model_flag(fake_studio):
+def test_opencode_passthrough_flags_omit_model_flag(fake_vllm):
     # Any passthrough (top-level flags that may precede a subcommand, or a subcommand)
     # is left untouched; --model is not injected. The model is pinned by the inline
     # OPENCODE_CONFIG_CONTENT (highest layer) instead, so it is still forced.
@@ -4669,7 +2935,7 @@ def test_opencode_passthrough_flags_omit_model_flag(fake_studio):
     )
 
 
-def test_opencode_passthrough_subcommand_omits_model_flag(fake_studio):
+def test_opencode_passthrough_subcommand_omits_model_flag(fake_vllm):
     # A passthrough subcommand (e.g. `serve`) takes the model from the pinned config;
     # inserting --model before it would break opencode's arg parsing.
     result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", "serve"])
@@ -4680,7 +2946,7 @@ def test_opencode_passthrough_subcommand_omits_model_flag(fake_studio):
     assert "--model" not in command
 
 
-def test_connect_opencode_no_launch(fake_studio, tmp_path):
+def test_connect_opencode_no_launch(fake_vllm, tmp_path):
     result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
     assert result.exit_code == 0, result.output
     assert "opencode" in result.output
@@ -4690,7 +2956,7 @@ def test_connect_opencode_no_launch(fake_studio, tmp_path):
     inline_config = _opencode_inline_config(result.output)
     config = json.loads(config_path.read_text())
     provider = config["provider"][start._OPENCODE_PROVIDER]
-    assert provider["options"]["apiKey"] == "sk-unsloth-feedfacefeedface"
+    assert provider["options"]["apiKey"] == KEY
     assert config["model"] == f"{start._OPENCODE_PROVIDER}/{MODEL['id']}"
     # The session config file (a throwaway overlay, not the user's real config) does not
     # carry provider filters; the session scoping rides in the inline env layer only.
@@ -4705,10 +2971,9 @@ def test_connect_opencode_no_launch(fake_studio, tmp_path):
     # --no-launch prints an append-safe base command (no --model before a subcommand a
     # driver may append); the model is forced by the inline pin above.
     assert _launch_command(result.output) == ["opencode"]
-    assert not any(c[1].endswith("/api/inference/status") for c in fake_studio)
 
 
-def test_connect_opencode_v2_no_launch_uses_private_server(fake_studio, monkeypatch):
+def test_connect_opencode_v2_no_launch_uses_private_server(fake_vllm, monkeypatch):
     monkeypatch.setattr(start, "_opencode_command", lambda *_: ("opencode2", True))
 
     result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
@@ -4724,7 +2989,7 @@ def test_connect_opencode_v2_no_launch_uses_private_server(fake_studio, monkeypa
 
 
 def test_connect_opencode_v2_no_launch_uses_resolved_off_path_binary(
-    fake_studio, monkeypatch, tmp_path
+    fake_vllm, monkeypatch, tmp_path
 ):
     binary = tmp_path / ".opencode" / "bin" / "opencode2"
     monkeypatch.setattr(
@@ -4739,7 +3004,7 @@ def test_connect_opencode_v2_no_launch_uses_resolved_off_path_binary(
     assert _launch_command(result.output) == [str(binary), "--standalone"]
 
 
-def test_connect_opencode_v2_models_uses_private_server(fake_studio, monkeypatch):
+def test_connect_opencode_v2_models_uses_private_server(fake_vllm, monkeypatch):
     monkeypatch.setattr(start, "_opencode_command", lambda *_: ("opencode2", True))
 
     result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", "models"])
@@ -4748,7 +3013,7 @@ def test_connect_opencode_v2_models_uses_private_server(fake_studio, monkeypatch
     assert _launch_command(result.output) == ["opencode2", "models", "--standalone"]
 
 
-def test_connect_opencode_as_subagent_preserves_cloud_parent(fake_studio, tmp_path, monkeypatch):
+def test_connect_opencode_as_subagent_preserves_cloud_parent(fake_vllm, tmp_path, monkeypatch):
     monkeypatch.setattr(
         start, "_opencode_subagent_inline_config", lambda path, permission, **kwargs: {}
     )
@@ -4759,12 +3024,12 @@ def test_connect_opencode_as_subagent_preserves_cloud_parent(fake_studio, tmp_pa
             "--as-subagent",
             "--no-launch",
             "--model",
-            MODEL["id"] + ":UD-Q4_K_XL",
+            MODEL["id"],
         ],
     )
     assert result.exit_code == 0, result.output
     assert _launch_command(result.output) == ["opencode"]
-    expected_model = f"{start._OPENCODE_PROVIDER}/{MODEL['id']}:UD-Q4_K_XL"
+    expected_model = f"{start._OPENCODE_PROVIDER}/{MODEL['id']}"
     # The agent rides in the inline overlay; nothing else comes from the empty base.
     assert _opencode_inline_config(result.output) == {
         "agent": {
@@ -4786,7 +3051,7 @@ def test_connect_opencode_as_subagent_preserves_cloud_parent(fake_studio, tmp_pa
     assert "The local model is available as @local and in /models." in result.output
 
 
-def test_claude_subagent_allowed_tools_precede_forwarded_delimiter(fake_studio):
+def test_claude_subagent_allowed_tools_precede_forwarded_delimiter(fake_vllm):
     # A forwarded `--` makes everything after it positional; the tool pre-approval
     # must be parsed as an option, so it rides before ctx.args.
     result = CliRunner().invoke(
@@ -4799,7 +3064,7 @@ def test_claude_subagent_allowed_tools_precede_forwarded_delimiter(fake_studio):
     assert command.index(allowed) < command.index("--resume")
 
 
-def test_claude_subagent_forwards_positional_prompt(fake_studio):
+def test_claude_subagent_forwards_positional_prompt(fake_vllm):
     # --allowedTools is variadic: a detached value would consume the prompt.
     result = CliRunner().invoke(
         start.start_app,
@@ -4811,7 +3076,7 @@ def test_claude_subagent_forwards_positional_prompt(fake_studio):
     assert "--allowedTools" not in command
 
 
-def test_opencode_subagent_installs_binary_before_filter_inspection(fake_studio, monkeypatch):
+def test_opencode_subagent_installs_binary_before_filter_inspection(fake_vllm, monkeypatch):
     # The effective-config inspection needs the opencode binary; a first launch must
     # offer the install before building the overlay, or a global allowlist read only
     # after _launch installs OpenCode would filter out the new provider.
@@ -4844,25 +3109,25 @@ def test_opencode_subagent_installs_binary_before_filter_inspection(fake_studio,
     assert inspected["binary"] == "/usr/local/bin/opencode"
 
 
-def test_opencode_subagent_pins_agent_in_inline_overlay(fake_studio, monkeypatch):
+def test_opencode_subagent_pins_agent_in_inline_overlay(fake_vllm, monkeypatch):
     # A project opencode.json outranks the session file, so the agent must ride in
-    # OPENCODE_CONFIG_CONTENT where a repo's own agent.unsloth cannot field-merge over it.
+    # OPENCODE_CONFIG_CONTENT where a repo's own agent.local cannot field-merge over it.
     monkeypatch.setattr(
         start, "_opencode_subagent_inline_config", lambda path, permission, **kwargs: {}
     )
     result = CliRunner().invoke(
         start.start_app,
-        ["opencode", "--as-subagent", "--no-launch", "--model", MODEL["id"] + ":UD-Q4_K_XL"],
+        ["opencode", "--as-subagent", "--no-launch", "--model", MODEL["id"]],
     )
     assert result.exit_code == 0, result.output
     agent = _opencode_inline_config(result.output)["agent"]["local"]
     assert agent["mode"] == "subagent"
-    assert agent["model"] == f"{start._OPENCODE_PROVIDER}/{MODEL['id']}:UD-Q4_K_XL"
+    assert agent["model"] == f"{start._OPENCODE_PROVIDER}/{MODEL['id']}"
     assert agent["prompt"] == start._SUBAGENT_INSTRUCTIONS
     assert agent["description"] == start._SUBAGENT_DESCRIPTION
 
 
-def test_connect_opencode_subagent_yolo_no_launch_stays_append_safe(fake_studio, monkeypatch):
+def test_connect_opencode_subagent_yolo_no_launch_stays_append_safe(fake_vllm, monkeypatch):
     monkeypatch.setattr(start, "_opencode_supports_native_auto", lambda *_: True)
     captured = {}
 
@@ -4897,12 +3162,12 @@ def test_connect_opencode_subagent_yolo_no_launch_stays_append_safe(fake_studio,
 
 def test_write_pi_config_fresh(tmp_path):
     path = tmp_path / ".pi" / "agent" / "models.json"
-    start.write_pi_config(BASE, "sk-unsloth-abc", MODEL, path)
+    start.write_pi_config(BASE, "sk-test-abc", MODEL, path)
     config = json.loads(path.read_text())
     provider = config["providers"]["agent-switch"]
     assert provider["api"] == "openai-completions"
     assert provider["baseUrl"] == f"{BASE}/v1"
-    assert provider["apiKey"] == "sk-unsloth-abc"
+    assert provider["apiKey"] == "sk-test-abc"
     # Pin the loaded window (and a sane output cap) so Pi compacts instead of
     # overflowing; without it Pi assumes its 128000 default.
     assert provider["models"] == [
@@ -4914,12 +3179,12 @@ def test_write_pi_config_preserves_and_idempotent(tmp_path):
     path = tmp_path / ".pi" / "agent" / "models.json"
     path.parent.mkdir(parents = True)
     path.write_text(json.dumps({"providers": {"google": {"api": "gemini"}}}))
-    start.write_pi_config(BASE, "sk-unsloth-abc", MODEL, path)
+    start.write_pi_config(BASE, "sk-test-abc", MODEL, path)
     config = json.loads(path.read_text())
     assert config["providers"]["google"] == {"api": "gemini"}  # unrelated provider kept
     assert config["providers"]["agent-switch"]["baseUrl"] == f"{BASE}/v1"
     before = path.read_text()
-    start.write_pi_config(BASE, "sk-unsloth-abc", MODEL, path)
+    start.write_pi_config(BASE, "sk-test-abc", MODEL, path)
     assert path.read_text() == before
 
 
@@ -4933,7 +3198,7 @@ def _pi_user_agent_dir(tmp_path, monkeypatch) -> Path:
     return agent_dir
 
 
-def test_connect_pi_no_launch(fake_studio, tmp_path, monkeypatch):
+def test_connect_pi_no_launch(fake_vllm, tmp_path, monkeypatch):
     user_agent_dir = _pi_user_agent_dir(tmp_path, monkeypatch)
     (user_agent_dir / "extensions").mkdir()
     (user_agent_dir / "extensions" / "mine.ts").write_text("export default () => {};\n")
@@ -4949,11 +3214,10 @@ def test_connect_pi_no_launch(fake_studio, tmp_path, monkeypatch):
     # Provider/model pinned on the command (Pi defaults to google otherwise).
     assert f"pi --provider agent-switch --model {MODEL['id']}" in result.output
     config = json.loads((home / ".pi" / "agent" / "models.json").read_text())
-    assert config["providers"]["agent-switch"]["apiKey"] == "sk-unsloth-feedfacefeedface"
+    assert config["providers"]["agent-switch"]["apiKey"] == KEY
     assert config["providers"]["agent-switch"]["models"] == [
         {"id": MODEL["id"], "contextWindow": MODEL["context_length"], "maxTokens": 32000}
     ]
-    assert not any(c[1].endswith("/api/inference/status") for c in fake_studio)
     assert (home / ".pi" / "agent" / "extensions" / "mine.ts").is_file()
     settings = json.loads((home / ".pi" / "agent" / "settings.json").read_text())
     assert settings == {"packages": ["npm:pi-mine"]}
@@ -4995,7 +3259,7 @@ def test_write_pi_user_resources_links_resources_and_keeps_config_private(tmp_pa
     )
     session_home = tmp_path / "session"
     agent_dir = session_home / ".pi" / "agent"
-    start.write_pi_config(BASE, "sk-unsloth-abc", MODEL, agent_dir / "models.json")
+    start.write_pi_config(BASE, "sk-test-abc", MODEL, agent_dir / "models.json")
 
     start.write_pi_user_resources(agent_dir, session_home)
 
@@ -5375,13 +3639,13 @@ def test_remove_overlay_entry_rmdirs_a_windows_directory_symlink(tmp_path, monke
 
 
 @pytest.mark.parametrize("yolo", [False, True])
-def test_connect_pi_as_subagent_preserves_cloud_parent(fake_studio, tmp_path, yolo):
+def test_connect_pi_as_subagent_preserves_cloud_parent(fake_vllm, tmp_path, yolo):
     args = [
         "pi",
         "--as-subagent",
         "--no-launch",
         "--model",
-        MODEL["id"] + ":UD-Q4_K_XL",
+        MODEL["id"],
     ]
     if yolo:
         args.insert(2, "--yolo")
@@ -5399,15 +3663,15 @@ def test_connect_pi_as_subagent_preserves_cloud_parent(fake_studio, tmp_path, yo
     assert "PI_CODING_AGENT_DIR" not in result.output
     assert "export HOME=" not in result.output
     assert "AGENT_SWITCH_PI_SUBAGENT_API_KEY" not in result.output
-    assert "sk-unsloth-feedfacefeedface" not in result.output
+    assert KEY not in result.output
     config_path = tmp_path / "agents" / "pi-subagent" / "subagent.json"
     _assert_env_set(result.output, "AGENT_SWITCH_PI_SUBAGENT_CONFIG", str(config_path))
     assert json.loads(config_path.read_text()) == {
         "baseUrl": f"{BASE}/v1",
-        "apiKey": "sk-unsloth-feedfacefeedface",
-        "model": MODEL["id"] + ":UD-Q4_K_XL",
-        "contextWindow": 4096,
-        "maxTokens": 1024,
+        "apiKey": KEY,
+        "model": MODEL["id"],
+        "contextWindow": MODEL["context_length"],
+        "maxTokens": 32000,
         "approve": yolo,
     }
     assert "Ask Pi to spawn a local agent." in result.output
@@ -5422,7 +3686,7 @@ def _pi_generated_model(tmp_path, as_subagent):
 
 
 @pytest.mark.parametrize("as_subagent", [False, True])
-def test_connect_pi_output_limit(fake_studio, tmp_path, as_subagent):
+def test_connect_pi_output_limit(fake_vllm, tmp_path, as_subagent):
     args = ["pi", "--no-launch", "--max-tokens", "40000"]
     if as_subagent:
         args.append("--as-subagent")
@@ -5437,7 +3701,7 @@ def test_connect_pi_output_limit(fake_studio, tmp_path, as_subagent):
 
 
 @pytest.mark.parametrize("as_subagent", [False, True])
-def test_connect_pi_output_limit_capped_at_half_window(fake_studio, tmp_path, as_subagent):
+def test_connect_pi_output_limit_capped_at_half_window(fake_vllm, tmp_path, as_subagent):
     args = ["pi", "--no-launch", "--max-tokens", "200000"]
     if as_subagent:
         args.append("--as-subagent")
@@ -5448,7 +3712,7 @@ def test_connect_pi_output_limit_capped_at_half_window(fake_studio, tmp_path, as
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "abc"])
-def test_connect_pi_invalid_output_limit(fake_studio, tmp_path, value):
+def test_connect_pi_invalid_output_limit(fake_vllm, tmp_path, value):
     result = CliRunner().invoke(start.start_app, ["pi", "--no-launch", "--max-tokens", value])
     assert result.exit_code != 0
     assert "--max-tokens" in result.output
@@ -5467,13 +3731,13 @@ def test_write_pi_output_limit_context_metadata(tmp_path, context):
         assert "contextWindow" not in model
 
 
-def test_connect_pi_no_launch_windows_relocates_userprofile(fake_studio, tmp_path, monkeypatch):
+def test_connect_pi_no_launch_windows_relocates_userprofile(fake_vllm, tmp_path, monkeypatch):
     # On native Windows Node resolves ~/.pi via USERPROFILE, not HOME, so the session
     # must point USERPROFILE at the relocated home or Pi reads the user's real ~/.pi.
     user_home = _pi_user_agent_dir(tmp_path, monkeypatch).parent.parent
     # Avoid pathlib selecting WindowsPath on this POSIX runner.
     monkeypatch.setattr(start.Path, "home", lambda: user_home)
-    monkeypatch.setattr(start.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     result = CliRunner().invoke(start.start_app, ["pi", "--no-launch"])
     assert result.exit_code == 0, result.output
     home = tmp_path / "agents" / "pi"
@@ -5507,7 +3771,7 @@ def test_write_dsh_patch_fresh(dsh_patch):
     assert provider["api"] == "openai-completions"
     assert provider["baseURL"] == f"{BASE}/v1"
     assert provider["apiKeyEnv"] == "AGENT_SWITCH_API_KEY"
-    assert "sk-unsloth" not in dsh_patch.read_text()
+    assert "sk-test" not in dsh_patch.read_text()
     assert provider["compat"] == {"supportsDeveloperRole": False, "maxTokensField": "max_tokens"}
     assert provider["models"] == [
         {"id": MODEL["id"], "contextWindow": MODEL["context_length"], "maxTokens": 32000}
@@ -5521,8 +3785,8 @@ def test_write_dsh_patch_fresh(dsh_patch):
 @pytest.mark.parametrize("window, expected", [(32_768, 8_192), (143_616, 32_000)])
 def test_pi_and_dsh_output_limit_follows_the_context(tmp_path, window, expected):
     model = {**MODEL, "context_length": window}
-    start.write_pi_config(BASE, "sk-unsloth-abc", model, tmp_path / "models.json")
-    start.write_pi_subagent_config(BASE, "sk-unsloth-abc", model, tmp_path / "subagent.json")
+    start.write_pi_config(BASE, "sk-test-abc", model, tmp_path / "models.json")
+    start.write_pi_subagent_config(BASE, "sk-test-abc", model, tmp_path / "subagent.json")
     start.write_dsh_patch(BASE, model, tmp_path / "agent-switch.patch.yml")
     pi = json.loads((tmp_path / "models.json").read_text())["providers"]["agent-switch"]["models"][0]
     subagent = json.loads((tmp_path / "subagent.json").read_text())
@@ -5532,9 +3796,9 @@ def test_pi_and_dsh_output_limit_follows_the_context(tmp_path, window, expected)
 
 
 def test_write_dsh_patch_without_window_omits_limits(dsh_patch):
-    start.write_dsh_patch(BASE, {"id": "unsloth/unknown-window"}, dsh_patch)
+    start.write_dsh_patch(BASE, {"id": "org/unknown-window"}, dsh_patch)
     provider = _dsh_entries(dsh_patch)["llm-pi-ai"]["config"]["providers"]["agent-switch"]
-    assert provider["models"] == [{"id": "unsloth/unknown-window"}]
+    assert provider["models"] == [{"id": "org/unknown-window"}]
 
 
 def test_write_dsh_patch_is_idempotent_and_follows_the_server(dsh_patch, capsys):
@@ -5605,11 +3869,11 @@ def test_dsh_command_places_the_patch_where_dsh_parses_it(args, expected):
     assert start._dsh_command(args, "P") == expected
 
 
-def test_connect_dsh_no_launch(fake_studio, tmp_path):
+def test_connect_dsh_no_launch(fake_vllm, tmp_path):
     yaml = pytest.importorskip("yaml")
     result = CliRunner().invoke(start.start_app, ["dsh", "--no-launch"])
     assert result.exit_code == 0, result.output
-    _assert_env_set(result.output, "AGENT_SWITCH_API_KEY", "sk-unsloth-feedfacefeedface")
+    _assert_env_set(result.output, "AGENT_SWITCH_API_KEY", KEY)
     home = tmp_path / "agents" / "dsh"
     _assert_env_set(result.output, "DSH_HOME", str(home))
     _assert_env_set(result.output, "DSH_TELEMETRY_DISABLED", "1")
@@ -5626,7 +3890,7 @@ def test_connect_dsh_no_launch(fake_studio, tmp_path):
 
 
 @pytest.mark.skipif(os.name == "nt", reason = "WSL scenario")
-def test_dsh_under_wsl_gets_the_windows_patch_path(fake_studio, monkeypatch):
+def test_dsh_under_wsl_gets_the_windows_patch_path(fake_vllm, monkeypatch):
     # WSLENV translates DSH_HOME for a Windows dsh, but a path on the command line reaches
     # the Windows Node process verbatim, where a Linux path does not open.
     windows_path = r"\\wsl.localhost\Ubuntu\tmp\agent-switch.patch.yml"
@@ -5640,13 +3904,13 @@ def test_dsh_under_wsl_gets_the_windows_patch_path(fake_studio, monkeypatch):
     assert command[command.index("--patch") + 1] == windows_path, command
 
 
-def test_dsh_yolo_sets_permission_mode(fake_studio):
+def test_dsh_yolo_sets_permission_mode(fake_vllm):
     result = CliRunner().invoke(start.start_app, ["dsh", "--yolo", "--no-launch"])
     assert result.exit_code == 0, result.output
     _assert_env_set(result.output, "DSH_PERMISSION_MODE", "danger-full-access")
 
 
-def test_dsh_without_yolo_pins_the_safe_permission_mode(fake_studio):
+def test_dsh_without_yolo_pins_the_safe_permission_mode(fake_vllm):
     result = CliRunner().invoke(start.start_app, ["dsh", "--no-launch"])
     assert result.exit_code == 0, result.output
     _assert_env_set(result.output, "DSH_PERMISSION_MODE", "workspace-write")
@@ -5660,7 +3924,7 @@ def test_dsh_without_yolo_pins_the_safe_permission_mode(fake_studio):
     ],
 )
 def test_dsh_permission_mode_overrides_an_inherited_bypass(
-    argv, expected, fake_studio, monkeypatch
+    argv, expected, fake_vllm, monkeypatch
 ):
     # dsh reads DSH_PERMISSION_MODE with ??, so merely omitting it would let a
     # danger-full-access exported in the parent shell survive a run without --yolo.
@@ -5671,12 +3935,11 @@ def test_dsh_permission_mode_overrides_an_inherited_bypass(
     assert captured["env"]["DSH_PERMISSION_MODE"] == expected
 
 
-def test_start_dsh_forwards_reasoning_effort(fake_studio, monkeypatch):
+def test_start_dsh_forwards_reasoning_effort(fake_vllm, monkeypatch):
     # --reasoning-effort is a shared option: it must reach the dsh config rather than
     # pass through to `dsh web`, which does not accept it.
     yaml = pytest.importorskip("yaml")
     captured = {}
-    monkeypatch.setattr(start, "_managed_node_tools", lambda: None)
     monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/dsh")
     monkeypatch.setattr(start, "is_deepseek_harness_executable", lambda _: True)
 
@@ -5748,8 +4011,8 @@ def test_powershell_quote_single_quotes_json():
     # Bare flags/paths pass through; JSON payloads get single-quoted so PowerShell
     # keeps the embedded double quotes literal (list2cmdline's backslashes would not).
     assert start._powershell_quote("--settings") == "--settings"
-    assert start._powershell_quote("unsloth/gemma-4-26B") == "unsloth/gemma-4-26B"
-    overlay = start._claude_settings_overlay("unsloth/gemma-4-26B")
+    assert start._powershell_quote("org/gemma-4-26B") == "org/gemma-4-26B"
+    overlay = start._claude_settings_overlay("org/gemma-4-26B")
     quoted = start._powershell_quote(overlay)
     assert quoted == "'" + overlay + "'"
     assert "\\" not in quoted  # no cmd.exe backslash escaping
@@ -5767,14 +4030,14 @@ _NATIVE_YOLO = {
 
 
 @pytest.mark.parametrize("agent, native", sorted(_NATIVE_YOLO.items()))
-def test_yolo_routes_to_native_flag(fake_studio, agent, native):
+def test_yolo_routes_to_native_flag(fake_vllm, agent, native):
     result = CliRunner().invoke(start.start_app, [agent, "--yolo", "--no-launch"])
     assert result.exit_code == 0, result.output
     assert native in result.output
 
 
 @pytest.mark.parametrize("agent, native", sorted(_NATIVE_YOLO.items()))
-def test_no_yolo_omits_native_flag(fake_studio, agent, native):
+def test_no_yolo_omits_native_flag(fake_vllm, agent, native):
     result = CliRunner().invoke(start.start_app, [agent, "--no-launch"])
     assert result.exit_code == 0, result.output
     # pi's --approve is a real flag only added under --yolo; assert it's absent here.
@@ -5787,7 +4050,7 @@ def test_no_yolo_omits_native_flag(fake_studio, agent, native):
     "alias",
     ["--yolo", "--dangerously-skip-permissions", "--dangerously-bypass-approvals-and-sandbox"],
 )
-def test_yolo_aliases_are_interchangeable(fake_studio, alias):
+def test_yolo_aliases_are_interchangeable(fake_vllm, alias):
     # Any spelling on any agent routes to that agent's own flag, even the "wrong" one.
     claude = CliRunner().invoke(start.start_app, ["claude", alias, "--no-launch"])
     assert claude.exit_code == 0, claude.output
@@ -5809,7 +4072,7 @@ def test_yolo_aliases_are_interchangeable(fake_studio, alias):
     assert "permission" not in _opencode_inline_config(opencode.output)
 
 
-def test_yolo_opencode_bare_no_launch_uses_permission_fallback(fake_studio, tmp_path):
+def test_yolo_opencode_bare_no_launch_uses_permission_fallback(fake_vllm, tmp_path):
     # A bare --no-launch recipe stays append-safe (callers add a subcommand later);
     # `opencode --auto run ...` would select the TUI, not `run`, so keep the config fallback.
     result = CliRunner().invoke(start.start_app, ["opencode", "--yolo", "--no-launch"])
@@ -5823,7 +4086,7 @@ def test_yolo_opencode_bare_no_launch_uses_permission_fallback(fake_studio, tmp_
     }
 
 
-def test_yolo_opencode_run_uses_native_auto(fake_studio):
+def test_yolo_opencode_run_uses_native_auto(fake_vllm):
     result = CliRunner().invoke(
         start.start_app,
         ["opencode", "--yolo", "--no-launch", "run", "hello"],
@@ -5834,7 +4097,7 @@ def test_yolo_opencode_run_uses_native_auto(fake_studio):
     assert "permission" not in _opencode_inline_config(result.output)
 
 
-def test_yolo_opencode_v2_run_uses_standalone_and_native_auto(fake_studio, monkeypatch):
+def test_yolo_opencode_v2_run_uses_standalone_and_native_auto(fake_vllm, monkeypatch):
     monkeypatch.setattr(start, "_opencode_command", lambda *_: ("opencode2", True))
 
     result = CliRunner().invoke(
@@ -5853,7 +4116,7 @@ def test_yolo_opencode_v2_run_uses_standalone_and_native_auto(fake_studio, monke
     assert "permission" not in _opencode_inline_config(result.output)
 
 
-def test_yolo_opencode_v2_mini_uses_permission_fallback(fake_studio, monkeypatch):
+def test_yolo_opencode_v2_mini_uses_permission_fallback(fake_vllm, monkeypatch):
     monkeypatch.setattr(start, "_opencode_command", lambda *_: ("opencode2", True))
 
     result = CliRunner().invoke(
@@ -5866,7 +4129,7 @@ def test_yolo_opencode_v2_mini_uses_permission_fallback(fake_studio, monkeypatch
     assert _opencode_inline_config(result.output)["permission"]["edit"] == "allow"
 
 
-def test_yolo_opencode_tui_resume_uses_native_auto(fake_studio):
+def test_yolo_opencode_tui_resume_uses_native_auto(fake_vllm):
     result = CliRunner().invoke(
         start.start_app,
         ["opencode", "--yolo", "--no-launch", "--session", "sid"],
@@ -5877,7 +4140,7 @@ def test_yolo_opencode_tui_resume_uses_native_auto(fake_studio):
     assert "permission" not in _opencode_inline_config(result.output)
 
 
-def test_no_yolo_opencode_run_omits_native_auto(fake_studio):
+def test_no_yolo_opencode_run_omits_native_auto(fake_vllm):
     result = CliRunner().invoke(
         start.start_app,
         ["opencode", "--no-launch", "run", "hello"],
@@ -5887,7 +4150,7 @@ def test_no_yolo_opencode_run_omits_native_auto(fake_studio):
     assert "permission" not in _opencode_inline_config(result.output)
 
 
-def test_yolo_opencode_bare_launch_uses_native_auto(fake_studio, monkeypatch):
+def test_yolo_opencode_bare_launch_uses_native_auto(fake_vllm, monkeypatch):
     monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/opencode")
     monkeypatch.setattr(start, "_opencode_supports_native_auto", lambda *_: True)
     captured = _capture_launch(monkeypatch, ["opencode", "--yolo"])
@@ -5899,7 +4162,7 @@ def test_yolo_opencode_bare_launch_uses_native_auto(fake_studio, monkeypatch):
     assert "permission" not in json.loads(captured["env"]["OPENCODE_CONFIG_CONTENT"])
 
 
-def test_yolo_opencode_v2_bare_launch_omits_root_model(fake_studio, monkeypatch):
+def test_yolo_opencode_v2_bare_launch_omits_root_model(fake_vllm, monkeypatch):
     monkeypatch.setattr(start, "_opencode_command", lambda *_: ("opencode2", True))
     monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/opencode2")
     captured = _capture_launch(monkeypatch, ["opencode", "--yolo"])
@@ -5909,7 +4172,7 @@ def test_yolo_opencode_v2_bare_launch_omits_root_model(fake_studio, monkeypatch)
     assert "--model" not in captured["command"]
 
 
-def test_yolo_opencode_native_auto_clears_prior_config_fallback(fake_studio, tmp_path):
+def test_yolo_opencode_native_auto_clears_prior_config_fallback(fake_vllm, tmp_path):
     fallback = CliRunner().invoke(
         start.start_app,
         ["opencode", "--yolo", "--no-launch"],
@@ -5952,7 +4215,7 @@ def test_opencode_native_auto_assumes_current_without_local_binary(monkeypatch):
     assert start._opencode_supports_native_auto() is True
 
 
-def test_yolo_opencode_old_version_uses_config_fallback(fake_studio, monkeypatch):
+def test_yolo_opencode_old_version_uses_config_fallback(fake_vllm, monkeypatch):
     monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/opencode")
     monkeypatch.setattr(start.subprocess, "check_output", lambda *args, **kwargs: "1.17.11")
     result = CliRunner().invoke(
@@ -5997,7 +4260,7 @@ def test_opencode_native_auto_args(args, expected, native):
     assert start._opencode_native_auto_args(args, False) == (args, False)
 
 
-def test_yolo_opencode_non_agent_subcommand_uses_config_fallback(fake_studio):
+def test_yolo_opencode_non_agent_subcommand_uses_config_fallback(fake_vllm):
     result = CliRunner().invoke(
         start.start_app,
         ["opencode", "--yolo", "--no-launch", "serve"],
@@ -6014,7 +4277,7 @@ def test_yolo_opencode_non_agent_subcommand_uses_config_fallback(fake_studio):
 
 
 @pytest.mark.parametrize("passthrough", (["generate"], ["console", "login"], ["--mini"]))
-def test_yolo_opencode_no_auto_command_uses_config_fallback(fake_studio, passthrough):
+def test_yolo_opencode_no_auto_command_uses_config_fallback(fake_vllm, passthrough):
     # generate/console are hidden and reject --auto, --mini ignores it: none get --auto,
     # all keep the config permission fallback.
     result = CliRunner().invoke(
@@ -6031,7 +4294,7 @@ def test_yolo_opencode_no_auto_command_uses_config_fallback(fake_studio, passthr
     }
 
 
-def test_no_yolo_opencode_has_no_permission_block(fake_studio, tmp_path):
+def test_no_yolo_opencode_has_no_permission_block(fake_vllm, tmp_path):
     result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
     assert result.exit_code == 0, result.output
     config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
@@ -6040,7 +4303,7 @@ def test_no_yolo_opencode_has_no_permission_block(fake_studio, tmp_path):
     assert "permission" not in config
 
 
-def test_no_yolo_opencode_flips_prior_yolo_allow_to_ask(fake_studio, tmp_path):
+def test_no_yolo_opencode_flips_prior_yolo_allow_to_ask(fake_vllm, tmp_path):
     # The core reset: a --yolo run wrote explicit per-tool allow; a later non-yolo run
     # must flip exactly those back to ask so nothing stays auto-approved.
     yolo = CliRunner().invoke(start.start_app, ["opencode", "--yolo", "--no-launch"])
@@ -6064,7 +4327,7 @@ def test_no_yolo_opencode_flips_prior_yolo_allow_to_ask(fake_studio, tmp_path):
 
 def test_write_opencode_config_yolo_unit(tmp_path):
     path = tmp_path / "opencode.json"
-    start.write_opencode_config(BASE, "sk-unsloth-abc", MODEL, path, yolo = True)
+    start.write_opencode_config(BASE, "sk-test-abc", MODEL, path, yolo = True)
     config = json.loads(path.read_text())
     assert config["permission"] == {
         "edit": "allow",
@@ -6074,7 +4337,7 @@ def test_write_opencode_config_yolo_unit(tmp_path):
     }
 
 
-def test_no_launch_rerun_clears_stale_opencode_yolo_permissions(fake_studio, tmp_path):
+def test_no_launch_rerun_clears_stale_opencode_yolo_permissions(fake_vllm, tmp_path):
     # The no-launch config dir is reused across runs, so a --yolo run persists its
     # auto-approve settings; a later run without --yolo must strip them, not leave
     # tool execution silently pre-approved.
@@ -6099,8 +4362,8 @@ def test_no_launch_rerun_clears_stale_opencode_yolo_permissions(fake_studio, tmp
 
 def test_write_opencode_config_yolo_then_plain_unit(tmp_path):
     path = tmp_path / "opencode.json"
-    start.write_opencode_config(BASE, "sk-unsloth-abc", MODEL, path, yolo = True)
-    start.write_opencode_config(BASE, "sk-unsloth-abc", MODEL, path, yolo = False)
+    start.write_opencode_config(BASE, "sk-test-abc", MODEL, path, yolo = True)
+    start.write_opencode_config(BASE, "sk-test-abc", MODEL, path, yolo = False)
     config = json.loads(path.read_text())
     # A plain rerun replaces the yolo allow policy with a prompting one.
     assert config["permission"] == {
@@ -6116,7 +4379,7 @@ def test_opencode_non_yolo_flips_only_explicit_allow(tmp_path):
     # deny/ask a user set is kept, and an absent tool is not added.
     path = tmp_path / "opencode.json"
     path.write_text(json.dumps({"permission": {"edit": "allow", "bash": "deny", "read": "ask"}}))
-    session = start.write_opencode_config(BASE, "sk-unsloth-abc", MODEL, path, yolo = False)
+    session = start.write_opencode_config(BASE, "sk-test-abc", MODEL, path, yolo = False)
     config = json.loads(path.read_text())
     assert config["permission"] == {"edit": "ask", "bash": "deny", "read": "ask"}
     assert session == {}  # a non-yolo session carries no permission inline
@@ -6126,7 +4389,7 @@ def test_opencode_subagent_non_yolo_clears_yolo_task_permission(tmp_path):
     path = tmp_path / "opencode.json"
     start.write_opencode_config(
         BASE,
-        "sk-unsloth-abc",
+        "sk-test-abc",
         MODEL,
         path,
         yolo = True,
@@ -6134,7 +4397,7 @@ def test_opencode_subagent_non_yolo_clears_yolo_task_permission(tmp_path):
     )
     start.write_opencode_config(
         BASE,
-        "sk-unsloth-abc",
+        "sk-test-abc",
         MODEL,
         path,
         as_subagent = True,
@@ -6148,7 +4411,7 @@ def test_opencode_non_yolo_leaves_string_permission(tmp_path):
     # carry no inline override.
     path = tmp_path / "opencode.json"
     path.write_text(json.dumps({"permission": "deny"}))
-    session = start.write_opencode_config(BASE, "sk-unsloth-abc", MODEL, path, yolo = False)
+    session = start.write_opencode_config(BASE, "sk-test-abc", MODEL, path, yolo = False)
     assert json.loads(path.read_text())["permission"] == "deny"
     assert session == {}
 
@@ -6159,7 +4422,7 @@ def test_opencode_non_yolo_leaves_catch_all_and_flips_explicit_allow(tmp_path):
     # flipped to "ask", but an absent tool inheriting the catch-all is not touched.
     path = tmp_path / "opencode.json"
     path.write_text(json.dumps({"permission": {"*": "allow", "bash": "allow"}}))
-    session = start.write_opencode_config(BASE, "sk-unsloth-abc", MODEL, path, yolo = False)
+    session = start.write_opencode_config(BASE, "sk-test-abc", MODEL, path, yolo = False)
     assert json.loads(path.read_text())["permission"] == {"*": "allow", "bash": "ask"}
     assert session == {}
 
@@ -6170,7 +4433,7 @@ def test_opencode_non_yolo_leaves_granular_object(tmp_path):
     path = tmp_path / "opencode.json"
     obj = {"read *": "deny", "git *": "ask"}
     path.write_text(json.dumps({"permission": {"bash": dict(obj)}}))
-    session = start.write_opencode_config(BASE, "sk-unsloth-abc", MODEL, path, yolo = False)
+    session = start.write_opencode_config(BASE, "sk-test-abc", MODEL, path, yolo = False)
     assert json.loads(path.read_text())["permission"]["bash"] == obj
     assert session == {}
 
@@ -6182,7 +4445,7 @@ def test_yolo_command_flags_unmapped_agent_is_empty():
     assert start._yolo_command_flags("claude", False) == []
 
 
-def test_yolo_config_fallbacks_add_no_legacy_command_flag(fake_studio):
+def test_yolo_config_fallbacks_add_no_legacy_command_flag(fake_vllm):
     # OpenCode's append-safe bare recipe uses its config fallback, so it must not leak a legacy
     # yolo/dangerous alias onto argv.
     for agent in ("opencode",):
@@ -6193,7 +4456,7 @@ def test_yolo_config_fallbacks_add_no_legacy_command_flag(fake_studio):
         assert not any("--yolo" in arg or "--dangerous" in arg for arg in command)
 
 
-def test_pi_launch_clears_screen_first(fake_studio, monkeypatch):
+def test_pi_launch_clears_screen_first(fake_vllm, monkeypatch):
     # Pi paints inline from the current cursor position (no alternate screen, no
     # clear on its first render), so the launcher hands it a clean screen. The
     # clear must come BEFORE the exec, and only on the launch path.
@@ -6211,7 +4474,7 @@ def test_pi_launch_clears_screen_first(fake_studio, monkeypatch):
     assert calls == ["clear", "exec"]
 
 
-def test_pi_no_launch_does_not_clear(fake_studio, monkeypatch):
+def test_pi_no_launch_does_not_clear(fake_vllm, monkeypatch):
     # The --no-launch recipe is meant to be read (and piped); never wipe it.
     calls = []
     monkeypatch.setattr(start.click, "clear", lambda: calls.append("clear"))
@@ -6220,7 +4483,7 @@ def test_pi_no_launch_does_not_clear(fake_studio, monkeypatch):
     assert calls == []
 
 
-def test_claude_launch_does_not_clear(fake_studio, monkeypatch):
+def test_claude_launch_does_not_clear(fake_vllm, monkeypatch):
     # Alternate-screen agents manage the terminal themselves; leave it alone.
     calls = []
     monkeypatch.setattr(start.click, "clear", lambda: calls.append("clear"))
@@ -6237,7 +4500,7 @@ def test_claude_launch_does_not_clear(fake_studio, monkeypatch):
     reason = "WSL-from-Linux scenario: a Windows pi shim under /mnt called from WSL "
     "(os.name is 'posix' under WSL), so this can't run on a native Windows runner.",
 )
-def test_connect_pi_wsl_windows_shim_relocates_userprofile(fake_studio, monkeypatch):
+def test_connect_pi_wsl_windows_shim_relocates_userprofile(fake_vllm, monkeypatch):
     captured = {}
     monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
     monkeypatch.setattr(start.shutil, "which", lambda _: "/mnt/c/Users/x/AppData/Roaming/npm/pi")
@@ -6258,7 +4521,7 @@ def test_connect_pi_wsl_windows_shim_relocates_userprofile(fake_studio, monkeypa
     assert "USERPROFILE/p" in wslenv
 
 
-def test_session_config_no_launch_preserves_existing_state(fake_studio, tmp_path):
+def test_session_config_no_launch_preserves_existing_state(fake_vllm, tmp_path):
     # A previously printed recipe may still be running an agent whose sessions
     # or sqlite state live in the stable home; a re-run must not wipe it.
     with start._session_config("codex", launch = False) as home:
@@ -6272,7 +4535,7 @@ def test_session_config_no_launch_preserves_existing_state(fake_studio, tmp_path
 
 # ── --persist: persist the agent session so it can be resumed ────────────────
 def test_session_config_persist_uses_stable_dir_and_survives(monkeypatch, tmp_path):
-    # --persist routes a launch to the stable Unsloth agents dir (the one --no-launch
+    # --persist routes a launch to the stable agent-switch agents dir (the one --no-launch
     # already uses) instead of a throwaway temp dir, and never wipes it on exit.
     monkeypatch.setattr(start, "_agents_config_root", lambda: tmp_path / "agents")
     with start._session_config("codex", launch = True, persist = True) as home:
@@ -6376,7 +4639,7 @@ def test_windows_codex_homes_use_the_short_parent(monkeypatch, tmp_path, agent):
     assert start._ephemeral_session_prefix(agent, parent) == "a-codex-"
 
 
-def test_non_codex_agents_keep_the_studio_private_root(monkeypatch, tmp_path):
+def test_non_codex_agents_keep_the_agent_switch_root(monkeypatch, tmp_path):
     monkeypatch.setattr(start.os, "name", "nt")
     monkeypatch.setattr(start.Path, "home", staticmethod(lambda: tmp_path))
 
@@ -6401,29 +4664,7 @@ def test_session_config_falls_back_when_existing_temp_root_is_unwritable(monkeyp
     assert not home.exists()
 
 
-def test_augment_path_keeps_managed_node_without_a_home(monkeypatch, tmp_path):
-    # No home, but the managed Node still backs Node shims, so it must stay on PATH.
-    managed_bin = tmp_path / "node" / "bin"
-    managed_bin.mkdir(parents = True)
-    monkeypatch.setattr(
-        start,
-        "_managed_node_tools",
-        lambda: (managed_bin / "node", managed_bin / "npm", True),
-    )
-    monkeypatch.setattr(
-        start.Path,
-        "home",
-        staticmethod(lambda: (_ for _ in ()).throw(RuntimeError("no home directory"))),
-    )
-    monkeypatch.setenv("PATH", "/usr/bin")
-
-    start._augment_path_with_install_dirs()
-
-    assert os.environ["PATH"].split(os.pathsep)[0] == str(managed_bin)
-
-
 def test_augment_path_leaves_path_alone_when_nothing_to_add(monkeypatch):
-    monkeypatch.setattr(start, "_managed_node_tools", lambda: None)
     monkeypatch.setattr(
         start.Path,
         "home",
@@ -6437,25 +4678,21 @@ def test_augment_path_leaves_path_alone_when_nothing_to_add(monkeypatch):
 
 
 def test_probe_env_carries_install_dirs_and_restores_path(monkeypatch, tmp_path):
-    # A shim resolved via Unsloth's managed Node needs that node on PATH when it runs.
-    managed_bin = tmp_path / "node" / "bin"
-    managed_bin.mkdir(parents = True)
-    monkeypatch.setattr(
-        start,
-        "_managed_node_tools",
-        lambda: (managed_bin / "node", managed_bin / "npm", True),
-    )
+    # A Node-backed shim whose node sits in an install dir needs that dir on PATH when it runs.
+    local_bin = tmp_path / ".local" / "bin"
+    local_bin.mkdir(parents = True)
+    monkeypatch.setattr(start.Path, "home", lambda: tmp_path)
     before = os.environ.get("PATH")
 
     env = start._probe_env(OPENCODE_CONFIG = "/tmp/cfg.json")
 
-    assert str(managed_bin) in env["PATH"]
+    assert str(local_bin) in env["PATH"]
     assert env["OPENCODE_CONFIG"] == "/tmp/cfg.json"
     assert os.environ.get("PATH") == before
 
 
-def test_session_config_falls_back_when_studio_auth_root_is_unwritable(monkeypatch, tmp_path):
-    # Attaching to a remote Unsloth needs no local auth tree, so a read-only one must not stop it.
+def test_session_config_falls_back_when_the_agents_root_is_unwritable(monkeypatch, tmp_path):
+    # A read-only agent-switch home must not stop a launch.
     readonly = tmp_path / "readonly"
     readonly.mkdir(mode = 0o500)
     monkeypatch.setattr(start, "_agents_config_root", lambda: readonly / "agents")
@@ -6467,7 +4704,7 @@ def test_session_config_falls_back_when_studio_auth_root_is_unwritable(monkeypat
 
 
 def test_session_config_reclaims_abandoned_homes_for_non_codex_agents(monkeypatch, tmp_path):
-    # Nothing else prunes Unsloth's auth tree, so a killed wrapper's home must be reclaimed.
+    # Nothing else prunes the agents tree, so a killed wrapper's home must be reclaimed.
     agents_root = tmp_path / "agents"
     temp_root = agents_root / ".tmp"
     temp_root.mkdir(parents = True)
@@ -6519,7 +4756,6 @@ _RESUME_ENV_VAR = {
 
 def _capture_launch(monkeypatch, argv):
     captured = {}
-    monkeypatch.setattr(start, "_managed_node_tools", lambda: None)
 
     def run(
         command,
@@ -6537,7 +4773,7 @@ def _capture_launch(monkeypatch, argv):
 
 
 @pytest.mark.parametrize("agent", sorted(_RESUME_ENV_VAR))
-def test_resume_persists_agent_home_to_stable_dir(agent, fake_studio, tmp_path, monkeypatch):
+def test_resume_persists_agent_home_to_stable_dir(agent, fake_vllm, tmp_path, monkeypatch):
     monkeypatch.setattr(start.shutil, "which", lambda _: f"/usr/local/bin/{agent}")
     if agent == "dsh":
         monkeypatch.setattr(start, "is_deepseek_harness_executable", lambda _: True)
@@ -6549,7 +4785,7 @@ def test_resume_persists_agent_home_to_stable_dir(agent, fake_studio, tmp_path, 
 
 
 @pytest.mark.parametrize("agent", sorted(_RESUME_ENV_VAR))
-def test_default_launch_home_is_ephemeral(agent, fake_studio, tmp_path, monkeypatch):
+def test_default_launch_home_is_ephemeral(agent, fake_vllm, tmp_path, monkeypatch):
     monkeypatch.setattr(start.shutil, "which", lambda _: f"/usr/local/bin/{agent}")
     if agent == "dsh":
         monkeypatch.setattr(start, "is_deepseek_harness_executable", lambda _: True)
@@ -6561,7 +4797,7 @@ def test_default_launch_home_is_ephemeral(agent, fake_studio, tmp_path, monkeypa
         assert Path(home).parent == tmp_path / "agents" / ".tmp"
 
 
-def test_resume_opencode_config_in_stable_dir(fake_studio, tmp_path, monkeypatch):
+def test_resume_opencode_config_in_stable_dir(fake_vllm, tmp_path, monkeypatch):
     # opencode's session data lives in ~/.local/share/opencode (never relocated), so
     # resume already survives exit; --persist also stabilizes its config overlay dir.
     monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/opencode")
@@ -6571,10 +4807,10 @@ def test_resume_opencode_config_in_stable_dir(fake_studio, tmp_path, monkeypatch
     assert stable.exists()
 
 
-def test_persist_bare_codex_launch_has_no_resume_token(fake_studio, monkeypatch):
+def test_persist_bare_codex_launch_has_no_resume_token(fake_vllm, monkeypatch):
     # A bare `--persist` only persists the session dir; it must NOT auto-append a native
     # resume token, or the very first launch (no session yet) would send codex down its
-    # no-session error path. The user resumes explicitly: `unsloth start codex --persist resume`.
+    # no-session error path. The user resumes explicitly: `agent-switch codex --persist resume`.
     monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/codex")
     captured = _capture_launch(monkeypatch, ["codex", "--persist"])
     assert "resume" not in captured["command"]
@@ -6582,14 +4818,14 @@ def test_persist_bare_codex_launch_has_no_resume_token(fake_studio, monkeypatch)
     assert captured["command"][1:] == ["--oss", "--profile", start._CODEX_PROFILE]
 
 
-def test_persist_bare_opencode_launch_has_no_resume_token(fake_studio, monkeypatch):
+def test_persist_bare_opencode_launch_has_no_resume_token(fake_vllm, monkeypatch):
     monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/opencode")
     captured = _capture_launch(monkeypatch, ["opencode", "--persist"])
     assert "--continue" not in captured["command"]
     assert captured["command"][1:] == ["--model", f"{start._OPENCODE_PROVIDER}/{MODEL['id']}"]
 
 
-def test_persist_bare_claude_launch_has_no_resume_token(fake_studio, monkeypatch):
+def test_persist_bare_claude_launch_has_no_resume_token(fake_vllm, monkeypatch):
     monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/claude")
     monkeypatch.setattr(start, "_claude_flags", lambda *a, **k: [])
     captured = _capture_launch(monkeypatch, ["claude", "--persist"])
@@ -6597,7 +4833,7 @@ def test_persist_bare_claude_launch_has_no_resume_token(fake_studio, monkeypatch
     assert captured["command"][1:] == ["--model", MODEL["id"]]
 
 
-def test_resume_with_passthrough_does_not_auto_append(fake_studio, monkeypatch):
+def test_resume_with_passthrough_does_not_auto_append(fake_vllm, monkeypatch):
     # When the caller drives their own subcommand, --persist only persists the dir; it
     # must not inject a resume token that would collide with the user's command.
     monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/codex")
@@ -6606,13 +4842,13 @@ def test_resume_with_passthrough_does_not_auto_append(fake_studio, monkeypatch):
     assert captured["command"][-2:] == ["exec", "hello"]
 
 
-def test_default_launch_has_no_resume_token(fake_studio, monkeypatch):
+def test_default_launch_has_no_resume_token(fake_vllm, monkeypatch):
     monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/codex")
     captured = _capture_launch(monkeypatch, ["codex"])
     assert "resume" not in captured["command"]
 
 
-def test_resume_persist_only_agents_have_no_resume_token(fake_studio, monkeypatch):
+def test_resume_persist_only_agents_have_no_resume_token(fake_vllm, monkeypatch):
     # Persistence alone must not select a session.
     for agent in ("dsh",):
         monkeypatch.setattr(start.shutil, "which", lambda _, a = agent: f"/usr/local/bin/{a}")
@@ -6623,1568 +4859,25 @@ def test_resume_persist_only_agents_have_no_resume_token(fake_studio, monkeypatc
         assert "--continue" not in captured["command"]
 
 
-def test_native_resume_flag_passes_through_unchanged(fake_studio, monkeypatch):
+def test_native_resume_flag_passes_through_unchanged(fake_vllm, monkeypatch):
     # The persistence flag is --persist, NOT --resume, so an agent's own
-    # `--resume <id>` (e.g. `unsloth start claude --resume <guid>`) still flows
-    # through to the agent verbatim and is not swallowed as an Unsloth option.
+    # `--resume <id>` (e.g. `agent-switch claude --resume <guid>`) still flows
+    # through to the agent verbatim and is not swallowed as an agent-switch option.
     monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/claude")
     monkeypatch.setattr(start, "_claude_flags", lambda *a, **k: [])
     captured = _capture_launch(monkeypatch, ["claude", "--resume", "some-session-guid"])
     resume = captured["command"].index("--resume")
     assert captured["command"][resume : resume + 2] == ["--resume", "some-session-guid"]
     assert captured["command"].index("--model") < resume
-    # Unsloth never auto-appends its own resume token when the user drives resume.
+    # agent-switch never auto-appends its own resume token when the user drives resume.
     assert captured["command"].count("--resume") == 1
     assert "--continue" not in captured["command"]
-
-
-def _fake_hub_listing(monkeypatch, files_by_repo):
-    monkeypatch.delenv("UNSLOTH_STUDIO_URL", raising = False)
-    monkeypatch.setattr(start, "find_studio_server", lambda **_: None)
-    calls = []
-
-    def fake(repo):
-        calls.append(repo)
-        return files_by_repo.get(repo)
-
-    monkeypatch.setattr(start, "_hub_gguf_files", fake)
-    return calls
-
-
-def test_codex_gguf_failure_suggests_only_a_verified_sibling(monkeypatch, capsys):
-    _fake_hub_listing(monkeypatch, {"owner/model-GGUF": ["model-Q4_K_M.gguf"]})
-    with pytest.raises(typer.Exit):
-        start._fail_agent_needs_gguf(start._CODEX_GGUF_AGENT, "owner/model")
-    assert "Try: unsloth start codex --model owner/model-GGUF" in capsys.readouterr().err
-
-
-def test_hub_gguf_files_parses_listing(monkeypatch):
-    monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
-    monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising = False)
-    payload = {"siblings": [{"rfilename": "README.md"}, {"rfilename": "model-Q4_K_M.GGUF"}]}
-    monkeypatch.setattr(
-        start.urllib.request,
-        "urlopen",
-        lambda request, timeout: io.BytesIO(json.dumps(payload).encode()),
-    )
-    assert start._hub_gguf_files("owner/model") == ["model-Q4_K_M.GGUF"]
-
-
-def test_hub_gguf_files_unknown_on_error_or_empty_listing(monkeypatch):
-    monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
-    monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising = False)
-
-    def unauthorized(request, timeout):
-        raise urllib.error.HTTPError(request.full_url, 401, "unauthorized", None, None)
-
-    monkeypatch.setattr(start.urllib.request, "urlopen", unauthorized)
-    assert start._hub_gguf_files("owner/missing") is None
-    monkeypatch.setattr(
-        start.urllib.request, "urlopen", lambda request, timeout: io.BytesIO(b'{"siblings": []}')
-    )
-    assert start._hub_gguf_files("owner/empty") is None
-
-
-def test_hub_gguf_files_ignores_auxiliary_ggufs(monkeypatch):
-    monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
-    monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising = False)
-    payload = {
-        "siblings": [
-            {"rfilename": "mmproj-F16.gguf"},
-            {"rfilename": "mtp-gemma.gguf"},
-            {"rfilename": "MTP/gemma-Q8_0-MTP.gguf"},
-            {"rfilename": "README.md"},
-        ]
-    }
-    monkeypatch.setattr(
-        start.urllib.request,
-        "urlopen",
-        lambda request, timeout: io.BytesIO(json.dumps(payload).encode()),
-    )
-    assert start._hub_gguf_files("owner/mmproj-pack") == []
-
-
-def test_hub_gguf_files_ignores_prefixed_drafters(monkeypatch):
-    # Mirrors hub.utils.gguf.is_mtp_drafter_path: basename prefix (every kind) or exact
-    # parent dir (mtp/, dspark/ only -- dflash/ is a real family name).
-    monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
-    monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising = False)
-    payload = {
-        "siblings": [
-            {"rfilename": "DSpark-drafter-Q2K-Q8.gguf"},
-            {"rfilename": "dflash-drafter-Q8_0.gguf"},
-            {"rfilename": "eagle3-gpt-oss-20b-Q8_0.gguf"},
-            {"rfilename": "dspark/DeepSeek-V4-Flash-Q8_0.gguf"},
-            # Family names, not companions: these ARE the model.
-            {"rfilename": "Qwen3.6-35B-A3B-DFlash-Q4_K_M.gguf"},
-            {"rfilename": "DFlash/Qwen3.6-27B-DFlash-Q4_K_M.gguf"},
-            {"rfilename": "Llama-3.1-8B-Eagle3-Q4_K_M.gguf"},
-        ]
-    }
-    monkeypatch.setattr(
-        start.urllib.request,
-        "urlopen",
-        lambda request, timeout: io.BytesIO(json.dumps(payload).encode()),
-    )
-    assert start._hub_gguf_files("owner/dspark-pack") == [
-        "Qwen3.6-35B-A3B-DFlash-Q4_K_M.gguf",
-        "DFlash/Qwen3.6-27B-DFlash-Q4_K_M.gguf",
-        "Llama-3.1-8B-Eagle3-Q4_K_M.gguf",
-    ]
-
-
-def test_hub_gguf_files_filters_root_big_endian_only(monkeypatch):
-    monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
-    monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising = False)
-    payload = {
-        "siblings": [
-            {"rfilename": "model-Q4_K_M-be.gguf"},
-            {"rfilename": "model-Q4_K_M_be.gguf"},
-            {"rfilename": "quants/model-be.gguf"},
-            {"rfilename": "model-belle.gguf"},
-        ]
-    }
-    monkeypatch.setattr(
-        start.urllib.request,
-        "urlopen",
-        lambda request, timeout: io.BytesIO(json.dumps(payload).encode()),
-    )
-    assert start._hub_gguf_files("owner/be-pack") == ["quants/model-be.gguf", "model-belle.gguf"]
-
-
-def _fake_variants(monkeypatch, responses):
-    urls = []
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        urls.append(url)
-        if isinstance(responses, Exception):
-            raise responses
-        return responses
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    return urls
-
-
-def test_codex_attach_check_rejects_on_empty_variants(monkeypatch, capsys):
-    monkeypatch.setattr(start, "_hub_gguf_files", lambda repo: None)
-    _fake_variants(monkeypatch, {"variants": [], "has_vision": False})
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(
-            start._CODEX_GGUF_AGENT, BASE, "sk-test", "mlx-community/Qwen3-0.6B-4bit"
-        )
-    assert "Codex needs a GGUF model" in capsys.readouterr().err
-
-
-def test_codex_attach_check_passes_on_variants(monkeypatch):
-    urls = _fake_variants(monkeypatch, {"variants": [{"quant": "Q4_K_M"}]})
-    start._attach_gguf_check(
-        start._CODEX_GGUF_AGENT, BASE, "sk-test", "unsloth/Qwen3-0.6B-GGUF:Q4_K_M"
-    )
-    assert "repo_id=unsloth%2FQwen3-0.6B-GGUF" in urls[0]
-
-
-def test_codex_attach_check_rejects_unavailable_variant(monkeypatch, capsys):
-    # llama.cpp kills the resident server before resolving the quant, so a typo'd quant on a
-    # real GGUF repo evicts and then fails the download.
-    _fake_variants(monkeypatch, {"variants": [{"quant": "Q4_K_M"}, {"quant": "Q8_0"}]})
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(
-            start._CODEX_GGUF_AGENT, BASE, "sk-test", "unsloth/Qwen3-0.6B-GGUF:Q4_KM"
-        )
-    err = capsys.readouterr().err
-    assert "no GGUF variant Q4_KM" in err
-    assert "Q4_K_M, Q8_0" in err
-
-
-@pytest.mark.parametrize(
-    "requested,rows",
-    [
-        # Case-insensitive, exactly as the load path compares quant labels.
-        ("q4_k_m", [{"quant": "Q4_K_M"}]),
-        # The load falls back to a whole-token filename match, so a quant that is only part
-        # of a longer label still resolves.
-        ("Q4_K_XL", [{"quant": "UD-Q4_K_XL", "filename": "Qwen3-0.6B-UD-Q4_K_XL.gguf"}]),
-        # An answer that carries neither field cannot disprove anything.
-        ("Q4_K_M", [{"size_bytes": 1}]),
-    ],
-)
-def test_codex_attach_check_passes_resolvable_variants(monkeypatch, requested, rows):
-    _fake_variants(monkeypatch, {"variants": rows})
-    start._attach_gguf_check(
-        start._CODEX_GGUF_AGENT, BASE, "sk-test", f"unsloth/Qwen3-0.6B-GGUF:{requested}"
-    )
-
-
-def test_codex_attach_check_takes_the_variant_from_the_caller(monkeypatch):
-    # `--gguf-variant` never reaches the identifier and _connect strips `repo:QUANT` before
-    # the gate runs, so the quant arrives as an argument.
-    _fake_variants(monkeypatch, {"variants": [{"quant": "Q8_0"}]})
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(
-            start._CODEX_GGUF_AGENT, BASE, "sk-test", "unsloth/Qwen3-0.6B-GGUF", "Q4_K_M"
-        )
-
-
-def test_codex_attach_check_defers_on_server_error(monkeypatch):
-    _fake_variants(
-        monkeypatch,
-        urllib.error.HTTPError(f"{BASE}/api/models/gguf-variants", 404, "nope", None, None),
-    )
-    start._attach_gguf_check(
-        start._CODEX_GGUF_AGENT, BASE, "sk-test", "mlx-community/Qwen3-0.6B-4bit"
-    )
-    start._attach_gguf_check(
-        start._CODEX_GGUF_AGENT, BASE, "sk-test", "unsloth/Qwen3-0.6B-GGUF:Q4_K_M"
-    )
-
-
-def test_codex_attach_check_skips_without_model(monkeypatch):
-    urls = _fake_variants(monkeypatch, {"variants": []})
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", None)
-    assert urls == []
-
-
-@pytest.mark.parametrize("var", ["HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"])
-def test_hub_gguf_files_skips_hub_when_offline(monkeypatch, var):
-    monkeypatch.setenv(var, "1")
-    monkeypatch.setattr(
-        start.urllib.request,
-        "urlopen",
-        lambda request, timeout: pytest.fail("offline mode must not call the hub"),
-    )
-    assert start._hub_gguf_files("owner/model") is None
-
-
-def test_codex_gguf_failure_skips_hint_probe_for_non_hub_ids(monkeypatch, capsys):
-    monkeypatch.setattr(
-        start,
-        "_hub_gguf_files",
-        lambda repo: pytest.fail("must not probe the hub for a non-hub id"),
-    )
-    with pytest.raises(typer.Exit):
-        start._fail_agent_needs_gguf(start._CODEX_GGUF_AGENT, "models/Llama/customer-model")
-    assert "Try:" not in capsys.readouterr().err
-
-
-def test_codex_attach_rejects_before_load(fake_studio, monkeypatch):
-    inner = start._http_json
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if "/api/models/gguf-variants" in url:
-            return {"variants": []}
-        if url.endswith("/api/inference/load"):
-            pytest.fail("rejected model must not be loaded")
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    result = CliRunner().invoke(
-        start.start_app, ["codex", "--model", "mlx-community/Qwen3-0.6B-4bit", "--no-launch"]
-    )
-    assert result.exit_code == 1
-    assert "Codex needs a GGUF model" in result.output
-
-
-def test_codex_attach_rejects_unavailable_variant_before_load(fake_studio, monkeypatch):
-    inner = start._http_json
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if "/api/models/gguf-variants" in url:
-            return {"variants": [{"quant": "Q4_K_M"}]}
-        if url.endswith("/api/inference/load"):
-            pytest.fail("a quant the repo does not have must not evict the resident model")
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    result = CliRunner().invoke(
-        start.start_app,
-        ["codex", "--model", "unsloth/Qwen3-0.6B-GGUF:Q4_KM", "--no-launch"],
-    )
-    assert result.exit_code == 1
-    assert "no GGUF variant Q4_KM" in result.output
-
-
-def test_codex_attach_reuses_resident_model_without_preload_probe(fake_studio, monkeypatch):
-    # No load happens when the resident model already answers --model, so the gate must not
-    # run: a canonical empty listing would reject a session that works.
-    inner = start._http_json
-    probes = []
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if "/api/models/gguf-variants" in url:
-            probes.append(url)
-            return {"variants": []}
-        if url.endswith("/api/inference/load"):
-            pytest.fail("the resident model already matches; no load is needed")
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    result = CliRunner().invoke(start.start_app, ["codex", "--model", MODEL["id"], "--no-launch"])
-    assert result.exit_code == 0, result.output
-    assert probes == []
-
-
-@pytest.mark.parametrize("endpoint", ["", "huggingface.co", "not a url"])
-def test_hub_gguf_files_unknown_on_malformed_endpoint(monkeypatch, endpoint):
-    monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
-    monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising = False)
-    monkeypatch.setenv("HF_ENDPOINT", endpoint)
-    assert start._hub_gguf_files("owner/model") is None
-
-
-def test_codex_attach_check_skips_direct_gguf_files(monkeypatch):
-    monkeypatch.setattr(
-        start,
-        "_http_json",
-        lambda *a, **k: pytest.fail("a direct .gguf file needs no variants probe"),
-    )
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "/models/foo-Q4_K_M.gguf")
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "./local/model.GGUF")
-    # A quant folder or an unrelated parent name is still the model itself.
-    start._attach_gguf_check(
-        start._CODEX_GGUF_AGENT, BASE, "sk-test", "/models/Q4_K_M/model-be.gguf"
-    )
-    start._attach_gguf_check(
-        start._CODEX_GGUF_AGENT, BASE, "sk-test", "/models/mmproj-dumps/foo-Q4_K_M.gguf"
-    )
-    start._attach_gguf_check(
-        start._CODEX_GGUF_AGENT, BASE, "sk-test", "/models/dflash/Qwen-DFlash-Q4_K_M.gguf"
-    )
-
-
-def test_codex_attach_check_direct_variant_always_asks_the_server(monkeypatch):
-    # The resolver scans the file's marked parent and may bind a different sibling, so every
-    # explicit variant goes to the probe.
-    probes = []
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        probes.append(url)
-        return {
-            "variants": [{"quant": "Q4_K_M"}],
-            "resolved_locally": True,
-            "loadable_variants": ["Q4_K_M", "q4_k_m"],
-            "loadable": True,
-        }
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    start._attach_gguf_check(
-        start._CODEX_GGUF_AGENT, BASE, "sk-test", "/models/foo-Q4_K_M.gguf", "q4_k_m"
-    )
-    assert probes, "an explicit variant must reach the server"
-
-    # Without a variant the load takes this very file, so no probe is needed.
-    monkeypatch.setattr(
-        start,
-        "_http_json",
-        lambda *a, **k: pytest.fail("a variantless direct file needs no probe"),
-    )
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "/models/foo-Q4_K_M.gguf")
-
-
-def test_codex_attach_check_asks_server_for_foreign_direct_variant(monkeypatch, capsys):
-    # A quant that is not the file's own label is the marked parent's business: an answer
-    # carrying it passes, one without it fails before the load can evict.
-    _fake_variants(monkeypatch, {"variants": [{"quant": "Q4_K_M"}, {"quant": "Q8_0"}]})
-    start._attach_gguf_check(
-        start._CODEX_GGUF_AGENT, BASE, "sk-test", "/models/m/model-Q4_K_M.gguf", "Q8_0"
-    )
-    _fake_variants(monkeypatch, {"variants": [{"quant": "Q4_K_M"}]})
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(
-            start._CODEX_GGUF_AGENT, BASE, "sk-test", "/models/foo-Q4_K_M.gguf", "Q8_0"
-        )
-    assert "no GGUF variant Q8_0" in capsys.readouterr().err
-    # The parent folder cannot vouch for a quant the file is not.
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(
-            start._CODEX_GGUF_AGENT, BASE, "sk-test", "/models/Q8_0/foo-Q4_K_M.gguf", "Q8_0"
-        )
-
-
-def test_codex_attach_check_fails_live_empty_explicit_paths(tmp_path, monkeypatch, capsys):
-    # Every server version resolves explicit local syntax locally, so a live empty answer
-    # settles the load; deferring would send a GGUF-less directory down the transformers path.
-    _fake_variants(monkeypatch, {"variants": []})
-    target = tmp_path / "hf-dir"
-    target.mkdir()
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", os.fspath(target))
-    assert "Codex needs a GGUF model" in capsys.readouterr().err
-
-
-def test_codex_attach_check_still_defers_existing_raw_names(tmp_path, monkeypatch):
-    # Marker-less names keep the deferral: older servers read them as hub ids, so a CLI-side
-    # hit may be a server-side model.
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "my-model-dir").mkdir()
-    _fake_variants(monkeypatch, {"variants": []})
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "my-model-dir")
-
-
-def test_codex_attach_check_strictness_follows_the_server_answer(monkeypatch):
-    # A one-slash id can be a hub repo or a server-cwd directory; the answer says which, and
-    # a local answer takes exact labels only.
-    rows = [{"quant": "Q4_K_M", "filename": "model-Q4_K_M.gguf"}]
-    _fake_variants(monkeypatch, {"variants": rows, "resolved_locally": True})
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "models/qwen", "Q4")
-    _fake_variants(monkeypatch, {"variants": rows})
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "models/qwen", "Q4")
-
-
-def test_codex_attach_check_strict_accepts_the_full_stem(monkeypatch):
-    # The local resolver accepts the exact shard-stripped stem as a label too.
-    _fake_variants(
-        monkeypatch,
-        {
-            "variants": [{"quant": "Q4_K_M", "filename": "model-Q4_K_M.gguf"}],
-            "resolved_locally": True,
-        },
-    )
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "./m", "model-Q4_K_M")
-
-
-def test_codex_attach_check_strict_rejects_nested_basename_labels(monkeypatch):
-    # The local resolver answers the full relative stem, never a nested file's basename.
-    _fake_variants(
-        monkeypatch,
-        {
-            "variants": [{"quant": "BF16", "filename": "BF16/model.gguf"}],
-            "resolved_locally": True,
-        },
-    )
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "./m", "model")
-
-
-def test_codex_attach_check_rejects_torn_named_file_despite_sibling_variant(tmp_path, monkeypatch):
-    # A variant does not redirect a DIRECT FILE, so the torn file named here is what loads
-    # and a ready sibling row must not vouch for it.
-    shard = tmp_path / "model-Q4_K_M-00001-of-00002.gguf"
-    shard.write_bytes(b"GGUF")
-    (tmp_path / "model-Q8_0.gguf").write_bytes(b"GGUF")
-    _fake_variants(
-        monkeypatch,
-        {"variants": [{"quant": "Q8_0", "partial": False}], "resolved_locally": True},
-    )
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", os.fspath(shard), "Q8_0")
-
-
-def test_codex_attach_check_rejects_a_requested_torn_local_variant(monkeypatch):
-    # A torn local row's labels do not vouch: llama gets the incomplete split after teardown.
-    rows = {
-        "variants": [
-            {"quant": "Q8_0", "partial": False},
-            {"quant": "Q4_K_M", "partial": True},
-        ],
-        "resolved_locally": True,
-    }
-    _fake_variants(monkeypatch, rows)
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "./m", "Q4_K_M")
-    _fake_variants(monkeypatch, rows)
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "./m", "Q8_0")
-
-
-def test_codex_attach_check_probes_direct_paths_on_remote_servers(monkeypatch, capsys):
-    # A remote filesystem is not ours, and the load takes the .gguf suffix as authoritative,
-    # so a missing file evicts before failing.
-    remote = "http://studio.example:8888"
-    _fake_variants(monkeypatch, {"variants": [], "resolved_locally": True})
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(
-            start._CODEX_GGUF_AGENT, remote, "sk-test", "/models/gone-Q4_K_M.gguf"
-        )
-    assert "Codex needs a GGUF model" in capsys.readouterr().err
-    # A server that has it answers with rows, and loopback still short-circuits.
-    _fake_variants(
-        monkeypatch,
-        {"variants": [{"quant": "Q4_K_M", "partial": False}], "resolved_locally": True},
-    )
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, remote, "sk-test", "/models/foo-Q4_K_M.gguf")
-    monkeypatch.setattr(start, "_http_json", lambda *a, **k: pytest.fail("loopback needs no probe"))
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "/models/foo-Q4_K_M.gguf")
-
-
-@pytest.mark.skipif(os.name == "nt", reason = "every spelling is native on Windows")
-def test_codex_attach_check_probes_non_native_direct_paths(monkeypatch, capsys):
-    # A Windows path read from WSL parses to nonsense here, so it is exempt from the absence
-    # check and reads as ready without anything being verified. Returning on it would vouch
-    # for a file nobody looked at, and the load trusts the .gguf suffix: teardown, then failure.
-    urls = _fake_variants(monkeypatch, {"variants": [], "resolved_locally": True})
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(
-            start._CODEX_GGUF_AGENT, BASE, "sk-test", r"C:\models\typo-Q4_K_M.gguf"
-        )
-    assert "Codex needs a GGUF model" in capsys.readouterr().err
-    assert urls, "the server was never asked"
-    # The server holding it still passes.
-    _fake_variants(
-        monkeypatch,
-        {"variants": [{"quant": "Q4_K_M", "partial": False}], "resolved_locally": True},
-    )
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", r"C:\models\foo-Q4_K_M.gguf")
-
-
-def test_codex_attach_check_honors_a_negative_verdict_without_an_allow_list(monkeypatch, capsys):
-    # No loadable_variants means a direct file, which loads as itself whatever the quant, so
-    # the variantless verdict decides for a variant too. The shapes differ (the row scan judges
-    # the immediate parent, the resolver the model root), so a row can outlive a false verdict.
-    negative = {
-        "variants": [{"quant": "Q8_0", "partial": False}],
-        "resolved_locally": True,
-        "loadable": False,
-    }
-    _fake_variants(monkeypatch, negative)
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(
-            start._CODEX_GGUF_AGENT, BASE, "sk-test", "/models/MTP/sub/foo-Q8_0.gguf", "Q8_0"
-        )
-    assert "Codex needs a GGUF model" in capsys.readouterr().err
-    # A positive verdict passes, and a server too old to send the flag falls through to rows.
-    _fake_variants(monkeypatch, {**negative, "loadable": True})
-    start._attach_gguf_check(
-        start._CODEX_GGUF_AGENT, BASE, "sk-test", "/models/sub/foo-Q8_0.gguf", "Q8_0"
-    )
-    _fake_variants(monkeypatch, {k: v for k, v in negative.items() if k != "loadable"})
-    start._attach_gguf_check(
-        start._CODEX_GGUF_AGENT, BASE, "sk-test", "/models/sub/foo-Q8_0.gguf", "Q8_0"
-    )
-
-
-def test_codex_attach_check_refuses_companion_paths_with_a_variant(monkeypatch, capsys):
-    # The loader consults gguf_variant only for a directory, so a refused direct file cannot
-    # be rescued by naming a sibling quant.
-    monkeypatch.setattr(
-        start,
-        "_http_json",
-        lambda *a, **k: pytest.fail("a refused direct file needs no variants probe"),
-    )
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(
-            start._CODEX_GGUF_AGENT, BASE, "sk-test", "/models/m/mmproj-F16.gguf", "Q4_K_M"
-        )
-    assert "Codex needs a GGUF model" in capsys.readouterr().err
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(
-            start._CODEX_GGUF_AGENT, BASE, "sk-test", "/models/m/mmproj-F16.gguf"
-        )
-
-
-def test_codex_attach_check_ignores_cleanable_only_answers(monkeypatch, capsys):
-    # A cleanable row offers deleting an empty leftover folder, never weights.
-    _fake_variants(
-        monkeypatch,
-        {"variants": [{"quant": "Q4_K_M", "partial": True, "cleanable": True}]},
-    )
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "owner/no-gguf")
-    assert "Codex needs a GGUF model" in capsys.readouterr().err
-    # A real listed row beside it still answers.
-    _fake_variants(
-        monkeypatch,
-        {
-            "variants": [
-                {"quant": "Q8_0", "partial": True, "cleanable": True},
-                {"quant": "Q4_K_M"},
-            ]
-        },
-    )
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "owner/has-gguf")
-
-
-def test_codex_attach_check_follows_bare_names_the_server_calls_remote(monkeypatch):
-    # The load uses a bare name only when it resolves locally, so an answer the server marks
-    # non-local must not settle the shorthand.
-    urls = []
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        urls.append(url)
-        if "unsloth" in url:
-            return {"variants": [{"quant": "Q4_K_M"}], "resolved_locally": False}
-        return {"variants": [], "resolved_locally": False}
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "Qwen3-0.6B-GGUF")
-    assert len(urls) == 2 and "unsloth%2FQwen3-0.6B-GGUF" in urls[1]
-
-
-def test_codex_attach_check_trusts_the_servers_loadable_answer(monkeypatch, capsys):
-    # When the server answers with the load resolver itself, that settles the round.
-    _fake_variants(
-        monkeypatch,
-        {
-            "variants": [{"quant": "BF16", "filename": "BF16/model.gguf"}],
-            "resolved_locally": True,
-            "loadable_variants": ["BF16"],
-            "loadable": False,
-        },
-    )
-    # Naming the quant works even though every row is nested...
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "./m", "BF16")
-    _fake_variants(
-        monkeypatch,
-        {
-            "variants": [{"quant": "BF16", "filename": "BF16/model.gguf"}],
-            "resolved_locally": True,
-            "loadable_variants": ["BF16"],
-            "loadable": False,
-        },
-    )
-    # ...and a variantless load, which cannot pick it, is refused.
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "./m")
-    assert "Codex needs a GGUF model" in capsys.readouterr().err
-    # A quant the load would not serve is refused even though a row lists it.
-    _fake_variants(
-        monkeypatch,
-        {
-            "variants": [{"quant": "Q8_0", "filename": "m-Q8_0-00001-of-00002.gguf"}],
-            "resolved_locally": True,
-            "loadable_variants": [],
-            "loadable": False,
-        },
-    )
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "./m", "Q8_0")
-
-
-def test_codex_attach_check_probes_missing_bare_gguf_shorthands(tmp_path, monkeypatch, capsys):
-    # A bare foo.gguf naming no local file is not a path: the load canonicalizes it to
-    # unsloth/foo.gguf, so the gate follows it there.
-    monkeypatch.chdir(tmp_path)
-    urls = []
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        urls.append(url)
-        return {"variants": []}
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "foo.gguf")
-    assert any("repo_id=unsloth%2Ffoo.gguf" in url for url in urls)
-    # A file that does exist is still the direct path it names.
-    (tmp_path / "real-Q4_K_M.gguf").write_bytes(b"GGUF")
-    monkeypatch.setattr(
-        start, "_http_json", lambda *a, **k: pytest.fail("an existing file needs no probe")
-    )
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "real-Q4_K_M.gguf")
-
-
-def test_codex_attach_check_treats_gguf_suffixed_hub_ids_as_remote(monkeypatch):
-    # owner/name.gguf is a repo, not a path: the remote load scans siblings recursively and
-    # matches loosely, so local-only rules must not apply.
-    _fake_variants(
-        monkeypatch,
-        {"variants": [{"quant": "Q4_K_M", "filename": "BF16/model-Q4_K_M.gguf"}]},
-    )
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "owner/model.gguf")
-    _fake_variants(
-        monkeypatch,
-        {"variants": [{"quant": "UD-Q4_K_XL", "filename": "m-UD-Q4_K_XL.gguf"}]},
-    )
-    start._attach_gguf_check(
-        start._CODEX_GGUF_AGENT, BASE, "sk-test", "owner/model.gguf", "Q4_K_XL"
-    )
-
-
-def test_codex_attach_check_accepts_bpw_qualified_local_requests(monkeypatch):
-    # The listing advertises the stripped label, the local loader takes the full bpw
-    # spelling; both name the same file, so both must pass.
-    _fake_variants(
-        monkeypatch,
-        {
-            "variants": [{"quant": "IQ4_XS", "filename": "model-IQ4_XS-3.53bpw.gguf"}],
-            "resolved_locally": True,
-        },
-    )
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "./m", "IQ4_XS-3.53bpw")
-
-
-def test_codex_attach_check_strict_accepts_basename_quant_tokens(monkeypatch):
-    # The loose-file resolver takes any whole quant token of the basename, so the listing's
-    # own default (the file's other label) must pass.
-    _fake_variants(
-        monkeypatch,
-        {
-            "variants": [{"quant": "F16", "filename": "F16-checkpoint-Q4_K_M.gguf"}],
-            "resolved_locally": True,
-        },
-    )
-    start._attach_gguf_check(
-        start._CODEX_GGUF_AGENT, BASE, "sk-test", "/models/F16-checkpoint-Q4_K_M.gguf", "Q4_K_M"
-    )
-
-
-def test_codex_attach_check_honors_resolved_locally_empty_for_raw_names(
-    tmp_path, monkeypatch, capsys
-):
-    # A server that resolved the name locally already answered for the directory the load
-    # will take, so deferring on CLI existence would let it evict the resident model.
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "models" / "qwen").mkdir(parents = True)
-    _fake_variants(monkeypatch, {"variants": [], "resolved_locally": True})
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "models/qwen")
-    assert "Codex needs a GGUF model" in capsys.readouterr().err
-    # A legacy answer without the flag keeps the deferral.
-    _fake_variants(monkeypatch, {"variants": []})
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "models/qwen")
-
-
-def test_codex_attach_check_requires_a_pickable_row_without_a_variant(monkeypatch, capsys):
-    # detect_gguf_model picks from the top level, so rows living only in quant subdirectories
-    # need an explicit variant.
-    rows = {
-        "variants": [{"quant": "BF16", "filename": "BF16/model.gguf"}],
-        "resolved_locally": True,
-    }
-    _fake_variants(monkeypatch, rows)
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "./m")
-    err = capsys.readouterr().err
-    assert "quant subdirectories" in err and "BF16" in err
-    # A path never parses `:QUANT`, so the hint names the quant file itself.
-    assert "Pass --model one of: ./m/BF16/model.gguf" in err
-    # A hub id keeps the shorthand hint.
-    _fake_variants(monkeypatch, rows)
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "unsloth/m")
-    assert "Pass --model unsloth/m:<QUANT> (available: BF16)" in capsys.readouterr().err
-    # Naming the variant resolves it, and a top-level row needs nothing.
-    _fake_variants(monkeypatch, rows)
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "./m", "BF16")
-    _fake_variants(
-        monkeypatch,
-        {"variants": [{"quant": "Q4_K_M", "filename": "m-Q4_K_M.gguf"}], "resolved_locally": True},
-    )
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "./m")
-
-
-def test_codex_attach_check_probes_gguf_named_directories(tmp_path, monkeypatch, capsys):
-    # The detector scans a .gguf-named directory instead of trusting the suffix.
-    gguf_dir = tmp_path / "foo.gguf"
-    gguf_dir.mkdir()
-    _fake_variants(monkeypatch, {"variants": [], "resolved_locally": True})
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", os.fspath(gguf_dir))
-    assert "Codex needs a GGUF model" in capsys.readouterr().err
-    # One holding weights answers with rows and passes.
-    _fake_variants(
-        monkeypatch,
-        {"variants": [{"quant": "Q4_K_M", "filename": "m-Q4_K_M.gguf"}], "resolved_locally": True},
-    )
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", os.fspath(gguf_dir))
-
-
-def test_codex_attach_check_allows_short_shard_like_names(tmp_path, monkeypatch):
-    # The split grammar is five digits exactly, so a -001-of-002 name loads as an ordinary file.
-    monkeypatch.setattr(
-        start,
-        "_http_json",
-        lambda *a, **k: pytest.fail("a direct .gguf file needs no variants probe"),
-    )
-    lone = tmp_path / "model-Q4_K_M-001-of-002.gguf"
-    lone.write_bytes(b"GGUF")
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", os.fspath(lone))
-
-
-def test_codex_attach_check_honors_loadable_on_an_empty_listing(monkeypatch):
-    # A root-blind lister can miss a file detect_gguf_model resolves, so an empty answer
-    # reporting loadable is loadable.
-    _fake_variants(monkeypatch, {"variants": [], "resolved_locally": True, "loadable": True})
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "/models/MTP/foo-Q8_0.gguf")
-    # Empty and not loadable still fails.
-    _fake_variants(monkeypatch, {"variants": [], "resolved_locally": True, "loadable": False})
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(
-            start._CODEX_GGUF_AGENT, BASE, "sk-test", "/models/MTP/foo-Q8_0.gguf"
-        )
-
-
-def test_codex_preload_gate_checks_direct_path_identity(fake_studio, monkeypatch, tmp_path):
-    # /v1/models shows only the basename, so a different path with the same name must not read
-    # as resident: the preload gate still runs on the REQUESTED path and refuses its big-endian
-    # build before the load evicts the resident. Without the path-identity check the basename
-    # match would skip the gate and the load would go through.
-    inner = start._http_json
-    resident = tmp_path / "old" / "foo-Q4_K_M-be.gguf"
-    resident.parent.mkdir()
-    resident.write_bytes(b"GGUF")
-    other = tmp_path / "new" / "foo-Q4_K_M-be.gguf"
-    other.parent.mkdir()
-    other.write_bytes(b"GGUF")
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/loaded-models"):
-            return {"data": [{"id": "foo-Q4_K_M-be", "loaded": True}]}
-        if url.endswith("/api/inference/status"):
-            return {"is_gguf": True, "model_identifier": os.fspath(resident)}
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    result = CliRunner().invoke(
-        start.start_app,
-        ["codex", "--model", os.fspath(other), "--no-launch"],
-    )
-    assert result.exit_code == 1
-    assert "Codex needs a GGUF model" in result.output
-    assert not [c for c in fake_studio if c[1].endswith("/api/inference/load")]
-
-
-def test_codex_preload_gate_runs_for_a_settings_reload(fake_studio, monkeypatch):
-    # A knob that changes the runtime intent is a real reload nothing dedupes, so the gate
-    # runs even for the resident id.
-    inner = start._http_json
-    probed = []
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if "/api/models/gguf-variants" in url:
-            probed.append(url)
-            return {"variants": [{"quant": "Q4_K_M"}], "resolved_locally": False}
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    CliRunner().invoke(
-        start.start_app,
-        ["codex", "--model", MODEL["id"], "--max-seq-length", "8192", "--no-launch"],
-    )
-    assert probed, "a context-length change reloads, so the gate must check it"
-
-
-def test_codex_preload_gate_runs_for_a_mistyped_resident_variant(fake_studio, monkeypatch):
-    # The server matches intent case-insensitively but keeps separators, so Q4KM is not the
-    # resident Q4_K_M and really reloads.
-    inner = start._http_json
-    probed = []
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/status"):
-            return {"is_gguf": True, "gguf_variant": "Q4_K_M"}
-        if "/api/models/gguf-variants" in url:
-            probed.append(url)
-            return {"variants": [{"quant": "Q4_K_M"}], "resolved_locally": False}
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    CliRunner().invoke(
-        start.start_app,
-        ["codex", "--model", MODEL["id"] + ":Q4KM", "--no-launch"],
-    )
-    assert probed, "a separator-mangled quant is not the resident one"
-
-
-def test_codex_preload_gate_defers_to_the_resident_model(fake_studio, monkeypatch):
-    # An explicit knob forces the load endpoint's disk-free dedupe to answer; gating it would
-    # reject a second session for the model already serving, whose file may have moved.
-    inner = start._http_json
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/status"):
-            return {"is_gguf": True, "gguf_variant": "Q4_K_M"}
-        if "/api/models/gguf-variants" in url:
-            pytest.fail("the resident model already serves this request")
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    result = CliRunner().invoke(
-        start.start_app,
-        ["codex", "--model", MODEL["id"], "--gguf-variant", "Q4_K_M", "--no-launch"],
-    )
-    assert result.exit_code == 0, result.output
-
-
-def test_codex_preload_gate_still_runs_for_a_different_variant(fake_studio, monkeypatch):
-    # A different quant is a real reload, so the gate has to run.
-    inner = start._http_json
-    probed = []
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/status"):
-            return {"is_gguf": True, "gguf_variant": "Q4_K_M"}
-        if "/api/models/gguf-variants" in url:
-            probed.append(url)
-            return {"variants": [{"quant": "Q4_K_M"}], "resolved_locally": False}
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    CliRunner().invoke(
-        start.start_app,
-        ["codex", "--model", MODEL["id"] + ":Q8_0", "--no-launch"],
-    )
-    assert probed, "a different quant reloads, so the gate must check it"
-
-
-def test_codex_attach_check_asks_about_nested_drafter_folders(monkeypatch, capsys):
-    # detect_gguf_model reads drafter folders relative to the model root, so the same nested
-    # path loads or is refused depending on a root this process cannot see.
-    _fake_variants(monkeypatch, {"variants": [], "resolved_locally": True})
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(
-            start._CODEX_GGUF_AGENT, BASE, "sk-test", "/models/MTP/copies/foo-Q8_0.gguf"
-        )
-    assert "Codex needs a GGUF model" in capsys.readouterr().err
-    # A server that serves it answers with rows and the attach proceeds.
-    _fake_variants(
-        monkeypatch,
-        {"variants": [{"quant": "Q8_0"}], "resolved_locally": True, "loadable": True},
-    )
-    start._attach_gguf_check(
-        start._CODEX_GGUF_AGENT, BASE, "sk-test", "/models/MTP/copies/foo-Q8_0.gguf"
-    )
-    # A drafter NAME PREFIX means the same under any root, so it is refused with no probe.
-    monkeypatch.setattr(
-        start, "_http_json", lambda *a, **k: pytest.fail("an immediate companion needs no probe")
-    )
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(
-            start._CODEX_GGUF_AGENT, BASE, "sk-test", "/models/mtp-foo-Q8_0.gguf"
-        )
-
-
-def test_codex_attach_check_defers_foreign_path_syntax(monkeypatch, tmp_path):
-    # A Windows path read from POSIX parses to nonsense here (parent '.'), so its local
-    # absence says nothing about the server's disk.
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(start, "_http_json", lambda *a, **k: {"variants": [{"quant": "Q4_K_M"}]})
-    start._attach_gguf_check(
-        start._CODEX_GGUF_AGENT, BASE, "sk-test", "C:\\models\\foo-Q4_K_M.gguf"
-    )
-    # A native path that really is absent is still failed.
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(
-            start._CODEX_GGUF_AGENT, BASE, "sk-test", os.fspath(tmp_path / "gone-Q4_K_M.gguf")
-        )
-
-
-def test_codex_attach_check_defers_when_loopback_is_not_this_machine(monkeypatch, tmp_path):
-    # 127.0.0.1 can be an SSH or container forward, where a server-valid path is simply absent
-    # here. Without a confirmed identity the local filesystem says nothing, so the probe decides.
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(start, "verify_studio_identity", lambda base, **_kw: False)
-    probes = []
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        probes.append(url)
-        return {"variants": [{"quant": "Q4_K_M"}]}
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    # Absent locally, and an incomplete local shard: neither may settle it now.
-    start._attach_gguf_check(
-        start._CODEX_GGUF_AGENT, BASE, "sk-test", os.fspath(tmp_path / "gone-Q4_K_M.gguf")
-    )
-    torn = tmp_path / "torn-Q4_K_M-00001-of-00002.gguf"
-    torn.write_bytes(b"GGUF")
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", os.fspath(torn))
-    assert probes, "the server must be asked when its filesystem is not ours"
-
-
-def test_codex_attach_check_treats_both_spellings_as_native_on_windows(monkeypatch, tmp_path):
-    # The other half of the asymmetry above: Windows accepts forward slashes, so both spellings
-    # are native there and an absent file is really absent.
-    monkeypatch.chdir(tmp_path)
-    _simulate_windows(monkeypatch)
-    assert start._path_syntax_is_native("C:\\models\\foo-Q4_K_M.gguf") is True
-    assert start._path_syntax_is_native("/models/foo-Q4_K_M.gguf") is True
-    monkeypatch.setattr(
-        start,
-        "_http_json",
-        lambda *a, **k: pytest.fail("a visible missing file needs no probe"),
-    )
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(
-            start._CODEX_GGUF_AGENT, BASE, "sk-test", os.fspath(tmp_path / "gone-Q4_K_M.gguf")
-        )
-
-
-def test_codex_attach_check_rejects_missing_direct_paths(tmp_path, monkeypatch, capsys):
-    # A mistyped or deleted path is still a GGUF load, so it tears the resident model down
-    # and only then fails.
-    monkeypatch.setattr(
-        start,
-        "_http_json",
-        lambda *a, **k: pytest.fail("a visible missing file needs no probe"),
-    )
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(
-            start._CODEX_GGUF_AGENT, BASE, "sk-test", os.fspath(tmp_path / "typo-Q4_K_M.gguf")
-        )
-    assert "does not exist" in capsys.readouterr().err
-    # A path under a directory this process cannot list stays unknowable.
-    start._attach_gguf_check(
-        start._CODEX_GGUF_AGENT, BASE, "sk-test", "/nonexistent-root/dir/m-Q4_K_M.gguf"
-    )
-
-
-def test_codex_attach_check_rejects_broken_direct_symlinks(tmp_path, monkeypatch, capsys):
-    # A broken symlink is visible here, and the suffix alone still makes it a GGUF load that
-    # fails after teardown.
-    monkeypatch.setattr(
-        start,
-        "_http_json",
-        lambda *a, **k: pytest.fail("a direct .gguf file needs no variants probe"),
-    )
-    link = tmp_path / "gone-Q4_K_M.gguf"
-    link.symlink_to(tmp_path / "missing-target.gguf")
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", os.fspath(link))
-    assert "incomplete" in capsys.readouterr().err
-
-
-def test_codex_attach_check_fails_all_partial_local_answers(monkeypatch, capsys):
-    # A local answer of only torn rows proves a load llama cannot serve; a hub answer passes
-    # because the downloader resumes hub partials.
-    rows = {"variants": [{"quant": "Q4_K_M", "partial": True}], "resolved_locally": True}
-    _fake_variants(monkeypatch, rows)
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "./m")
-    assert "incomplete GGUF weights" in capsys.readouterr().err
-    _fake_variants(monkeypatch, {"variants": [{"quant": "Q4_K_M", "partial": True}]})
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "unsloth/Qwen3-0.6B-GGUF")
-    # A server predating resolved_locally still resolves explicit path syntax locally.
-    _fake_variants(monkeypatch, {"variants": [{"quant": "Q4_K_M", "partial": True}]})
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "./m")
-
-
-def test_codex_attach_check_local_answers_take_exact_labels_only(monkeypatch):
-    # The local resolver takes exact labels only, so a local answer must not let the
-    # filename-token tier vouch for a shorter quant; hub answers keep that tier.
-    rows = {"variants": [{"quant": "Q4_K_M", "filename": "model-Q4_K_M.gguf"}]}
-    _fake_variants(monkeypatch, rows)
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "./m", "Q4")
-    _fake_variants(monkeypatch, rows)
-    start._attach_gguf_check(
-        start._CODEX_GGUF_AGENT, BASE, "sk-test", "unsloth/Qwen3-0.6B-GGUF", "Q4"
-    )
-
-
-def test_codex_attach_check_rejects_incomplete_direct_files(tmp_path, monkeypatch, capsys):
-    # On a loopback attach the CLI sees the server's filesystem, and llama finds missing bytes
-    # or shards only after the resident model is torn down.
-    monkeypatch.setattr(
-        start,
-        "_http_json",
-        lambda *a, **k: pytest.fail("a direct .gguf file needs no variants probe"),
-    )
-    empty = tmp_path / "zero-Q4_K_M.gguf"
-    empty.write_bytes(b"")
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", os.fspath(empty))
-    assert "incomplete" in capsys.readouterr().err
-
-    shard = tmp_path / "m-Q4_K_M-00001-of-00002.gguf"
-    shard.write_bytes(b"GGUF")
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", os.fspath(shard))
-
-    # The complete set beside it passes, and a CLI-invisible path stays open.
-    (tmp_path / "m-Q4_K_M-00002-of-00002.gguf").write_bytes(b"GGUF")
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", os.fspath(shard))
-    start._attach_gguf_check(
-        start._CODEX_GGUF_AGENT, BASE, "sk-test", "/nonexistent/other-Q4_K_M.gguf"
-    )
-
-
-def test_codex_attach_check_accepts_symlinked_split_shards(tmp_path, monkeypatch):
-    # The load resolves an incomplete nominal set through the symlink to the target's shards,
-    # so the readiness check does the same.
-    monkeypatch.setattr(
-        start,
-        "_http_json",
-        lambda *a, **k: pytest.fail("a direct .gguf file needs no variants probe"),
-    )
-    real = tmp_path / "real"
-    real.mkdir()
-    (real / "m-Q4_K_M-00001-of-00002.gguf").write_bytes(b"GGUF")
-    (real / "m-Q4_K_M-00002-of-00002.gguf").write_bytes(b"GGUF")
-    links = tmp_path / "links"
-    links.mkdir()
-    link = links / "m-Q4_K_M-00001-of-00002.gguf"
-    link.symlink_to(real / "m-Q4_K_M-00001-of-00002.gguf")
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", os.fspath(link))
-
-    # A target set that is itself torn still fails.
-    (real / "m-Q4_K_M-00002-of-00002.gguf").unlink()
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", os.fspath(link))
-
-
-@pytest.mark.parametrize(
-    "path",
-    [
-        "/models/mmproj-F16.gguf",
-        "./local/MMPROJ-F32.GGUF",
-        "/models/mtp-Qwen3-Q8_0.gguf",
-        "/models/dspark/dspark-DeepSeek-Q8_0.gguf",
-        "C:\\models\\mmproj-F16.gguf",
-    ],
-)
-def test_codex_attach_check_refuses_companion_gguf_files(monkeypatch, capsys, path):
-    # Projector and drafter name prefixes read the basename alone, so detect_gguf_model refuses
-    # these under any root and the name settles it; probing would defer on a path that exists.
-    # A drafter FOLDER is root-dependent instead (see the nested-drafter test).
-    monkeypatch.setattr(
-        start,
-        "_http_json",
-        lambda *a, **k: pytest.fail("a companion .gguf needs no variants probe"),
-    )
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", path)
-    assert "Codex needs a GGUF model" in capsys.readouterr().err
-
-
-def test_codex_attach_check_normalizes_shorthand_after_raw_probe(monkeypatch, capsys):
-    monkeypatch.setattr(start, "_hub_gguf_files", lambda repo: None)
-    urls = []
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        urls.append(url)
-        if "repo_id=Qwen3-0.6B" in url and "unsloth" not in url:
-            raise urllib.error.HTTPError(url, 400, "invalid repo_id", None, None)
-        return {"variants": []}
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "Qwen3-0.6B")
-    assert len(urls) == 2
-    assert "repo_id=unsloth%2FQwen3-0.6B" in urls[1]
-    assert "unsloth/Qwen3-0.6B" in capsys.readouterr().err
-
-
-def test_codex_attach_check_trusts_raw_server_dir_answer(monkeypatch):
-    urls = []
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        urls.append(url)
-        return {"variants": [{"quant": "Q4_K_M"}]}
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "local-gguf-dir")
-    assert len(urls) == 1
-
-
-def test_codex_attach_check_rejects_live_empty_raw_shorthand(monkeypatch, tmp_path, capsys):
-    # A live empty answer for the raw name is the server resolving it against its own cwd,
-    # exactly what the load does; unsloth/<name> is tried only when that resolves to nothing.
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(start, "_hub_gguf_files", lambda repo: None)
-    urls = []
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        urls.append(url)
-        if "unsloth" in url:
-            return {"variants": [{"quant": "Q4_K_M"}]}
-        return {"variants": []}
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "Qwen3-0.6B-GGUF")
-    assert len(urls) == 1
-    assert "Qwen3-0.6B-GGUF" in capsys.readouterr().err
-
-
-def test_codex_attach_check_defers_shorthand_when_canonical_probe_errors(monkeypatch):
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        raise urllib.error.HTTPError(url, 404, "nope", None, None)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "Qwen3-0.6B")
-
-
-def test_codex_attach_check_probes_hub_shaped_gguf_ids(monkeypatch, capsys):
-    monkeypatch.setattr(start, "_hub_gguf_files", lambda repo: None)
-    urls = _fake_variants(monkeypatch, {"variants": []})
-    with pytest.raises(typer.Exit):
-        start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "owner/model.gguf")
-    assert len(urls) == 1
-    assert "owner%2Fmodel.gguf" in urls[0]
-
-
-def test_codex_attach_check_defers_when_raw_name_exists_locally(monkeypatch, tmp_path):
-    (tmp_path / "models" / "qwen").mkdir(parents = True)
-    monkeypatch.chdir(tmp_path)
-    _fake_variants(monkeypatch, {"variants": []})
-    start._attach_gguf_check(start._CODEX_GGUF_AGENT, BASE, "sk-test", "models/qwen")
 
 
 # These also pin Codex's wording, now that the helpers are shared.
 
 
-def test_gguf_agents_name_themselves_and_their_own_subcommand(monkeypatch, capsys):
-    monkeypatch.setattr(start, "_is_hub_model_id", lambda name: True)
-    monkeypatch.setattr(start, "_hub_gguf_files", lambda repo: ["model-Q4_K_M.gguf"])
-    for agent, label, command in (
-        (start._CODEX_GGUF_AGENT, "Codex", "codex"),
-        (start._CLAUDE_GGUF_AGENT, "Claude Code", "claude"),
-    ):
-        with pytest.raises(typer.Exit) as excinfo:
-            start._fail_agent_needs_gguf(agent, "unsloth/gemma-3-4b-it")
-        assert excinfo.value.exit_code == 1
-        assert capsys.readouterr().err.strip() == (
-            f"{label} needs a GGUF model served by llama-server, but unsloth/gemma-3-4b-it "
-            f"is not one. Try: unsloth start {command} --model unsloth/gemma-3-4b-it-GGUF"
-        )
-
-
-def test_require_gguf_for_agent_reads_the_servers_status(monkeypatch, capsys):
-    monkeypatch.setattr(
-        start,
-        "_http_json",
-        lambda *a, **k: {"is_gguf": False, "active_model": "unsloth/gemma-3-4b-it"},
-    )
-    with pytest.raises(typer.Exit):
-        start._require_gguf_for_agent(
-            start._CLAUDE_GGUF_AGENT, BASE, "sk-test", "unsloth/gemma-3-4b-it"
-        )
-    assert "Claude Code needs a GGUF model" in capsys.readouterr().err
-    monkeypatch.setattr(start, "_http_json", lambda *a, **k: {"is_gguf": True})
-    start._require_gguf_for_agent(
-        start._CLAUDE_GGUF_AGENT, BASE, "sk-test", "unsloth/gemma-3-4b-it-GGUF"
-    )
-
-
-def test_claude_preload_gate_rejects_before_an_evicting_load(fake_studio, monkeypatch):
-    inner = start._http_json
-    probed = []
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if "/api/models/gguf-variants" in url:
-            probed.append(url)
-            return {"variants": []}
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    result = CliRunner().invoke(
-        start.start_app, ["claude", "--model", "unsloth/Qwen3-1.7B", "--no-launch"]
-    )
-    assert result.exit_code == 1
-    assert "Claude Code needs a GGUF model" in result.output
-    assert probed, "the gate must probe the server before the load"
-    assert not [call for call in fake_studio if call[1].endswith("/api/inference/load")]
-
-
 # Tolerance: callers tear the server down on any exception, so only "is_gguf": false rejects.
-
-
-def _status_raises(monkeypatch, exc):
-    def http_json(*args, **kwargs):
-        raise exc
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-
-
-def _require_claude_gguf():
-    start._require_gguf_for_agent(
-        start._CLAUDE_GGUF_AGENT, BASE, "sk-test", "unsloth/gemma-3-4b-it"
-    )
-
-
-@pytest.mark.parametrize(
-    "code,reason",
-    [
-        (404, "not found"),  # older server without the endpoint
-        (401, "Unauthorized"),  # key scoped to /v1, not /api
-        (403, "Forbidden"),
-        (500, "Failed to get status"),  # get_status's own catch-all, GGUF still resident
-        (503, "Service Unavailable"),
-        (302, "refusing redirect"),  # urlopen_no_redirect raises this shape
-    ],
-)
-def test_require_gguf_never_rejects_on_an_http_error(monkeypatch, capsys, code, reason):
-    url = f"{BASE}/api/inference/status"
-    _status_raises(monkeypatch, urllib.error.HTTPError(url, code, reason, None, None))
-    assert _require_claude_gguf() is None
-    assert capsys.readouterr().err == ""
-
-
-@pytest.mark.parametrize(
-    "exc",
-    [
-        urllib.error.URLError(ConnectionRefusedError(111, "Connection refused")),
-        TimeoutError("timed out"),
-        OSError(101, "Network is unreachable"),
-        json.JSONDecodeError("Expecting value", "<html>not json</html>", 0),
-        http.client.BadStatusLine("garbage"),
-        http.client.RemoteDisconnected("closed"),
-    ],
-)
-def test_require_gguf_never_rejects_on_a_transport_failure(monkeypatch, capsys, exc):
-    # Nor as a traceback: only HTTPError was caught before.
-    _status_raises(monkeypatch, exc)
-    assert _require_claude_gguf() is None
-    assert capsys.readouterr().err == ""
-
-
-@pytest.mark.parametrize(
-    "body",
-    [
-        {},  # blank 200 body; _http_json turns "" into {}
-        {"model_identifier": "unsloth/Qwen3-1.7B-GGUF"},  # 200 without the key
-        {"error": "API endpoint not found"},  # Studio older than the /api/* 404
-        {"is_gguf": None},  # explicit null from a proxy or hand-rolled server
-        ["not", "a", "dict"],
-        None,
-    ],
-)
-def test_require_gguf_treats_an_unreadable_answer_as_unknown(monkeypatch, capsys, body):
-    monkeypatch.setattr(start, "_http_json", lambda *a, **k: body)
-    assert _require_claude_gguf() is None
-    # The old code claimed "needs a GGUF model", which the server never said.
-    assert "needs a GGUF model" not in capsys.readouterr().err
-
-
-@pytest.mark.parametrize(
-    "agent,label",
-    [("_CODEX_GGUF_AGENT", "Codex"), ("_CLAUDE_GGUF_AGENT", "Claude Code")],
-)
-def test_require_gguf_still_rejects_a_definite_no(monkeypatch, capsys, agent, label):
-    monkeypatch.setattr(start, "_hub_gguf_files", lambda repo: None)  # no Try: suffix
-    monkeypatch.setattr(
-        start,
-        "_http_json",
-        lambda *a, **k: {"is_gguf": False, "model_identifier": "transformers-model"},
-    )
-    with pytest.raises(typer.Exit) as excinfo:
-        start._require_gguf_for_agent(
-            getattr(start, agent), BASE, "sk-test", "unsloth/gemma-3-4b-it"
-        )
-    assert excinfo.value.exit_code == 1
-    assert capsys.readouterr().err.strip() == (
-        f"{label} needs a GGUF model served by llama-server, "
-        "but unsloth/gemma-3-4b-it is not one."
-    )
-
-
-@pytest.mark.parametrize(
-    "body",
-    [
-        {"is_gguf": False},
-        {"is_gguf": False, "active_model": None},
-        {"is_gguf": False, "active_model": None, "model_identifier": None},
-    ],
-)
-def test_require_gguf_treats_an_idle_server_as_unknown(monkeypatch, body):
-    # is_gguf's False default means an idle server answers False and names no model;
-    # reading that as "not GGUF" refuses a good GGUF that is merely not loaded yet.
-    monkeypatch.setattr(start, "_http_json", lambda *a, **k: body)
-    start._require_gguf_for_agent(
-        start._CLAUDE_GGUF_AGENT, BASE, "sk-test", "unsloth/gemma-3-4b-it-GGUF"
-    )
-
-
-def test_require_gguf_still_rejects_a_named_non_gguf_model(monkeypatch, capsys):
-    # The tolerance above must not reach a server that does name what it is holding.
-    monkeypatch.setattr(
-        start,
-        "_http_json",
-        lambda *a, **k: {"is_gguf": False, "model_identifier": "unsloth/gemma-3-4b-it"},
-    )
-    with pytest.raises(typer.Exit):
-        start._require_gguf_for_agent(
-            start._CLAUDE_GGUF_AGENT, BASE, "sk-test", "unsloth/gemma-3-4b-it"
-        )
-    assert "Claude Code needs a GGUF model" in capsys.readouterr().err
-
-
-def test_require_gguf_does_not_swallow_a_real_exit(monkeypatch):
-    # Guards the exception tuple against being loosened to `except Exception`.
-    _status_raises(monkeypatch, typer.Exit(code = 1))
-    with pytest.raises(typer.Exit):
-        _require_claude_gguf()
-
-
-def test_require_gguf_does_not_swallow_a_bug(monkeypatch):
-    _status_raises(monkeypatch, AttributeError("typo in the stub"))
-    with pytest.raises(AttributeError):
-        _require_claude_gguf()
-
-
-@pytest.mark.parametrize("agent", ["claude", "codex"])
-def test_a_status_body_without_is_gguf_still_launches(fake_studio, monkeypatch, agent):
-    inner = start._http_json
-
-    def http_json(
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        if url.endswith("/api/inference/status"):
-            return {"model_identifier": MODEL["id"]}
-        return inner(method, url, token, payload, timeout, error)
-
-    monkeypatch.setattr(start, "_http_json", http_json)
-    result = CliRunner().invoke(start.start_app, [agent, "--no-launch"])
-    assert result.exit_code == 0, result.output
-    assert "needs a GGUF model" not in result.output
 
 
 @pytest.mark.parametrize(
@@ -8193,172 +4886,10 @@ def test_a_status_body_without_is_gguf_still_launches(fake_studio, monkeypatch, 
         ("codex", ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN")),
     ],
 )
-def test_launch_drops_provider_credentials(agent, unset, fake_studio, monkeypatch):
+def test_launch_drops_provider_credentials(agent, unset, fake_vllm, monkeypatch):
     monkeypatch.setattr(start.shutil, "which", lambda _: f"/usr/local/bin/{agent}")
     for name in unset:
         monkeypatch.setenv(name, "sk-stale")
     captured = _capture_launch(monkeypatch, [agent])
     for name in unset:
         assert name not in captured["env"]
-
-
-def test_direct_gguf_labels_keep_packed_and_grouped_quants():
-    # Mirrors model_config._extract_quant_label: prism-ml/Ternary-Bonsai-*-gguf ships all three.
-    for name, label in (
-        ("Ternary-Bonsai-8B-PQ2_0.gguf", "PQ2_0"),
-        ("Ternary-Bonsai-8B-Q2_0.gguf", "Q2_0"),
-        ("Ternary-Bonsai-8B-Q2_0_g64.gguf", "Q2_0_g64"),
-        ("Ternary-Bonsai-2-27B-PTQ1_0.gguf", "PTQ1_0"),
-    ):
-        assert start._direct_gguf_variant_labels(name)[1] == label
-
-
-GiB = 1024**3
-
-
-class _LoadServer:
-    """Fake Studio: `listing` answers active-downloads, `repos` maps repo -> iterator of progress readings."""
-
-    def __init__(self, listing, repos):
-        self.listing = listing
-        self.repos = {repo: iter(readings) for repo, readings in repos.items()}
-        self.urls = []
-
-    def __call__(
-        self,
-        method,
-        url,
-        token,
-        payload = None,
-        timeout = 30,
-        error = None,
-        *,
-        internal_auth = False,
-    ):
-        self.urls.append(url)
-        if url.endswith("/active-downloads"):
-            if isinstance(self.listing, Exception):
-                raise self.listing
-            return {"downloads": self.listing}
-        repo = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["repo_id"][0]
-        reading = next(self.repos[repo])
-        if isinstance(reading, Exception):
-            raise reading
-        return reading
-
-    def count(self, fragment):
-        return sum(fragment in url for url in self.urls)
-
-
-def _reading(
-    downloaded,
-    expected = 4 * GiB,
-    completed = 0,
-):
-    return {
-        "downloaded_bytes": downloaded,
-        "completed_bytes": completed,
-        "expected_bytes": expected,
-    }
-
-
-def _load_job(repo, **extra):
-    return {"repo_id": repo, "owner": "load", "state": "running", **extra}
-
-
-def _progress(monkeypatch, server, clock):
-    monkeypatch.setattr(start, "_http_json", server)
-    monkeypatch.setattr(start.time, "monotonic", lambda: clock[0])
-    return start._ModelDownloadProgress(BASE, "sk-test", "owner/adapter", None)
-
-
-def test_model_download_progress_counts_the_base_a_load_reports(monkeypatch, capsys):
-    adapter_done = _reading(8 * 1024**2, 8 * 1024**2, 8 * 1024**2)
-    server = _LoadServer(
-        [
-            _load_job("owner/base"),
-            {"repo_id": "someone/else", "state": "running"},
-            {"repo_id": "owner/attached", "state": "running", "load_attached": True},
-        ],
-        {
-            "owner/adapter": [adapter_done] * 3,
-            "owner/base": [_reading(0), _reading(1 * GiB), _reading(2 * GiB)],
-            "owner/attached": [_reading(3 * GiB)] + [TimeoutError("slow")] * 2,
-        },
-    )
-    clock = [0.0]
-    progress = _progress(monkeypatch, server, clock)
-
-    for _ in range(3):
-        progress.poll()
-        clock[0] += 1.0
-
-    assert progress.downloaded_bytes == 8 * 1024**2 + 2 * GiB + 3 * GiB
-    assert server.count("someone%2Felse") == 0
-    # The line follows the base as it grows, not the attached job first seen at 3 GiB.
-    out = capsys.readouterr().out
-    assert "1.0 GiB / 4.0 GiB" in out and "3.0 GiB" not in out
-
-
-def test_model_download_progress_lists_load_jobs_at_most_every_interval(monkeypatch):
-    done = _reading(4 * GiB, completed = 4 * GiB)
-    server = _LoadServer(
-        [_load_job("owner/base")],
-        {
-            "owner/adapter": [_reading(1024)] * 20,
-            "owner/base": [_reading(GiB), done] + [AssertionError] * 20,
-        },
-    )
-    clock = [0.0]
-    progress = _progress(monkeypatch, server, clock)
-
-    for _ in range(12):
-        progress.poll()
-        clock[0] += 1.0
-
-    assert server.count("/active-downloads") == 3
-    # A finished base is not scanned again, but its bytes still count.
-    assert server.count("owner%2Fbase") == 2
-    assert progress.downloaded_bytes == 1024 + 4 * GiB
-
-
-def test_model_download_progress_stops_listing_on_a_server_without_the_route(monkeypatch):
-    missing = urllib.error.HTTPError(BASE, 404, "Not Found", None, None)
-    server = _LoadServer(missing, {"owner/adapter": [_reading(1024)] * 20})
-    clock = [0.0]
-    progress = _progress(monkeypatch, server, clock)
-
-    for _ in range(12):
-        progress.poll()
-        clock[0] += 1.0
-
-    assert server.count("/active-downloads") == 1
-    assert progress.downloaded_bytes == 1024
-
-
-def test_download_progress_display_restarts_when_the_repo_changes(monkeypatch, capsys):
-    monkeypatch.setattr(start.sys.stdout, "isatty", lambda: False, raising = False)
-    display = start._DownloadProgressDisplay()
-
-    display.update(_reading(19 * 1024**2, 20 * 1024**2), "owner/adapter")
-    display.update(_reading(GiB), "owner/base")
-
-    out = capsys.readouterr().out
-    assert "19.0 MiB / 20.0 MiB" in out
-    assert "1.0 GiB / 4.0 GiB" in out
-
-
-def test_model_download_progress_counts_the_remote_base_of_a_local_adapter(monkeypatch):
-    server = _LoadServer(
-        [_load_job("owner/base")], {"owner/base": [_reading(GiB), _reading(2 * GiB)]}
-    )
-    clock = [0.0]
-    monkeypatch.setattr(start, "_http_json", server)
-    monkeypatch.setattr(start.time, "monotonic", lambda: clock[0])
-    progress = start._ModelDownloadProgress(BASE, "sk-test", "/models/my-lora", None)
-
-    progress.poll()
-    progress.poll()
-
-    assert progress.downloaded_bytes == 2 * GiB
-    assert server.count("my-lora") == 0
