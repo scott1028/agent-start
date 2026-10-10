@@ -24,6 +24,7 @@ from agent_switch.core.install import (
     _which_with_install_dirs,
 )
 from agent_switch.core.launch import _connect, _resolve_target, _run
+from agent_switch.core.mcp import load_mcp_servers
 from agent_switch.core.options import (
     LoadOptions,
     ProviderName,
@@ -34,6 +35,8 @@ from agent_switch.core.options import (
     _KEY_OPTION,
     _LAUNCH_OPTION,
     _MAX_TOKENS_OPTION,
+    _MCP_ALL_OPTION,
+    _MCP_OPTION,
     _MIN_P_OPTION,
     _MODEL_LOAD_OPTION,
     _MODEL_OPTION,
@@ -275,6 +278,24 @@ class _JsExpression(str):
     """A dsh loader `!!js` value: evaluated at boot, so it must not be written as a plain string."""
 
 
+def _dsh_mcp_config(name: str, server: dict) -> dict:
+    """One dsh-mcp-client 0.1.5-rc.2 config block for a mounted MCP server."""
+    if server["transport"] == "stdio":
+        return {
+            "transport": "stdio",
+            "serverName": name,
+            "command": server["command"],
+            "args": server["args"],
+            "env": server["env"],
+        }
+    return {
+        "transport": "streamable-http",
+        "serverName": name,
+        "url": server["url"],
+        "headers": server["headers"],
+    }
+
+
 def write_dsh_patch(
     base: str,
     model: dict,
@@ -285,6 +306,7 @@ def write_dsh_patch(
     max_tokens: Optional[int] = None,
     compact_at: Optional[float] = None,
     is_tui: bool = False,
+    mcp_servers: Optional[dict] = None,
 ) -> None:
     """Write the dsh loader patch that points the booted profile at the model server.
 
@@ -347,6 +369,23 @@ def write_dsh_patch(
                 "id": "compaction-basic",
                 "name": "@deepseek-ai/dsh-compaction-basic",
                 "config": {"thresholdRatio": compact_at},
+            }
+        )
+    if mcp_servers:
+        # A row without `insert` only patches an existing plugin id (the include loader warns
+        # "entry not found" and skips it), so the mounted servers go through one insert row.
+        # DSH_HOME is already the session's, which is what replaces the user's own servers;
+        # the patch is rewritten whole, so a run without MCP flags drops the row again.
+        entries.append(
+            {
+                "insert": [
+                    {
+                        "id": f"mcp-{name}",
+                        "name": "@deepseek-ai/dsh-mcp-client",
+                        "config": _dsh_mcp_config(name, server),
+                    }
+                    for name, server in mcp_servers.items()
+                ]
             }
         )
     # TODO: dsh >= 0.1.7 keeps /settings in the profile patch, and this row replaces the whole
@@ -674,6 +713,8 @@ def dsh(
     provider: Optional[ProviderName] = _PROVIDER_OPTION,
     yolo: bool = _YOLO_OPTION,
     persist: Optional[bool] = _DSH_PERSIST_OPTION,
+    mcp: Optional[list[str]] = _MCP_OPTION,
+    mcp_all: bool = _MCP_ALL_OPTION,
 ):
     """Point DeepSeek Harness (dsh) at a local model server and start it."""
     # One handler for dsh and the TUI: they share the server route and differ in launch and home.
@@ -688,6 +729,9 @@ def dsh(
         )
     else:
         _reject_as_subagent("dsh", ctx.args)
+    # Validate the MCP selection before _connect, so a registry error fails fast.
+    # --as-subagent is refused for dsh above, so an MCP flag there fails with it already.
+    mcp_servers = load_mcp_servers(mcp, should_mount_all = mcp_all)
     headers = parse_headers(header)
     target = _resolve_target(url, provider, api_key, headers)
     install_hint = _npm_install_hint(_DSH_TUI_PACKAGE if is_tui else _DSH_PACKAGE)
@@ -735,6 +779,7 @@ def dsh(
             max_tokens = max_tokens,
             compact_at = compact_at,
             is_tui = is_tui,
+            mcp_servers = mcp_servers,
         )
         # A Windows dsh under WSL gets DSH_HOME translated through WSLENV, but not argv.
         if is_tui:

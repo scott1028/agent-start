@@ -22,6 +22,7 @@ from agent_switch.core.install import (
     _which_with_install_dirs,
 )
 from agent_switch.core.launch import _connect, _resolve_target, _run
+from agent_switch.core.mcp import load_mcp_servers
 from agent_switch.core.options import (
     LoadOptions,
     ProviderName,
@@ -32,6 +33,8 @@ from agent_switch.core.options import (
     _HEADER_OPTION,
     _KEY_OPTION,
     _LAUNCH_OPTION,
+    _MCP_ALL_OPTION,
+    _MCP_OPTION,
     _MIN_P_OPTION,
     _MODEL_LOAD_OPTION,
     _MODEL_OPTION,
@@ -146,18 +149,57 @@ def _codex_provider_table(base: str, headers: Optional[dict] = None) -> str:
 _CODEX_PROVIDER_TABLES = (_PROVIDER_HEADER, _PROVIDER_HEADER[:-1] + ".")
 
 
-def _merge_codex_config(existing: str, base: str, headers: Optional[dict] = None) -> str:
+def _codex_mcp_tables(servers: Optional[dict]) -> str:
+    """[mcp_servers."<name>"] tables for the session config.toml; keys verified against the codex binary."""
+    if not servers:
+        return ""
+    tables = ""
+    for name, server in servers.items():
+        tables += f'\n[mcp_servers.{json.dumps(name)}]\n'
+        if server["transport"] == "stdio":
+            tables += f"command = {json.dumps(server['command'])}\n"
+            if server["args"]:
+                tables += f"args = {json.dumps(server['args'])}\n"
+            if server["env"]:
+                pairs = ", ".join(
+                    f"{json.dumps(key)} = {json.dumps(value)}"
+                    for key, value in server["env"].items()
+                )
+                tables += f"env = {{ {pairs} }}\n"
+        else:
+            tables += f"url = {json.dumps(server['url'])}\n"
+            if server["headers"]:
+                pairs = ", ".join(
+                    f"{json.dumps(key)} = {json.dumps(value)}"
+                    for key, value in server["headers"].items()
+                )
+                tables += f"http_headers = {{ {pairs} }}\n"
+    return tables
+
+
+def _merge_codex_config(
+    existing: str,
+    base: str,
+    headers: Optional[dict] = None,
+    mcp_servers: Optional[dict] = None,
+) -> str:
     chunks = re.split(r"(?m)^(?=\[)", existing)  # preamble, then one chunk per table
     if not re.search(r"(?m)^\s*oss_provider\s*=", chunks[0]):
         if chunks[0] and not chunks[0].endswith("\n"):
             chunks[0] += "\n"
         chunks[0] += f'oss_provider = "{_CODEX_PROFILE}"\n'
-    text = "".join(c for c in chunks if not c.startswith(_CODEX_PROVIDER_TABLES))
+    # This config.toml is agent-switch's own; drop every mcp_servers chunk first so a persisted
+    # session never keeps an earlier run's servers, then append the ones mounted now (if any).
+    text = "".join(
+        c
+        for c in chunks
+        if not c.startswith(_CODEX_PROVIDER_TABLES) and not c.startswith("[mcp_servers")
+    )
     if not text.endswith("\n"):
         text += "\n"
     if not text.endswith("\n\n"):
         text += "\n"
-    return text + _codex_provider_table(base, headers)
+    return text + _codex_provider_table(base, headers) + _codex_mcp_tables(mcp_servers)
 
 
 # Keep custom-model behavior aligned with Codex's own unknown-model fallback. This Apache-2.0 prompt is copied from openai/codex rust-v0.144.0 models-manager/prompt.md.
@@ -230,12 +272,13 @@ def write_codex_config(
     reasoning_effort: Optional[str] = None,
     headers: Optional[dict] = None,
     compact_at: Optional[float] = None,
+    mcp_servers: Optional[dict] = None,
 ) -> None:
     home.mkdir(parents = True, exist_ok = True)
 
     config = home / "config.toml"
     existing = config.read_text(encoding = "utf-8") if config.exists() else ""
-    merged = _merge_codex_config(existing, base, headers)
+    merged = _merge_codex_config(existing, base, headers, mcp_servers)
     if merged != existing:
         config.write_text(merged, encoding = "utf-8")
         # http_headers can carry a secret Authorization, so keep the file owner-only like the JSON configs.
@@ -509,11 +552,19 @@ def codex(
     yolo: bool = _YOLO_OPTION,
     persist: bool = _PERSIST_OPTION,
     as_subagent: bool = _AS_SUBAGENT_OPTION,
+    mcp: Optional[list[str]] = _MCP_OPTION,
+    mcp_all: bool = _MCP_ALL_OPTION,
 ):
     """Point OpenAI Codex at a local model server and start it."""
     # Route a leading `org/name` positional to --model; forward the rest to the agent.
     model, ctx.args[:] = _consume_positional_model(model, ctx.args)
     headers = parse_headers(header)
+    if as_subagent and (mcp or mcp_all):
+        # The subagent's parent CODEX_HOME symlinks into the real ~/.codex, so writing MCP
+        # servers there would modify the user's own config.
+        _fail("--mcp/--mcp-all cannot be combined with --as-subagent.")
+    # Validate the MCP selection before _connect, so a registry error fails fast.
+    mcp_servers = load_mcp_servers(mcp, should_mount_all = mcp_all)
     target = _resolve_target(url, provider, api_key, headers)
     install_hint = _npm_install_hint("@openai/codex")
     _require_agent_for_launch("codex", install_hint, launch)
@@ -581,7 +632,7 @@ def codex(
         *ctx.args,
     ]
     with _session_config("codex", launch, persist = persist) as home:
-        write_codex_config(base, entry, home, codex_effort, headers, compact_at)
+        write_codex_config(base, entry, home, codex_effort, headers, compact_at, mcp_servers)
         env = {_CODEX_ENV_KEY: key, "CODEX_HOME": str(home)}
         _run(
             base,

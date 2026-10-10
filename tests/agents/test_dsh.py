@@ -31,6 +31,7 @@ from tests.cli_support import (
     _capture_launch,
     _dsh_entries,
     _launch_command,
+    _mcp_registry,
 )
 from tests.start_split import set_start_attr
 
@@ -526,3 +527,77 @@ def test_dsh_no_launch_links_user_resources_into_the_session(fake_vllm, tmp_path
     dsh_home = tmp_path / "agents" / "dsh"
     assert (dsh_home / "AGENTS.md").resolve() == (source / "AGENTS.md").resolve()
     assert (dsh_home / "skills").resolve() == (source / "skills").resolve()
+
+
+# ── --mcp / --mcp-all: session-only MCP mounting ─────────────────────
+
+
+def _dsh_mcp_rows(patch_path):
+    yaml = pytest.importorskip("yaml")
+    rows = [entry["insert"] for entry in yaml.safe_load(patch_path.read_text()) if "insert" in entry]
+    assert len(rows) <= 1
+    return {row["id"]: row for row in rows[0]} if rows else {}
+
+
+def test_connect_dsh_mcp_inserts_one_row_per_server(fake_vllm, tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
+    _mcp_registry()
+    result = CliRunner().invoke(
+        start.start_app, ["dsh", "--no-launch", "--mcp", "context7", "--mcp", "github"]
+    )
+    assert result.exit_code == 0, result.output
+    rows = _dsh_mcp_rows(tmp_path / "agents" / "dsh" / dsh_agent._DSH_PATCH_FILE)
+    assert set(rows) == {"mcp-context7", "mcp-github"}
+    assert rows["mcp-context7"]["name"] == "@deepseek-ai/dsh-mcp-client"
+    assert rows["mcp-context7"]["config"] == {
+        "transport": "stdio",
+        "serverName": "context7",
+        "command": "npx",
+        "args": ["-y", "@upstash/context7-mcp"],
+        "env": {},
+    }
+    assert rows["mcp-github"]["config"] == {
+        "transport": "streamable-http",
+        "serverName": "github",
+        "url": "https://api.githubcopilot.com/mcp/",
+        "headers": {"Authorization": "Bearer gh-secret"},
+    }
+    assert "gh-secret" not in result.output
+
+
+def test_connect_dsh_mcp_all_mounts_every_registry_server(fake_vllm, tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
+    _mcp_registry()
+    result = CliRunner().invoke(start.start_app, ["dsh", "--no-launch", "--mcp-all"])
+    assert result.exit_code == 0, result.output
+    rows = _dsh_mcp_rows(tmp_path / "agents" / "dsh" / dsh_agent._DSH_PATCH_FILE)
+    assert set(rows) == {"mcp-context7", "mcp-github"}
+
+
+def test_connect_dsh_without_mcp_flags_has_no_insert_row(fake_vllm, tmp_path):
+    result = CliRunner().invoke(start.start_app, ["dsh", "--no-launch"])
+    assert result.exit_code == 0, result.output
+    patch = tmp_path / "agents" / "dsh" / dsh_agent._DSH_PATCH_FILE
+    assert _dsh_mcp_rows(patch) == {}
+
+
+def test_dsh_mcp_state_cleared_on_rerun_without_flags(fake_vllm, tmp_path, monkeypatch):
+    # The patch is rewritten whole, so a run without MCP flags drops the insert row again.
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
+    _mcp_registry()
+    result = CliRunner().invoke(start.start_app, ["dsh", "--no-launch", "--mcp", "context7"])
+    assert result.exit_code == 0, result.output
+    patch = tmp_path / "agents" / "dsh" / dsh_agent._DSH_PATCH_FILE
+    assert _dsh_mcp_rows(patch)
+    result = CliRunner().invoke(start.start_app, ["dsh", "--no-launch"])
+    assert result.exit_code == 0, result.output
+    assert _dsh_mcp_rows(patch) == {}
+
+
+def test_dsh_mcp_with_as_subagent_fails(fake_vllm):
+    _mcp_registry()
+    result = CliRunner().invoke(
+        start.start_app, ["dsh", "--no-launch", "--mcp", "context7", "--as-subagent"]
+    )
+    assert result.exit_code == 1
+    assert "--as-subagent is not supported for dsh." in result.output

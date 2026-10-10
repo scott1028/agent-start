@@ -16,6 +16,7 @@ from agent_switch.core.install import (
     _require_agent_for_launch,
 )
 from agent_switch.core.launch import _connect, _resolve_target, _run
+from agent_switch.core.mcp import load_mcp_servers
 from agent_switch.core.options import (
     LoadOptions,
     ProviderName,
@@ -28,6 +29,8 @@ from agent_switch.core.options import (
     _KEY_OPTION,
     _LAUNCH_OPTION,
     _MAX_TOKENS_OPTION,
+    _MCP_ALL_OPTION,
+    _MCP_OPTION,
     _MIN_P_OPTION,
     _MODEL_LOAD_OPTION,
     _MODEL_OPTION,
@@ -469,11 +472,17 @@ def pi(
     yolo: bool = _YOLO_OPTION,
     persist: bool = _PERSIST_OPTION,
     as_subagent: bool = _AS_SUBAGENT_OPTION,
+    mcp: Optional[list[str]] = _MCP_OPTION,
+    mcp_all: bool = _MCP_ALL_OPTION,
 ):
     """Point Pi (coding agent) at a local model server and start it."""
     # Route a leading `org/name` positional to --model; forward the rest to the agent.
     model, ctx.args[:] = _consume_positional_model(model, ctx.args)
     headers = parse_headers(header)
+    if as_subagent and (mcp or mcp_all):
+        _fail("--mcp/--mcp-all cannot be combined with --as-subagent.")
+    # Validate the MCP selection before _connect, so a registry error fails fast.
+    mcp_servers = load_mcp_servers(mcp, should_mount_all = mcp_all)
     target = _resolve_target(url, provider, api_key, headers)
     install_hint = _npm_install_hint(
         "@earendil-works/pi-coding-agent",
@@ -571,6 +580,31 @@ def pi(
         )
         write_pi_user_resources(pi_agent_dir, home)
         write_pi_compaction(pi_agent_dir, entry, compact_at)
+        # Pi 1.1.0's built-in MCP reads <agentDir>/mcp.json (as does the user's pi-mcp-adapter);
+        # HOME and PI_CODING_AGENT_DIR are already the session's, so this file replaces the
+        # user's own servers for the session. Without MCP flags it is removed again, so a
+        # persisted session keeps no earlier mount.
+        mcp_path = pi_agent_dir / "mcp.json"
+        if mcp_servers:
+            _write_private_json(
+                mcp_path,
+                {
+                    "mcpServers": {
+                        name: (
+                            {
+                                "command": server["command"],
+                                "args": server["args"],
+                                "env": server["env"],
+                            }
+                            if server["transport"] == "stdio"
+                            else {"url": server["url"], "headers": server["headers"]}
+                        )
+                        for name, server in mcp_servers.items()
+                    }
+                },
+            )
+        else:
+            mcp_path.unlink(missing_ok = True)
         env = {"HOME": str(home), "PI_CODING_AGENT_DIR": str(pi_agent_dir)}
         if os.name == "nt" or os.environ.get("WSL_DISTRO_NAME"):
             # Node resolves ~/.pi via USERPROFILE (then HOMEDRIVE + HOMEPATH) on Windows, not HOME. Set them whenever Pi may run as a Windows process: native Windows, or a /mnt Windows shim launched from WSL, where the WSLENV bridge then translates the path. Otherwise the Windows process falls back to the user's real %USERPROFILE%\\.pi. splitdrive yields no drive off a POSIX path, so HOMEDRIVE/HOMEPATH stay unset there.

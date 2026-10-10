@@ -33,6 +33,7 @@ from tests.cli_support import (
     _assert_env_unset,
     _capture_launch,
     _launch_command,
+    _mcp_registry,
     _parse_toml,
     _path_aware_which,
 )
@@ -722,3 +723,66 @@ def test_default_launch_has_no_resume_token(fake_vllm, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda name, path = None: "/usr/local/bin/codex")
     captured = _capture_launch(monkeypatch, ["codex"])
     assert "resume" not in captured["command"]
+
+
+# ── --mcp / --mcp-all: session-only MCP mounting ─────────────────────
+
+
+def test_connect_codex_mcp_writes_mcp_server_tables(fake_vllm, tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
+    _mcp_registry()
+    result = CliRunner().invoke(
+        start.start_app, ["codex", "--no-launch", "--mcp", "context7", "--mcp", "github"]
+    )
+    assert result.exit_code == 0, result.output
+    config = _parse_toml((tmp_path / "agents" / "codex" / "config.toml").read_text())
+    assert config["mcp_servers"]["context7"] == {
+        "command": "npx",
+        "args": ["-y", "@upstash/context7-mcp"],
+    }
+    assert config["mcp_servers"]["github"] == {
+        "url": "https://api.githubcopilot.com/mcp/",
+        "http_headers": {"Authorization": "Bearer gh-secret"},
+    }
+    # The expanded secret rides only in the private (0600) config, never in the printed recipe.
+    assert "gh-secret" not in result.output
+
+
+def test_connect_codex_mcp_all_mounts_every_registry_server(fake_vllm, tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
+    _mcp_registry()
+    result = CliRunner().invoke(start.start_app, ["codex", "--no-launch", "--mcp-all"])
+    assert result.exit_code == 0, result.output
+    config = _parse_toml((tmp_path / "agents" / "codex" / "config.toml").read_text())
+    assert set(config["mcp_servers"]) == {"context7", "github"}
+
+
+def test_connect_codex_without_mcp_flags_has_no_mcp_servers(fake_vllm, tmp_path):
+    result = CliRunner().invoke(start.start_app, ["codex", "--no-launch"])
+    assert result.exit_code == 0, result.output
+    config = _parse_toml((tmp_path / "agents" / "codex" / "config.toml").read_text())
+    assert "mcp_servers" not in config
+
+
+def test_codex_mcp_state_cleared_on_rerun_without_flags(fake_vllm, tmp_path, monkeypatch):
+    # A --no-launch CODEX_HOME is reused, so the next run must not keep the earlier mount.
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
+    _mcp_registry()
+    result = CliRunner().invoke(start.start_app, ["codex", "--no-launch", "--mcp", "context7"])
+    assert result.exit_code == 0, result.output
+    config_path = tmp_path / "agents" / "codex" / "config.toml"
+    assert "mcp_servers" in _parse_toml(config_path.read_text())
+    result = CliRunner().invoke(start.start_app, ["codex", "--no-launch"])
+    assert result.exit_code == 0, result.output
+    assert "mcp_servers" not in _parse_toml(config_path.read_text())
+
+
+def test_codex_mcp_with_as_subagent_fails(fake_vllm):
+    # The subagent's parent CODEX_HOME symlinks into the real ~/.codex; writing MCP servers
+    # there would modify the user's own config.
+    _mcp_registry()
+    result = CliRunner().invoke(
+        start.start_app, ["codex", "--as-subagent", "--no-launch", "--mcp", "context7"]
+    )
+    assert result.exit_code == 1
+    assert "--mcp/--mcp-all cannot be combined with --as-subagent" in result.output

@@ -142,6 +142,46 @@ effective window (the window minus its output reserve), so there it can only pul
 trigger earlier, never later. DeepSeek Harness applies it only to its headless profile
 (`--profile headless`): its web profile ignores it, and agent-switch warns before starting it.
 
+## MCP servers
+
+`--mcp NAME` (repeat the flag) and `--mcp-all` mount MCP servers into one agent session only, from
+a registry agent-switch owns: `~/.agent-switch/mcp.json` (or `$AGENT_SWITCH_HOME/mcp.json`), in the
+common `.mcp.json` shape:
+
+```json
+{
+  "mcpServers": {
+    "context7":  { "command": "npx", "args": ["-y", "@upstash/context7-mcp"] },
+    "github":    { "type": "http", "url": "https://api.githubcopilot.com/mcp/",
+                   "headers": { "Authorization": "Bearer ${GITHUB_TOKEN}" } },
+    "atlassian": { "type": "http", "url": "https://mcp.atlassian.com/v1/mcp", "oauth": true }
+  }
+}
+```
+
+A stdio server needs `command` and may carry `args` and `env`; an http server uses
+`"type": "http"`, `url`, `headers` and `oauth`. Server names must match `[A-Za-z0-9_-]+`; other
+transports (e.g. `sse`) are refused. `${VAR}` in `args`, `env` values, `url` and `headers` values
+is expanded from your environment at launch, and an unset variable stops the launch naming it. The
+expanded values go only into the session's private (0600) config files, never into the printed
+command.
+
+```sh
+agent-switch claude --mcp context7 --mcp github   # just these two, this session only
+agent-switch codex --mcp-all                      # every server in the registry
+```
+
+The mounted servers replace the agent's own MCP servers for the session: Claude Code gets
+`--strict-mcp-config --mcp-config=<session file>`, and Codex, OpenCode, Pi and dsh take them through
+their isolated session config (OpenCode additionally copies your global config's unmounted servers
+with `enabled: false`). MCP config inside the project you launch from may still load: OpenCode's
+project `opencode.json` outranks the session overlay, for example. An `oauth: true` http server is
+mounted through the pinned `mcp-remote` (needs `npx`): it signs in with a browser on first use, keeps
+the tokens under `~/.agent-switch/mcp-auth/mcp-remote-v1/<url-hash>_tokens.json` (delete that file to
+sign in again), and takes its `headers` from a private `~/.agent-switch/mcp-auth/<name>.headers` file
+rather than the command line. `--mcp`/`--mcp-all` are not combined with `--as-subagent`. Each stdio
+server starts once per session, when the agent spawns it, and stops when the session ends.
+
 ## Develop
 
 ```sh

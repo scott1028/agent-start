@@ -19,6 +19,7 @@ from agent_switch.core.install import (
     _which_with_install_dirs,
 )
 from agent_switch.core.launch import _connect, _resolve_target, _run
+from agent_switch.core.mcp import load_mcp_servers
 from agent_switch.core.options import (
     LoadOptions,
     ProviderName,
@@ -31,6 +32,8 @@ from agent_switch.core.options import (
     _KEY_OPTION,
     _LAUNCH_OPTION,
     _MAX_TOKENS_OPTION,
+    _MCP_ALL_OPTION,
+    _MCP_OPTION,
     _MIN_P_OPTION,
     _MODEL_LOAD_OPTION,
     _MODEL_OPTION,
@@ -363,6 +366,81 @@ def _opencode_provider(
     }
 
 
+def _parse_jsonc(text: str) -> dict:
+    """Parse the JSONC OpenCode accepts: drop // and /* */ comments outside strings and trailing commas."""
+    kept: list[str] = []
+    in_string = in_block = escaped = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if in_block:
+            if char == "*" and text[index + 1 : index + 2] == "/":
+                in_block = False
+                index += 2
+            else:
+                index += 1
+            continue
+        if in_string:
+            kept.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "/" and text[index + 1 : index + 2] == "/":
+            while index < len(text) and text[index] != "\n":
+                index += 1
+            continue
+        elif char == "/" and text[index + 1 : index + 2] == "*":
+            in_block = True
+            index += 2
+            continue
+        elif char in "}]":
+            # Drop a trailing comma before the closer; a regex could corrupt a string holding ", }".
+            while kept and kept[-1].isspace():
+                kept.pop()
+            if kept and kept[-1] == ",":
+                kept.pop()
+        kept.append(char)
+        index += 1
+    return json.loads("".join(kept))
+
+
+def _opencode_global_mcp() -> dict:
+    """The mcp entries of the user's global opencode configs.
+
+    The session overlay outranks the global config but cannot delete a global entry, so an
+    unmounted one is disabled by a copy of itself (a bare {"enabled": false} can fail the
+    per-layer schema check). OpenCode loads config.json, opencode.json and opencode.jsonc
+    from its global dir, a later file winning per server, so all three are read here;
+    disabling a name OpenCode never loads is harmless.
+    """
+    config_home = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    directory = Path(config_home) / "opencode"
+    servers: dict = {}
+    for name in ("config.json", "opencode.json", "opencode.jsonc"):
+        path = directory / name
+        if not path.is_file():
+            continue
+        try:
+            data = _parse_jsonc(path.read_text(encoding = "utf-8"))
+        except (ValueError, OSError):
+            # Still unparseable after the JSONC handling; leave its servers on.
+            typer.echo(
+                f"Warning: couldn't parse {path}; its MCP servers stay enabled in this session.",
+                err = True,
+            )
+            continue
+        if isinstance(data, dict) and isinstance(data.get("mcp"), dict):
+            servers.update(data["mcp"])
+    return servers
+
+
 def write_opencode_config(
     base: str,
     key: str,
@@ -374,6 +452,7 @@ def write_opencode_config(
     request_body: Optional[dict] = None,
     headers: Optional[dict] = None,
     compact_at: Optional[float] = None,
+    mcp_servers: Optional[dict] = None,
 ) -> dict:
     config = _read_json_object(path)
     if config is None:
@@ -396,6 +475,33 @@ def write_opencode_config(
     _subdict(config, "provider")[_OPENCODE_PROVIDER] = _opencode_provider(
         base, key, model, max_tokens, request_body, headers
     )
+    # --mcp/--mcp-all rewrite the mcp map every run: mounted servers win by name in this
+    # overlay, and every unmounted entry of the user's global config is copied with
+    # enabled: false (this layer cannot delete a lower-layer entry). Without MCP flags the
+    # key is dropped, so a persisted session keeps no earlier mount.
+    if mcp_servers is None:
+        config.pop("mcp", None)
+    else:
+        mounted: dict = {}
+        for name, server in mcp_servers.items():
+            if server["transport"] == "stdio":
+                mounted[name] = {
+                    "type": "local",
+                    "command": [server["command"], *server["args"]],
+                    "environment": server["env"],
+                    "enabled": True,
+                }
+            else:
+                mounted[name] = {
+                    "type": "remote",
+                    "url": server["url"],
+                    "headers": server["headers"],
+                    "enabled": True,
+                }
+        for name, entry in _opencode_global_mcp().items():
+            if name not in mounted and isinstance(entry, dict):
+                mounted[name] = {**entry, "enabled": False}
+        config["mcp"] = mounted
     # Normal mode pins this as the session model. Subagent mode leaves the user's main/small models alone and exposes the local model to @local and /models.
     opencode_model = f"{_OPENCODE_PROVIDER}/{model['id']}"
     if as_subagent:
@@ -475,11 +581,17 @@ def opencode(
     yolo: bool = _YOLO_OPTION,
     persist: bool = _PERSIST_OPTION,
     as_subagent: bool = _AS_SUBAGENT_OPTION,
+    mcp: Optional[list[str]] = _MCP_OPTION,
+    mcp_all: bool = _MCP_ALL_OPTION,
 ):
     """Point OpenCode at a local model server and start it."""
     # Route a leading `org/name` positional to --model; forward the rest to the agent.
     model, ctx.args[:] = _consume_positional_model(model, ctx.args)
     headers = parse_headers(header)
+    if as_subagent and (mcp or mcp_all):
+        _fail("--mcp/--mcp-all cannot be combined with --as-subagent.")
+    # Validate the MCP selection before _connect, so a registry error fails fast.
+    mcp_servers = load_mcp_servers(mcp, should_mount_all = mcp_all)
     target = _resolve_target(url, provider, api_key, headers)
     command_name, opencode_v2 = _opencode_command()
     install_hint = _npm_install_hint("@opencode-ai/cli@beta" if opencode_v2 else "opencode-ai")
@@ -607,6 +719,7 @@ def opencode(
             request_body = server_options.request_body(),
             headers = headers,
             compact_at = compact_at,
+            mcp_servers = mcp_servers,
         )
         # A project's own opencode.json outranks OPENCODE_CONFIG, so the session model pin would silently lose to a repo config; carry it in OPENCODE_CONFIG_CONTENT, which outranks project config, while the API key stays in the private file. Only the config fallback carries a permission: native --auto omits it (auto-approve asks, keep explicit denies) and a non-yolo session omits it too, honoring project rules. V1 filters are ordinary overlays, so scope that session to our provider; V2 turns filters into security policies where global/project rules intentionally win, so keep those policies intact and tell the user above that they must allow our provider. small_model is opencode's separate model for lightweight tasks; pin it to the session model too, or a user/project small_model on another (now filtered) provider would resolve a not-found error mid-session.
         inline_config: dict = {

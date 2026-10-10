@@ -280,6 +280,24 @@ _AS_SUBAGENT_OPTION = typer.Option(
 )
 
 
+_MCP_OPTION = typer.Option(
+    None,
+    "--mcp",
+    metavar = "NAME",
+    rich_help_panel = _PANEL_SESSION,
+    help = "Mount this MCP server from the agent-switch registry (mcp.json in its home) for "
+    "this session only; repeat the flag for more. They replace the agent's own MCP servers.",
+)
+
+
+_MCP_ALL_OPTION = typer.Option(
+    False,
+    "--mcp-all",
+    rich_help_panel = _PANEL_SESSION,
+    help = "Mount every MCP server in the agent-switch registry for this session only.",
+)
+
+
 _COMPACT_AT_OPTION = typer.Option(
     None,
     "--compact-at",

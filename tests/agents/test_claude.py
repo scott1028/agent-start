@@ -32,6 +32,7 @@ from tests.cli_support import (
     _assert_env_unset,
     _capture_launch,
     _launch_command,
+    _mcp_registry,
     _path_aware_which,
     _simulate_windows,
 )
@@ -696,3 +697,84 @@ def test_native_resume_flag_passes_through_unchanged(fake_vllm, monkeypatch):
     # agent-switch never auto-appends its own resume token when the user drives resume.
     assert captured["command"].count("--resume") == 1
     assert "--continue" not in captured["command"]
+
+
+# ── --mcp / --mcp-all: session-only MCP mounting ─────────────────────
+
+
+def test_connect_claude_mcp_writes_private_config_and_flags(fake_vllm, tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
+    _mcp_registry()
+    result = CliRunner().invoke(
+        start.start_app,
+        ["claude", "--no-launch", "--mcp", "context7", "--mcp", "github", "hello"],
+    )
+    assert result.exit_code == 0, result.output
+    command = _launch_command(result.output)
+    mcp_arg = next(arg for arg in command if arg.startswith("--mcp-config="))
+    mcp_path = Path(mcp_arg.removeprefix("--mcp-config="))
+    assert mcp_path == tmp_path / "agents" / "claude" / "mcp.json"
+    assert "--strict-mcp-config" in command
+    # --mcp-config is variadic in claude, so both flags ride in `=` form ahead of the passthrough.
+    assert command.index(mcp_arg) < command.index("hello")
+    servers = json.loads(mcp_path.read_text())["mcpServers"]
+    assert servers["context7"] == {
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "@upstash/context7-mcp"],
+        "env": {},
+    }
+    assert servers["github"] == {
+        "type": "http",
+        "url": "https://api.githubcopilot.com/mcp/",
+        "headers": {"Authorization": "Bearer gh-secret"},
+    }
+    if os.name != "nt":
+        assert mcp_path.stat().st_mode & 0o777 == 0o600
+    # The expanded secret rides only in the private file, never in the printed recipe.
+    assert "gh-secret" not in result.output
+
+
+def test_connect_claude_mcp_all_mounts_every_registry_server(fake_vllm, tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
+    _mcp_registry()
+    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch", "--mcp-all"])
+    assert result.exit_code == 0, result.output
+    command = _launch_command(result.output)
+    mcp_arg = next(arg for arg in command if arg.startswith("--mcp-config="))
+    servers = json.loads(Path(mcp_arg.removeprefix("--mcp-config=")).read_text())["mcpServers"]
+    assert set(servers) == {"context7", "github"}
+
+
+def test_connect_claude_without_mcp_flags_writes_no_mcp_config(fake_vllm, tmp_path):
+    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
+    assert result.exit_code == 0, result.output
+    command = _launch_command(result.output)
+    assert "--strict-mcp-config" not in command
+    assert not any(arg.startswith("--mcp-config") for arg in command)
+    assert not (tmp_path / "agents" / "claude" / "mcp.json").exists()
+
+
+def test_claude_mcp_flags_cleared_on_rerun_without_them(fake_vllm, tmp_path, monkeypatch):
+    # A --no-launch session dir is reused, so the next run must not keep the earlier mount's flags.
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
+    _mcp_registry()
+    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch", "--mcp", "context7"])
+    assert result.exit_code == 0, result.output
+    assert "--mcp-config=" in result.output
+    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
+    assert result.exit_code == 0, result.output
+    command = _launch_command(result.output)
+    assert "--strict-mcp-config" not in command
+    assert not any(arg.startswith("--mcp-config") for arg in command)
+    # The persisted session dir must not keep the earlier mount's private mcp.json either.
+    assert not (tmp_path / "agents" / "claude" / "mcp.json").exists()
+
+
+def test_claude_mcp_with_as_subagent_fails(fake_vllm):
+    _mcp_registry()
+    result = CliRunner().invoke(
+        start.start_app, ["claude", "--as-subagent", "--no-launch", "--mcp", "context7"]
+    )
+    assert result.exit_code == 1
+    assert "--mcp/--mcp-all cannot be combined with --as-subagent" in result.output

@@ -21,6 +21,7 @@ from agent_switch.core.install import (
     _which_with_install_dirs,
 )
 from agent_switch.core.launch import _connect, _resolve_target, _run
+from agent_switch.core.mcp import load_mcp_servers
 from agent_switch.core.options import (
     LoadOptions,
     ProviderName,
@@ -32,6 +33,8 @@ from agent_switch.core.options import (
     _HEADER_OPTION,
     _KEY_OPTION,
     _LAUNCH_OPTION,
+    _MCP_ALL_OPTION,
+    _MCP_OPTION,
     _MIN_P_OPTION,
     _MODEL_LOAD_OPTION,
     _MODEL_OPTION,
@@ -49,6 +52,7 @@ from agent_switch.core.options import (
     _YOLO_OPTION,
     _check_compact_at,
     _consume_positional_model,
+    _fail,
     _yolo_command_flags,
     parse_headers,
 )
@@ -128,6 +132,28 @@ def _write_claude_settings(path: Path, model_id: str, local_env: dict) -> Path:
     return settings
 
 
+def _write_claude_mcp_config(path: Path, servers: dict) -> None:
+    """The session mcp.json for --mcp/--mcp-all, in the common .mcp.json shape."""
+    _write_private_json(
+        path,
+        {
+            "mcpServers": {
+                name: (
+                    {
+                        "type": "stdio",
+                        "command": server["command"],
+                        "args": server["args"],
+                        "env": server["env"],
+                    }
+                    if server["transport"] == "stdio"
+                    else {"type": "http", "url": server["url"], "headers": server["headers"]}
+                )
+                for name, server in servers.items()
+            }
+        },
+    )
+
+
 def _claude_version() -> Optional[tuple]:
     # None means no local `claude` (a --no-launch printout for another machine; assume a current build). An unparseable version is treated as too old for the new flags.
     executable = _which_with_install_dirs("claude")
@@ -159,12 +185,21 @@ def _claude_flags(model_id: str, settings: Optional[str] = None) -> list:
     return [_DYNAMIC_SECTIONS_FLAG, *settings_flags]
 
 
-def _claude_local_command(model_id: str, settings: str, yolo: bool, passthrough: list) -> list:
+def _claude_local_command(
+    model_id: str,
+    settings: str,
+    yolo: bool,
+    passthrough: list,
+    mcp_flags: Optional[list] = None,
+) -> list:
     local_args = [
         "--model",
         model_id,
         *_claude_flags(model_id, settings),
         *_yolo_command_flags("claude", yolo),
+        # The `=` form: --mcp-config is variadic in claude, so a detached value would swallow the
+        # first forwarded positional, same reason as --allowedTools in the subagent command.
+        *(mcp_flags or []),
     ]
     forwarded = list(passthrough)
     separator = forwarded.index("--") if "--" in forwarded else len(forwarded)
@@ -390,11 +425,17 @@ def claude(
     yolo: bool = _YOLO_OPTION,
     persist: bool = _PERSIST_OPTION,
     as_subagent: bool = _AS_SUBAGENT_OPTION,
+    mcp: Optional[list[str]] = _MCP_OPTION,
+    mcp_all: bool = _MCP_ALL_OPTION,
 ):
     """Point Claude Code at a local model server and start it."""
     # Route a leading `org/name` positional to --model; forward the rest to the agent.
     model, ctx.args[:] = _consume_positional_model(model, ctx.args)
     headers = parse_headers(header)
+    if as_subagent and (mcp or mcp_all):
+        _fail("--mcp/--mcp-all cannot be combined with --as-subagent.")
+    # Validate the MCP selection before _connect, so a registry error fails fast.
+    mcp_servers = load_mcp_servers(mcp, should_mount_all = mcp_all)
     target = _resolve_target(url, provider, api_key, headers)
     install_hint = (
         "irm https://claude.ai/install.ps1 | iex"
@@ -468,11 +509,24 @@ def claude(
     # Claude Code auto-compacts against its native context window; the local env above supplies the loaded model's real window and a 90% threshold instead. --yolo (or its aliases) maps to Claude's own --dangerously-skip-permissions. IS_SANDBOX is left unset on purpose: Claude refuses bypass mode as root unless a sandbox is detected, and we do not want to falsely claim one on the user's host. claude keeps its history in ~/.claude/projects, which --settings/env never relocate, so a session already survives exit; resume it with `claude --continue` or `--resume <id>` passed through.
     with _session_config("claude", launch, persist = persist) as config:
         settings = _write_claude_settings(config, model_id, env)
+        mcp_flags = []
+        mcp_config = config / "mcp.json"
+        if mcp_servers:
+            _write_claude_mcp_config(mcp_config, mcp_servers)
+            # --strict-mcp-config is what "replace" means here: claude ignores its user- and
+            # project-level MCP servers and reads only this file. The flags go only with mounted
+            # servers, so a persisted session without MCP flags keeps claude's own behavior.
+            mcp_path = _agent_config_path(mcp_config, ["claude"])
+            mcp_flags = ["--strict-mcp-config", f"--mcp-config={mcp_path}"]
+        else:
+            # As in pi(): a persisted session dir must not keep an earlier mount's expanded secrets.
+            mcp_config.unlink(missing_ok = True)
         command = _claude_local_command(
             model_id,
             _agent_config_path(settings, ["claude"]),
             yolo,
             ctx.args,
+            mcp_flags,
         )
         _run(
             base,

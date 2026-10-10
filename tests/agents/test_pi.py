@@ -29,6 +29,7 @@ from tests.cli_support import (
     _SESSION_FLAGS,
     _assert_env_set,
     _launch_command,
+    _mcp_registry,
     _simulate_windows,
 )
 from tests.start_split import set_start_attr
@@ -687,3 +688,71 @@ def test_connect_pi_wsl_windows_shim_relocates_userprofile(fake_vllm, monkeypatc
     wslenv = captured["env"]["WSLENV"].split(":")
     assert "HOME/p" in wslenv
     assert "USERPROFILE/p" in wslenv
+
+
+# ── --mcp / --mcp-all: session-only MCP mounting ─────────────────────
+
+
+def test_connect_pi_mcp_writes_agent_mcp_json(fake_vllm, tmp_path, monkeypatch):
+    _pi_user_agent_dir(tmp_path, monkeypatch)
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
+    _mcp_registry()
+    result = CliRunner().invoke(
+        start.start_app, ["pi", "--no-launch", "--mcp", "context7", "--mcp", "github"]
+    )
+    assert result.exit_code == 0, result.output
+    # Pi 1.1.0's built-in MCP reads <agentDir>/mcp.json; PI_CODING_AGENT_DIR is the session's.
+    mcp_path = tmp_path / "agents" / "pi" / ".pi" / "agent" / "mcp.json"
+    servers = json.loads(mcp_path.read_text())["mcpServers"]
+    assert servers["context7"] == {
+        "command": "npx",
+        "args": ["-y", "@upstash/context7-mcp"],
+        "env": {},
+    }
+    assert servers["github"] == {
+        "url": "https://api.githubcopilot.com/mcp/",
+        "headers": {"Authorization": "Bearer gh-secret"},
+    }
+    if os.name != "nt":
+        assert mcp_path.stat().st_mode & 0o777 == 0o600
+    assert "gh-secret" not in result.output
+
+
+def test_connect_pi_mcp_all_mounts_every_registry_server(fake_vllm, tmp_path, monkeypatch):
+    _pi_user_agent_dir(tmp_path, monkeypatch)
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
+    _mcp_registry()
+    result = CliRunner().invoke(start.start_app, ["pi", "--no-launch", "--mcp-all"])
+    assert result.exit_code == 0, result.output
+    mcp_path = tmp_path / "agents" / "pi" / ".pi" / "agent" / "mcp.json"
+    assert set(json.loads(mcp_path.read_text())["mcpServers"]) == {"context7", "github"}
+
+
+def test_connect_pi_without_mcp_flags_writes_no_mcp_json(fake_vllm, tmp_path, monkeypatch):
+    _pi_user_agent_dir(tmp_path, monkeypatch)
+    result = CliRunner().invoke(start.start_app, ["pi", "--no-launch"])
+    assert result.exit_code == 0, result.output
+    assert not (tmp_path / "agents" / "pi" / ".pi" / "agent" / "mcp.json").exists()
+
+
+def test_pi_mcp_state_cleared_on_rerun_without_flags(fake_vllm, tmp_path, monkeypatch):
+    # A --no-launch session dir is reused, so the next run must delete the earlier mount.
+    _pi_user_agent_dir(tmp_path, monkeypatch)
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
+    _mcp_registry()
+    result = CliRunner().invoke(start.start_app, ["pi", "--no-launch", "--mcp", "context7"])
+    assert result.exit_code == 0, result.output
+    mcp_path = tmp_path / "agents" / "pi" / ".pi" / "agent" / "mcp.json"
+    assert mcp_path.exists()
+    result = CliRunner().invoke(start.start_app, ["pi", "--no-launch"])
+    assert result.exit_code == 0, result.output
+    assert not mcp_path.exists()
+
+
+def test_pi_mcp_with_as_subagent_fails(fake_vllm):
+    _mcp_registry()
+    result = CliRunner().invoke(
+        start.start_app, ["pi", "--as-subagent", "--no-launch", "--mcp", "context7"]
+    )
+    assert result.exit_code == 1
+    assert "--mcp/--mcp-all cannot be combined with --as-subagent" in result.output

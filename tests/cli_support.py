@@ -15,6 +15,7 @@ import pytest
 from typer.testing import CliRunner
 
 import agent_switch.start as start
+from agent_switch.core.storage import _agent_switch_home
 from tests.start_split import set_start_attr
 
 
@@ -133,3 +134,24 @@ def _capture_launch(monkeypatch, argv):
     result = CliRunner().invoke(start.start_app, argv)
     assert result.exit_code == 0, result.output
     return captured
+
+
+# One stdio and one http server, the http header carrying a ${VAR} so a test can prove the
+# expanded secret reaches only the private session file, never the printed recipe.
+_MCP_SERVERS = {
+    "context7": {"command": "npx", "args": ["-y", "@upstash/context7-mcp"]},
+    "github": {
+        "type": "http",
+        "url": "https://api.githubcopilot.com/mcp/",
+        "headers": {"Authorization": "Bearer ${GITHUB_TOKEN}"},
+    },
+}
+
+
+def _mcp_registry(servers: dict = None) -> Path:
+    """Write the agent-switch MCP registry under the test AGENT_SWITCH_HOME."""
+    path = _agent_switch_home() / "mcp.json"
+    path.parent.mkdir(parents = True, exist_ok = True)
+    data = _MCP_SERVERS if servers is None else servers
+    path.write_text(json.dumps({"mcpServers": data}), encoding = "utf-8")
+    return path

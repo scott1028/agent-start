@@ -29,6 +29,7 @@ from tests.cli_support import (
     _assert_env_set,
     _capture_launch,
     _launch_command,
+    _mcp_registry,
     _opencode_inline_config,
     _path_aware_which,
 )
@@ -1105,3 +1106,162 @@ def test_persist_bare_opencode_launch_has_no_resume_token(fake_vllm, monkeypatch
     captured = _capture_launch(monkeypatch, ["opencode", "--persist"])
     assert "--continue" not in captured["command"]
     assert captured["command"][1:] == ["--model", f"{opencode_agent._OPENCODE_PROVIDER}/{MODEL['id']}"]
+
+
+# ── --mcp / --mcp-all: session-only MCP mounting ─────────────────────
+
+
+def _opencode_user_global_mcp(tmp_path, monkeypatch) -> dict:
+    # A global server the session does not mount must be copied and disabled, not deleted.
+    global_dir = tmp_path / "xdg" / "opencode"
+    global_dir.mkdir(parents = True)
+    entry = {"type": "remote", "url": "http://127.0.0.1:9/mcp", "enabled": True}
+    (global_dir / "opencode.json").write_text(json.dumps({"mcp": {"user-server": entry}}))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    return entry
+
+
+def test_connect_opencode_mcp_writes_local_and_remote_entries(fake_vllm, tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
+    user_entry = _opencode_user_global_mcp(tmp_path, monkeypatch)
+    _mcp_registry()
+    result = CliRunner().invoke(
+        start.start_app, ["opencode", "--no-launch", "--mcp", "context7", "--mcp", "github"]
+    )
+    assert result.exit_code == 0, result.output
+    config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
+    assert config["mcp"]["context7"] == {
+        "type": "local",
+        "command": ["npx", "-y", "@upstash/context7-mcp"],
+        "environment": {},
+        "enabled": True,
+    }
+    assert config["mcp"]["github"] == {
+        "type": "remote",
+        "url": "https://api.githubcopilot.com/mcp/",
+        "headers": {"Authorization": "Bearer gh-secret"},
+        "enabled": True,
+    }
+    # The unmounted global entry is a full copy with enabled: false (a partial entry can fail
+    # the per-layer schema check).
+    assert config["mcp"]["user-server"] == {**user_entry, "enabled": False}
+    assert "gh-secret" not in result.output
+
+
+def test_connect_opencode_mcp_all_mounts_every_registry_server(fake_vllm, tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
+    _opencode_user_global_mcp(tmp_path, monkeypatch)
+    _mcp_registry()
+    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", "--mcp-all"])
+    assert result.exit_code == 0, result.output
+    config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
+    assert {name for name, entry in config["mcp"].items() if entry["enabled"]} == {
+        "context7",
+        "github",
+    }
+
+
+def test_connect_opencode_without_mcp_flags_has_no_mcp_key(fake_vllm, tmp_path, monkeypatch):
+    _opencode_user_global_mcp(tmp_path, monkeypatch)
+    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
+    assert result.exit_code == 0, result.output
+    config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
+    assert "mcp" not in config
+
+
+def test_opencode_mcp_state_cleared_on_rerun_without_flags(fake_vllm, tmp_path, monkeypatch):
+    # A --no-launch session config is reused, so the next run must not keep the earlier mount.
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
+    _mcp_registry()
+    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", "--mcp", "context7"])
+    assert result.exit_code == 0, result.output
+    config_path = tmp_path / "agents" / "opencode" / "opencode.json"
+    assert "mcp" in json.loads(config_path.read_text())
+    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
+    assert result.exit_code == 0, result.output
+    assert "mcp" not in json.loads(config_path.read_text())
+
+
+def test_opencode_unparseable_global_config_warns_and_continues(fake_vllm, tmp_path, monkeypatch, capsys):
+    # Still unparseable after the JSONC handling: warn, keep its servers.
+    global_dir = tmp_path / "xdg" / "opencode"
+    global_dir.mkdir(parents = True)
+    (global_dir / "opencode.json").write_text("{ this is not json")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    _mcp_registry()
+    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", "--mcp", "context7"])
+    assert result.exit_code == 0, result.output
+    assert "couldn't parse" in result.output
+    config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
+    assert list(config["mcp"]) == ["context7"]
+
+
+def test_opencode_commented_jsonc_global_mcp_is_disabled(fake_vllm, tmp_path, monkeypatch):
+    # .jsonc with comments is OpenCode's documented format: parse it and disable its unmounted servers.
+    global_dir = tmp_path / "xdg" / "opencode"
+    global_dir.mkdir(parents = True)
+    (global_dir / "opencode.jsonc").write_text(
+        "{\n  // the user's own server\n  \"mcp\": {\"user-server\": {\"type\": \"remote\", "
+        "\"url\": \"http://127.0.0.1:9/mcp\", /* block */ \"enabled\": true}},\n}\n"
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    _mcp_registry()
+    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", "--mcp", "context7"])
+    assert result.exit_code == 0, result.output
+    config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
+    assert config["mcp"]["user-server"] == {
+        "type": "remote",
+        "url": "http://127.0.0.1:9/mcp",
+        "enabled": False,
+    }
+
+
+def test_opencode_global_mcp_from_two_files_both_disabled(fake_vllm, tmp_path, monkeypatch):
+    # OpenCode loads config.json, opencode.json and opencode.jsonc; every unmounted name is disabled.
+    global_dir = tmp_path / "xdg" / "opencode"
+    global_dir.mkdir(parents = True)
+    (global_dir / "config.json").write_text(
+        json.dumps({"mcp": {"old-server": {"type": "local", "command": ["true"]}}})
+    )
+    (global_dir / "opencode.jsonc").write_text(
+        json.dumps({"mcp": {"new-server": {"type": "remote", "url": "http://127.0.0.1:9/mcp"}}})
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    _mcp_registry()
+    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", "--mcp", "context7"])
+    assert result.exit_code == 0, result.output
+    config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
+    assert config["mcp"]["old-server"] == {"type": "local", "command": ["true"], "enabled": False}
+    assert config["mcp"]["new-server"] == {
+        "type": "remote",
+        "url": "http://127.0.0.1:9/mcp",
+        "enabled": False,
+    }
+
+
+def test_opencode_jsonc_comment_marker_in_string_survives(fake_vllm, tmp_path, monkeypatch):
+    # Comment markers inside a string value must not be stripped as comments.
+    global_dir = tmp_path / "xdg" / "opencode"
+    global_dir.mkdir(parents = True)
+    (global_dir / "opencode.jsonc").write_text(
+        '{"mcp": {"odd-server": {"type": "remote", "url": "http://x//y/*z*/mcp"}}} // trailing'
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    _mcp_registry()
+    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", "--mcp", "context7"])
+    assert result.exit_code == 0, result.output
+    config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
+    assert config["mcp"]["odd-server"] == {
+        "type": "remote",
+        "url": "http://x//y/*z*/mcp",
+        "enabled": False,
+    }
+
+
+def test_opencode_mcp_with_as_subagent_fails(fake_vllm):
+    _mcp_registry()
+    result = CliRunner().invoke(
+        start.start_app, ["opencode", "--as-subagent", "--no-launch", "--mcp", "context7"]
+    )
+    assert result.exit_code == 1
+    assert "--mcp/--mcp-all cannot be combined with --as-subagent" in result.output
