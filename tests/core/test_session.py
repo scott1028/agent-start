@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See LICENSE
 # Ported from unsloth_cli/tests/test_start.py (unsloth commit 8e11ba15e); see NOTICE.md.
 
 """Session config homes: ephemeral, persistent, locks and unwritable-root fallbacks."""

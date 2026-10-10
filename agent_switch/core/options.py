@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See LICENSE
 
 """Shared command options, panels, request fields and cross-agent helpers."""
 
@@ -475,7 +475,7 @@ _REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "max", "xhigh"
 
 
 def _split_repo_variant(model: str) -> tuple:
-    """Split ``org/name:QUANT`` into ``("org/name", "QUANT")``, the ``:variant`` shorthand llama.cpp and Ollama accept. Local paths, Windows drive letters and ids without a ``:`` pass through unchanged."""
+    """Split ``org/name:QUANT`` into ``("org/name", "QUANT")``, the ``:variant`` shorthand some local servers accept. Local paths, Windows drive letters and ids without a ``:`` pass through unchanged."""
     s = (model or "").strip()
     if not s or s.startswith(("/", "./", "../", "~")) or s == ".":
         return s, None

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See LICENSE
 
 """`agent-switch codex`: Codex config/catalog writers, overlays and subagent bridge."""
 
@@ -89,7 +89,7 @@ _CODEX_PROFILE = "agent_switch"
 _CODEX_ENV_KEY = "AGENT_SWITCH_AUTH_TOKEN"
 
 
-# Codex treats an SSE stream with no bytes for this long as lost, cancels it and reconnects. Its default is 300000 (5 minutes), measured against the WHOLE quiet period, and llama-server sends nothing at all while it processes the prompt. A local CPU host chews through a prompt at low tens of tokens a second and Codex's own preamble is several thousand tokens before the user has typed anything: 16.1 tok/s measured on a 2-core box means ~460s of silence for a ~7300-token first turn, so the default trips before the first token exists. The reconnect is worse than the wait, because llama-server hands the retry a different parallel slot whose KV cache shares no prefix, so each attempt restarts prompt processing from zero and the five retries can never converge. Observed as a request completing in exactly 300056ms with `Reconnecting... 1/5` and no turn ever finishing. 20 minutes here, sized to be longer than a slow local first turn rather than to any server-side budget: nothing here bounds generation, and a genuinely dead stream is still caught, just later.
+# Codex treats an SSE stream with no bytes for this long as lost, cancels it and reconnects. Its default is 300000 (5 minutes), measured against the WHOLE quiet period, and a local server may send nothing at all while it processes the prompt. A local CPU host chews through a prompt at low tens of tokens a second and Codex's own preamble is several thousand tokens before the user has typed anything: 16.1 tok/s measured on a 2-core box means ~460s of silence for a ~7300-token first turn, so the default trips before the first token exists. The reconnect is worse than the wait, because the server hands the retry a different parallel slot whose KV cache shares no prefix, so each attempt restarts prompt processing from zero and the five retries can never converge. Observed as a request completing in exactly 300056ms with `Reconnecting... 1/5` and no turn ever finishing. 20 minutes here, sized to be longer than a slow local first turn rather than to any server-side budget: nothing here bounds generation, and a genuinely dead stream is still caught, just later.
 _CODEX_STREAM_IDLE_TIMEOUT_MS = 1_200_000
 
 
@@ -338,7 +338,7 @@ def write_codex_config(
         config.chmod(0o600)
         typer.echo(f"Updated {config}")
 
-    # oss_provider here too: codex --oss picks the provider from it, and the profile layer must beat a user-set value ("ollama") in config.toml.
+    # oss_provider here too: codex --oss picks the provider from it, and the profile layer must beat a user-set value (a built-in provider name) in config.toml.
     profile_text = (
         f'oss_provider = "{_CODEX_PROFILE}"\n'
         f'model_provider = "{_CODEX_PROFILE}"\n'

@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See LICENSE.
-# Ported from studio/backend/utils/coding_agents.py (unsloth commit 8e11ba15e); see NOTICE.md.
 
 """Tell DeepSeek Harness (`dsh`) and its TUI (`dsh-tui`) apart from other executables of that name."""
 

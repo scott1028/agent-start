@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See LICENSE
 
 """`agent-switch <agent>` — launch a coding agent against a running model server."""
 
@@ -37,8 +37,8 @@ class _AliasGroup(TyperGroup):
 
 
 start_app = typer.Typer(
-    help = "With --url/--provider the agent runs against that local model server (Ollama, LM "
-    "Studio, llama-server, vLLM or any OpenAI-compatible server) with a throwaway, session-only "
+    help = "With --url/--provider the agent runs against that local OpenAI-compatible model "
+    "server (--provider lists the supported types) with a throwaway, session-only "
     "configuration; without them it runs natively, on its own model, login and config, and only "
     "the shared flags (MCP mounting, --yolo) are added. Either way your own agent config is not "
     "modified. "
