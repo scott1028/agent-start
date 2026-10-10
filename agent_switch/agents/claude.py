@@ -20,7 +20,15 @@ from agent_switch.core.install import (
     _require_agent_for_launch,
     _which_with_install_dirs,
 )
-from agent_switch.core.launch import _connect, _resolve_target, _run
+from agent_switch.core.launch import (
+    _ALIAS_META,
+    _agent_command,
+    _check_alias,
+    _connect,
+    _resolve_target,
+    _run,
+    _run_native,
+)
 from agent_switch.core.mcp import load_mcp_servers
 from agent_switch.core.options import (
     LoadOptions,
@@ -57,6 +65,8 @@ from agent_switch.core.options import (
     _YOLO_OPTION,
     _check_compact_at,
     _consume_positional_model,
+    _fail,
+    _refuse_local_only,
     _yolo_command_flags,
     parse_headers,
 )
@@ -453,12 +463,67 @@ def claude(
         as_subagent = as_subagent,
     )
     target = _resolve_target(url, provider, api_key, headers)
+    if target is None:
+        _refuse_local_only(
+            model = model,
+            max_seq_length = max_seq_length,
+            reasoning = reasoning,
+            reasoning_effort = reasoning_effort,
+            temperature = temperature,
+            top_p = top_p,
+            top_k = top_k,
+            min_p = min_p,
+            repetition_penalty = repetition_penalty,
+            presence_penalty = presence_penalty,
+            compact_at = compact_at,
+            api_key = api_key,
+            header = header,
+            model_load = model_load,
+            as_subagent = as_subagent,
+            persist = persist,
+        )
+    alias = ctx.meta.get(_ALIAS_META)
+    if alias and as_subagent:
+        _fail("--as-subagent is not supported for agent aliases.")
     install_hint = (
         "irm https://claude.ai/install.ps1 | iex"
         if os.name == "nt"
         else "curl -fsSL https://claude.ai/install.sh | bash"
     )
-    _require_agent_for_launch("claude", install_hint, launch)
+    if alias:
+        _check_alias(alias)
+    else:
+        _require_agent_for_launch("claude", install_hint, launch)
+    if target is None:
+        # Native launch: claude keeps its own model, login, settings and MCP servers; the
+        # mounted servers are only added through --mcp-config (no --strict-mcp-config).
+        with _session_config("claude-native", launch) as config:
+            mcp_config = config / "mcp.json"
+            mcp_flags = []
+            if mcp_servers:
+                _write_claude_mcp_config(mcp_config, mcp_servers)
+                # The `=` form: --mcp-config is variadic in claude, so a detached value would
+                # swallow the first forwarded positional.
+                mcp_flags = [f"--mcp-config={_agent_config_path(mcp_config, ['claude'])}"]
+            else:
+                mcp_config.unlink(missing_ok = True)
+            command = _agent_command(
+                alias,
+                "claude",
+                [
+                    *_yolo_command_flags("claude", yolo),
+                    *mcp_flags,
+                    *ctx.args,
+                ],
+            )
+            _run_native(
+                alias or "claude",
+                {},
+                command,
+                launch = launch,
+                install_hint = install_hint,
+            )
+        return
     server_options = ServerOptions(
         reasoning = reasoning,
         reasoning_effort = reasoning_effort,
@@ -544,6 +609,10 @@ def claude(
             ctx.args,
             mcp_flags,
         )
+        if alias:
+            # The alias function replaces only argv[0]; the unset inside the bash string
+            # re-clears what its re-read shell config could re-export.
+            command = _agent_command(alias, "claude", command[1:], _CLAUDE_ENV_UNSET)
         _run(
             base,
             entry,

@@ -18,7 +18,15 @@ from agent_switch.core.install import (
     _require_agent_for_launch,
     _which_with_install_dirs,
 )
-from agent_switch.core.launch import _connect, _resolve_target, _run
+from agent_switch.core.launch import (
+    _ALIAS_META,
+    _agent_command,
+    _check_alias,
+    _connect,
+    _resolve_target,
+    _run,
+    _run_native,
+)
 from agent_switch.core.mcp import load_mcp_servers
 from agent_switch.core.options import (
     LoadOptions,
@@ -61,6 +69,7 @@ from agent_switch.core.options import (
     _consume_positional_model,
     _fail,
     _get_compaction_reserve,
+    _refuse_local_only,
     opencode_output_limit,
     parse_headers,
 )
@@ -446,6 +455,27 @@ def _opencode_global_mcp() -> dict:
     return servers
 
 
+def _opencode_mcp_entries(mcp_servers: dict) -> dict:
+    """The opencode mcp map for the mounted servers."""
+    entries: dict = {}
+    for name, server in mcp_servers.items():
+        if server["transport"] == "stdio":
+            entries[name] = {
+                "type": "local",
+                "command": [server["command"], *server["args"]],
+                "environment": server["env"],
+                "enabled": True,
+            }
+        else:
+            entries[name] = {
+                "type": "remote",
+                "url": server["url"],
+                "headers": server["headers"],
+                "enabled": True,
+            }
+    return entries
+
+
 def write_opencode_config(
     base: str,
     key: str,
@@ -487,22 +517,7 @@ def write_opencode_config(
     if mcp_servers is None:
         config.pop("mcp", None)
     else:
-        mounted: dict = {}
-        for name, server in mcp_servers.items():
-            if server["transport"] == "stdio":
-                mounted[name] = {
-                    "type": "local",
-                    "command": [server["command"], *server["args"]],
-                    "environment": server["env"],
-                    "enabled": True,
-                }
-            else:
-                mounted[name] = {
-                    "type": "remote",
-                    "url": server["url"],
-                    "headers": server["headers"],
-                    "enabled": True,
-                }
+        mounted: dict = _opencode_mcp_entries(mcp_servers)
         for name, entry in _opencode_global_mcp().items():
             if name not in mounted and isinstance(entry, dict):
                 mounted[name] = {**entry, "enabled": False}
@@ -610,9 +625,69 @@ def opencode(
         as_subagent = as_subagent,
     )
     target = _resolve_target(url, provider, api_key, headers)
+    if target is None:
+        _refuse_local_only(
+            model = model,
+            max_seq_length = max_seq_length,
+            max_tokens = max_tokens,
+            reasoning = reasoning,
+            reasoning_effort = reasoning_effort,
+            temperature = temperature,
+            top_p = top_p,
+            top_k = top_k,
+            min_p = min_p,
+            repetition_penalty = repetition_penalty,
+            presence_penalty = presence_penalty,
+            compact_at = compact_at,
+            api_key = api_key,
+            header = header,
+            model_load = model_load,
+            as_subagent = as_subagent,
+            persist = persist,
+        )
+    alias = ctx.meta.get(_ALIAS_META)
+    if alias and as_subagent:
+        _fail("--as-subagent is not supported for agent aliases.")
     command_name, opencode_v2 = _opencode_command()
     install_hint = _npm_install_hint("@opencode-ai/cli@beta" if opencode_v2 else "opencode-ai")
-    _require_agent_for_launch(command_name, install_hint, launch)
+    if alias:
+        _check_alias(alias)
+    else:
+        _require_agent_for_launch(command_name, install_hint, launch)
+    if target is None:
+        # Native launch: opencode keeps its own model, login and config; the session config
+        # carries only the mounted MCP servers, and OPENCODE_CONFIG is the only env change.
+        route_native_auto = yolo and _opencode_supports_native_auto(command_name)
+        opencode_args = list(ctx.args)
+        if opencode_v2:
+            opencode_args = _opencode_v2_standalone_args(opencode_args)
+        opencode_args, _ = _opencode_native_auto_args(
+            opencode_args, route_native_auto, v2 = opencode_v2
+        )
+        command = _agent_command(alias, command_name, opencode_args)
+        with _session_config("opencode-native", launch) as cfg:
+            env = {}
+            config_path = cfg / "opencode.json"
+            if mcp_servers:
+                _write_private_json(
+                    config_path,
+                    {
+                        "$schema": "https://opencode.ai/config.json",
+                        "mcp": _opencode_mcp_entries(mcp_servers),
+                    },
+                )
+                env["OPENCODE_CONFIG"] = str(config_path)
+            else:
+                # Stable --no-launch dir: drop an earlier mount so a bare rerun stays native.
+                config_path.unlink(missing_ok = True)
+            _run_native(
+                alias or "opencode",
+                env,
+                command,
+                launch = launch,
+                install_hint = install_hint,
+            )
+        return
     server_options = ServerOptions(
         reasoning = reasoning,
         reasoning_effort = reasoning_effort,
@@ -707,7 +782,7 @@ def opencode(
         opencode_args, native_auto = _opencode_native_auto_args(
             opencode_args, route_native_auto, v2 = opencode_v2
         )
-        command = [command_name, *opencode_args]
+        command = _agent_command(alias, command_name, opencode_args)
     elif launch:
         opencode_args = [] if opencode_v2 else ["--model", opencode_model]
         if opencode_v2:
@@ -717,11 +792,11 @@ def opencode(
             route_native_auto,
             v2 = opencode_v2,
         )
-        command = [command_name, *opencode_args]
+        command = _agent_command(alias, command_name, opencode_args)
     else:
         # Append-safe base: `opencode --auto run ...` parses as the TUI with a project "run", not the run subcommand. The command is unknown here, so keep the config fallback.
         opencode_args = _opencode_v2_standalone_args([]) if opencode_v2 else []
-        command = [command_name, *opencode_args]
+        command = _agent_command(alias, command_name, opencode_args)
     # opencode keeps sessions in ~/.local/share/opencode (never relocated), so resume already survives exit; reopen the last one by passing `opencode --continue` through.
     with _session_config("opencode", launch, persist = persist) as cfg:
         config_path = cfg / "opencode.json"

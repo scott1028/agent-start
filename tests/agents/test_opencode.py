@@ -72,7 +72,6 @@ def test_opencode_command_finds_official_v2_install_dir(monkeypatch, tmp_path):
     assert opencode_agent._opencode_command() == (str(install_dir / "opencode2"), True)
 
 
-@pytest.mark.usefixtures("one_local_server")
 def test_declined_opencode_subagent_install_stops_before_connect(monkeypatch):
     installs = []
     set_start_attr(monkeypatch, "_which_with_install_dirs", lambda _: None)
@@ -83,14 +82,13 @@ def test_declined_opencode_subagent_install_stops_before_connect(monkeypatch):
         lambda *a, **k: pytest.fail("declined install must stop before model connection"),
     )
 
-    result = CliRunner().invoke(start.start_app, ["opencode", "--as-subagent"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--provider", "vllm", "--as-subagent"])
 
     assert result.exit_code == 1
     assert len(installs) == 1
     assert installs[0][0] == "opencode"
 
 
-@pytest.mark.usefixtures("one_local_server")
 def test_opencode_no_launch_resolves_generation_without_installing(monkeypatch):
     resolved = []
     set_start_attr(monkeypatch, "_which_with_install_dirs",
@@ -103,7 +101,7 @@ def test_opencode_no_launch_resolves_generation_without_installing(monkeypatch):
     set_start_attr(monkeypatch, "_connect", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError)
     )
 
-    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--provider", "vllm", "--no-launch"])
 
     assert result.exit_code == 1
     assert isinstance(result.exception, RuntimeError)
@@ -123,7 +121,7 @@ def test_launch_native_posix_child_gets_current_pwd(fake_vllm, monkeypatch, tmp_
 
     monkeypatch.setattr(subprocess, "run", run)
 
-    result = CliRunner().invoke(start.start_app, ["opencode"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE])
 
     assert result.exit_code == 0, result.output
     assert captured["command"][0] == "/usr/local/bin/opencode"
@@ -134,7 +132,7 @@ def test_launch_native_posix_child_gets_current_pwd(fake_vllm, monkeypatch, tmp_
 def test_opencode_inline_config_beats_project_config(fake_vllm):
     # A project's opencode.json outranks OPENCODE_CONFIG, so the model pin (and --yolo
     # permissions) ride in OPENCODE_CONFIG_CONTENT, which outranks project config.
-    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", "--yolo"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch", "--yolo"])
     assert result.exit_code == 0, result.output
     inline = _opencode_inline_config(result.output)
     assert inline["model"] == f"{opencode_agent._OPENCODE_PROVIDER}/{MODEL['id']}"
@@ -151,7 +149,7 @@ def test_opencode_inline_config_omits_permission_without_yolo(fake_vllm):
     # A non-yolo session carries no permission inline. OPENCODE_CONFIG_CONTENT outranks the
     # project opencode.json we cannot read, so forcing any value there would override the
     # user's project rules; clearing our own config is the fix, and the inline pins the model.
-    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     inline = _opencode_inline_config(result.output)
     assert inline["model"] == f"{opencode_agent._OPENCODE_PROVIDER}/{MODEL['id']}"
@@ -162,7 +160,7 @@ def test_opencode_session_temperature_needs_the_capability(fake_vllm, tmp_path, 
     monkeypatch.chdir(tmp_path)
     config_path = tmp_path / "agents" / "opencode" / "opencode.json"
     for argv, capability in ((["--temperature", "0.3"], True), (["--top-k", "40"], None)):
-        result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", *argv])
+        result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch", *argv])
         assert result.exit_code == 0, result.output
         provider = json.loads(config_path.read_text())["provider"][opencode_agent._OPENCODE_PROVIDER]
         assert provider["models"][MODEL["id"]].get("temperature") is capability
@@ -173,7 +171,7 @@ def test_session_carries_the_custom_header_to_the_agent(fake_vllm, tmp_path, mon
     # agent config must carry it and drop the apiKey it no longer sends.
     monkeypatch.chdir(tmp_path)
     result = CliRunner().invoke(
-        start.start_app, ["opencode", "--no-launch", "--header", "Authorization=Bearer gateway-token"]
+        start.start_app, ["opencode", "--url", BASE, "--no-launch", "--header", "Authorization=Bearer gateway-token"]
     )
     assert result.exit_code == 0, result.output
     provider = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())["provider"][
@@ -188,7 +186,7 @@ def test_opencode_v1_reads_the_effort_as_reasoning_effort_option(
 ):
     monkeypatch.chdir(tmp_path)
     result = CliRunner().invoke(
-        start.start_app, ["opencode", "--no-launch", "--reasoning-effort", "low"]
+        start.start_app, ["opencode", "--url", BASE, "--no-launch", "--reasoning-effort", "low"]
     )
     assert result.exit_code == 0, result.output
     provider = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
@@ -240,7 +238,7 @@ def test_opencode_output_limit(window, max_tokens, expected):
 
 def test_opencode_max_tokens_sets_limit_and_raises_opencode_ceiling(fake_vllm, tmp_path):
     result = CliRunner().invoke(
-        start.start_app, ["opencode", "--no-launch", "--max-tokens", "65536"]
+        start.start_app, ["opencode", "--url", BASE, "--no-launch", "--max-tokens", "65536"]
     )
     assert result.exit_code == 0, result.output
     config_path = tmp_path / "agents" / "opencode" / "opencode.json"
@@ -291,7 +289,7 @@ def test_opencode_max_tokens_without_a_window_warns(capsys):
 
 def test_opencode_max_tokens_under_ceiling_leaves_opencode_env_alone(fake_vllm, tmp_path):
     result = CliRunner().invoke(
-        start.start_app, ["opencode", "--no-launch", "--max-tokens", "16000"]
+        start.start_app, ["opencode", "--url", BASE, "--no-launch", "--max-tokens", "16000"]
     )
     assert result.exit_code == 0, result.output
     config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
@@ -303,7 +301,7 @@ def test_opencode_max_tokens_under_ceiling_leaves_opencode_env_alone(fake_vllm, 
 def test_opencode_max_tokens_raises_a_smaller_inherited_ceiling(fake_vllm, monkeypatch):
     monkeypatch.setenv("OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX", "8000")
     result = CliRunner().invoke(
-        start.start_app, ["opencode", "--no-launch", "--max-tokens", "16000"]
+        start.start_app, ["opencode", "--url", BASE, "--no-launch", "--max-tokens", "16000"]
     )
     assert result.exit_code == 0, result.output
     _assert_env_set(result.output, "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX", "16000")
@@ -313,7 +311,7 @@ def test_opencode_max_tokens_recipe_keeps_a_larger_inherited_ceiling(fake_vllm, 
     # The --no-launch recipe must carry the ceiling, or a shell without the export reverts to 32,000.
     monkeypatch.setenv("OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX", "100000")
     result = CliRunner().invoke(
-        start.start_app, ["opencode", "--no-launch", "--max-tokens", "65536"]
+        start.start_app, ["opencode", "--url", BASE, "--no-launch", "--max-tokens", "65536"]
     )
     assert result.exit_code == 0, result.output
     _assert_env_set(result.output, "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX", "100000")
@@ -321,7 +319,7 @@ def test_opencode_max_tokens_recipe_keeps_a_larger_inherited_ceiling(fake_vllm, 
 
 def test_opencode_max_tokens_past_half_the_window_is_capped(fake_vllm, tmp_path):
     result = CliRunner().invoke(
-        start.start_app, ["opencode", "--no-launch", "--max-tokens", "120000"]
+        start.start_app, ["opencode", "--url", BASE, "--no-launch", "--max-tokens", "120000"]
     )
     assert result.exit_code == 0, result.output
     assert "leaves too little" in result.output
@@ -511,7 +509,7 @@ def test_opencode_inline_scopes_session_to_our_provider(fake_vllm):
     # and a model pin does not bypass that gate. The inline overlay (session-only, highest
     # layer, arrays replace) allowlists our provider and clears the denylist so the local
     # model always loads regardless of the user's config, without reading or editing it.
-    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     inline = _opencode_inline_config(result.output)
     assert inline["enabled_providers"] == [opencode_agent._OPENCODE_PROVIDER]
@@ -526,7 +524,7 @@ def test_opencode_passthrough_flags_omit_model_flag(fake_vllm):
     # Any passthrough (top-level flags that may precede a subcommand, or a subcommand)
     # is left untouched; --model is not injected. The model is pinned by the inline
     # OPENCODE_CONFIG_CONTENT (highest layer) instead, so it is still forced.
-    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", "--dir", "repo"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch", "--dir", "repo"])
     assert result.exit_code == 0, result.output
     command = _launch_command(result.output)
     assert command == ["opencode", "--dir", "repo"]
@@ -540,7 +538,7 @@ def test_opencode_passthrough_flags_omit_model_flag(fake_vllm):
 def test_opencode_passthrough_subcommand_omits_model_flag(fake_vllm):
     # A passthrough subcommand (e.g. `serve`) takes the model from the pinned config;
     # inserting --model before it would break opencode's arg parsing.
-    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", "serve"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch", "serve"])
     assert result.exit_code == 0, result.output
     command = _launch_command(result.output)
     assert command[0] == "opencode"
@@ -549,7 +547,7 @@ def test_opencode_passthrough_subcommand_omits_model_flag(fake_vllm):
 
 
 def test_connect_opencode_no_launch(fake_vllm, tmp_path):
-    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     assert "opencode" in result.output
     config_path = tmp_path / "agents" / "opencode" / "opencode.json"
@@ -578,7 +576,7 @@ def test_connect_opencode_no_launch(fake_vllm, tmp_path):
 def test_connect_opencode_v2_no_launch_uses_private_server(fake_vllm, monkeypatch):
     set_start_attr(monkeypatch, "_opencode_command", lambda *_: ("opencode2", True))
 
-    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch"])
 
     assert result.exit_code == 0, result.output
     assert _launch_command(result.output) == ["opencode2", "--standalone"]
@@ -598,7 +596,7 @@ def test_connect_opencode_v2_no_launch_uses_resolved_off_path_binary(
         lambda: (str(binary), True),
     )
 
-    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch"])
 
     assert result.exit_code == 0, result.output
     assert _launch_command(result.output) == [str(binary), "--standalone"]
@@ -607,7 +605,7 @@ def test_connect_opencode_v2_no_launch_uses_resolved_off_path_binary(
 def test_connect_opencode_v2_models_uses_private_server(fake_vllm, monkeypatch):
     set_start_attr(monkeypatch, "_opencode_command", lambda *_: ("opencode2", True))
 
-    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", "models"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch", "models"])
 
     assert result.exit_code == 0, result.output
     assert _launch_command(result.output) == ["opencode2", "models", "--standalone"]
@@ -619,7 +617,7 @@ def test_connect_opencode_as_subagent_preserves_cloud_parent(fake_vllm, tmp_path
     result = CliRunner().invoke(
         start.start_app,
         [
-            "opencode",
+            "opencode", "--url", BASE,
             "--as-subagent",
             "--no-launch",
             "--model",
@@ -674,7 +672,7 @@ def test_opencode_subagent_installs_binary_before_filter_inspection(fake_vllm, m
     set_start_attr(monkeypatch, "_opencode_subagent_inline_config", inline)
     set_start_attr(monkeypatch, "_run", lambda *a, **k: None)
 
-    result = CliRunner().invoke(start.start_app, ["opencode", "--as-subagent"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--as-subagent"])
 
     assert result.exit_code == 0, result.output
     assert installed["name"] == "opencode"
@@ -688,7 +686,7 @@ def test_opencode_subagent_pins_agent_in_inline_overlay(fake_vllm, monkeypatch):
     )
     result = CliRunner().invoke(
         start.start_app,
-        ["opencode", "--as-subagent", "--no-launch", "--model", MODEL["id"]],
+        ["opencode", "--url", BASE, "--as-subagent", "--no-launch", "--model", MODEL["id"]],
     )
     assert result.exit_code == 0, result.output
     agent = _opencode_inline_config(result.output)["agent"]["local"]
@@ -709,7 +707,7 @@ def test_connect_opencode_subagent_yolo_no_launch_stays_append_safe(fake_vllm, m
     set_start_attr(monkeypatch, "_opencode_subagent_inline_config", inline)
     result = CliRunner().invoke(
         start.start_app,
-        ["opencode", "--as-subagent", "--no-launch", "--yolo"],
+        ["opencode", "--url", BASE, "--as-subagent", "--no-launch", "--yolo"],
     )
 
     assert result.exit_code == 0, result.output
@@ -728,7 +726,7 @@ def test_connect_opencode_subagent_yolo_no_launch_stays_append_safe(fake_vllm, m
 def test_yolo_opencode_bare_no_launch_uses_permission_fallback(fake_vllm, tmp_path):
     # A bare --no-launch recipe stays append-safe (callers add a subcommand later);
     # `opencode --auto run ...` would select the TUI, not `run`, so keep the config fallback.
-    result = CliRunner().invoke(start.start_app, ["opencode", "--yolo", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--yolo", "--no-launch"])
     assert result.exit_code == 0, result.output
     config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
     assert config["permission"] == {
@@ -742,7 +740,7 @@ def test_yolo_opencode_bare_no_launch_uses_permission_fallback(fake_vllm, tmp_pa
 def test_yolo_opencode_run_uses_native_auto(fake_vllm):
     result = CliRunner().invoke(
         start.start_app,
-        ["opencode", "--yolo", "--no-launch", "run", "hello"],
+        ["opencode", "--url", BASE, "--yolo", "--no-launch", "run", "hello"],
     )
     assert result.exit_code == 0, result.output
     command = _launch_command(result.output)
@@ -755,7 +753,7 @@ def test_yolo_opencode_v2_run_uses_standalone_and_native_auto(fake_vllm, monkeyp
 
     result = CliRunner().invoke(
         start.start_app,
-        ["opencode", "--yolo", "--no-launch", "run", "hello"],
+        ["opencode", "--url", BASE, "--yolo", "--no-launch", "run", "hello"],
     )
 
     assert result.exit_code == 0, result.output
@@ -774,7 +772,7 @@ def test_yolo_opencode_v2_mini_uses_permission_fallback(fake_vllm, monkeypatch):
 
     result = CliRunner().invoke(
         start.start_app,
-        ["opencode", "--yolo", "--no-launch", "mini"],
+        ["opencode", "--url", BASE, "--yolo", "--no-launch", "mini"],
     )
 
     assert result.exit_code == 0, result.output
@@ -785,7 +783,7 @@ def test_yolo_opencode_v2_mini_uses_permission_fallback(fake_vllm, monkeypatch):
 def test_yolo_opencode_tui_resume_uses_native_auto(fake_vllm):
     result = CliRunner().invoke(
         start.start_app,
-        ["opencode", "--yolo", "--no-launch", "--session", "sid"],
+        ["opencode", "--url", BASE, "--yolo", "--no-launch", "--session", "sid"],
     )
     assert result.exit_code == 0, result.output
     command = _launch_command(result.output)
@@ -796,7 +794,7 @@ def test_yolo_opencode_tui_resume_uses_native_auto(fake_vllm):
 def test_no_yolo_opencode_run_omits_native_auto(fake_vllm):
     result = CliRunner().invoke(
         start.start_app,
-        ["opencode", "--no-launch", "run", "hello"],
+        ["opencode", "--url", BASE, "--no-launch", "run", "hello"],
     )
     assert result.exit_code == 0, result.output
     assert _launch_command(result.output) == ["opencode", "run", "hello"]
@@ -806,7 +804,7 @@ def test_no_yolo_opencode_run_omits_native_auto(fake_vllm):
 def test_yolo_opencode_bare_launch_uses_native_auto(fake_vllm, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/opencode")
     set_start_attr(monkeypatch, "_opencode_supports_native_auto", lambda *_: True)
-    captured = _capture_launch(monkeypatch, ["opencode", "--yolo"])
+    captured = _capture_launch(monkeypatch, ["opencode", "--url", BASE, "--yolo"])
     assert captured["command"][1:] == [
         "--model",
         f"{opencode_agent._OPENCODE_PROVIDER}/{MODEL['id']}",
@@ -818,7 +816,7 @@ def test_yolo_opencode_bare_launch_uses_native_auto(fake_vllm, monkeypatch):
 def test_yolo_opencode_v2_bare_launch_omits_root_model(fake_vllm, monkeypatch):
     set_start_attr(monkeypatch, "_opencode_command", lambda *_: ("opencode2", True))
     monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/opencode2")
-    captured = _capture_launch(monkeypatch, ["opencode", "--yolo"])
+    captured = _capture_launch(monkeypatch, ["opencode", "--url", BASE, "--yolo"])
 
     assert captured["command"][0].endswith("opencode2")
     assert captured["command"][1:] == ["--standalone", "--auto"]
@@ -828,13 +826,13 @@ def test_yolo_opencode_v2_bare_launch_omits_root_model(fake_vllm, monkeypatch):
 def test_yolo_opencode_native_auto_clears_prior_config_fallback(fake_vllm, tmp_path):
     fallback = CliRunner().invoke(
         start.start_app,
-        ["opencode", "--yolo", "--no-launch"],
+        ["opencode", "--url", BASE, "--yolo", "--no-launch"],
     )
     assert fallback.exit_code == 0, fallback.output
 
     native = CliRunner().invoke(
         start.start_app,
-        ["opencode", "--yolo", "--no-launch", "run", "hello"],
+        ["opencode", "--url", BASE, "--yolo", "--no-launch", "run", "hello"],
     )
     assert native.exit_code == 0, native.output
     assert _launch_command(native.output) == ["opencode", "run", "hello", "--auto"]
@@ -873,7 +871,7 @@ def test_yolo_opencode_old_version_uses_config_fallback(fake_vllm, monkeypatch):
     monkeypatch.setattr(subprocess, "check_output", lambda *args, **kwargs: "1.17.11")
     result = CliRunner().invoke(
         start.start_app,
-        ["opencode", "--yolo", "--no-launch", "run", "hello"],
+        ["opencode", "--url", BASE, "--yolo", "--no-launch", "run", "hello"],
     )
     assert result.exit_code == 0, result.output
     assert _launch_command(result.output) == ["opencode", "run", "hello"]
@@ -916,7 +914,7 @@ def test_opencode_native_auto_args(args, expected, native):
 def test_yolo_opencode_non_agent_subcommand_uses_config_fallback(fake_vllm):
     result = CliRunner().invoke(
         start.start_app,
-        ["opencode", "--yolo", "--no-launch", "serve"],
+        ["opencode", "--url", BASE, "--yolo", "--no-launch", "serve"],
     )
     assert result.exit_code == 0, result.output
     command = _launch_command(result.output)
@@ -935,7 +933,7 @@ def test_yolo_opencode_no_auto_command_uses_config_fallback(fake_vllm, passthrou
     # all keep the config permission fallback.
     result = CliRunner().invoke(
         start.start_app,
-        ["opencode", "--yolo", "--no-launch", *passthrough],
+        ["opencode", "--url", BASE, "--yolo", "--no-launch", *passthrough],
     )
     assert result.exit_code == 0, result.output
     assert _launch_command(result.output) == ["opencode", *passthrough]
@@ -948,7 +946,7 @@ def test_yolo_opencode_no_auto_command_uses_config_fallback(fake_vllm, passthrou
 
 
 def test_no_yolo_opencode_has_no_permission_block(fake_vllm, tmp_path):
-    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
     # A non-yolo run on a fresh config writes no permission block; it only flips a prior
@@ -959,7 +957,7 @@ def test_no_yolo_opencode_has_no_permission_block(fake_vllm, tmp_path):
 def test_no_yolo_opencode_flips_prior_yolo_allow_to_ask(fake_vllm, tmp_path):
     # The core reset: a --yolo run wrote explicit per-tool allow; a later non-yolo run
     # must flip exactly those back to ask so nothing stays auto-approved.
-    yolo = CliRunner().invoke(start.start_app, ["opencode", "--yolo", "--no-launch"])
+    yolo = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--yolo", "--no-launch"])
     assert yolo.exit_code == 0, yolo.output
     config_path = tmp_path / "agents" / "opencode" / "opencode.json"
     assert json.loads(config_path.read_text())["permission"] == {
@@ -968,7 +966,7 @@ def test_no_yolo_opencode_flips_prior_yolo_allow_to_ask(fake_vllm, tmp_path):
         "webfetch": "allow",
         "external_directory": {"*": "allow"},
     }
-    plain = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
+    plain = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch"])
     assert plain.exit_code == 0, plain.output
     assert json.loads(config_path.read_text())["permission"] == {
         "edit": "ask",
@@ -994,11 +992,11 @@ def test_no_launch_rerun_clears_stale_opencode_yolo_permissions(fake_vllm, tmp_p
     # The no-launch config dir is reused across runs, so a --yolo run persists its
     # auto-approve settings; a later run without --yolo must strip them, not leave
     # tool execution silently pre-approved.
-    yolo = CliRunner().invoke(start.start_app, ["opencode", "--yolo", "--no-launch"])
+    yolo = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--yolo", "--no-launch"])
     assert yolo.exit_code == 0, yolo.output
     config_path = tmp_path / "agents" / "opencode" / "opencode.json"
     assert "permission" in json.loads(config_path.read_text())
-    plain = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
+    plain = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch"])
     assert plain.exit_code == 0, plain.output
     config = json.loads(config_path.read_text())
     # The yolo allow policy is replaced by a prompting one, not deleted (which would
@@ -1095,7 +1093,7 @@ def test_resume_opencode_config_in_stable_dir(fake_vllm, tmp_path, monkeypatch):
     # opencode's session data lives in ~/.local/share/opencode (never relocated), so
     # resume already survives exit; --persist also stabilizes its config overlay dir.
     monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/opencode")
-    captured = _capture_launch(monkeypatch, ["opencode", "--persist"])
+    captured = _capture_launch(monkeypatch, ["opencode", "--url", BASE, "--persist"])
     stable = tmp_path / "agents" / "opencode"
     assert captured["env"]["OPENCODE_CONFIG"] == str(stable / "opencode.json")
     assert stable.exists()
@@ -1103,7 +1101,7 @@ def test_resume_opencode_config_in_stable_dir(fake_vllm, tmp_path, monkeypatch):
 
 def test_persist_bare_opencode_launch_has_no_resume_token(fake_vllm, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/opencode")
-    captured = _capture_launch(monkeypatch, ["opencode", "--persist"])
+    captured = _capture_launch(monkeypatch, ["opencode", "--url", BASE, "--persist"])
     assert "--continue" not in captured["command"]
     assert captured["command"][1:] == ["--model", f"{opencode_agent._OPENCODE_PROVIDER}/{MODEL['id']}"]
 
@@ -1126,7 +1124,7 @@ def test_connect_opencode_mcp_writes_local_and_remote_entries(fake_vllm, tmp_pat
     user_entry = _opencode_user_global_mcp(tmp_path, monkeypatch)
     _mcp_registry()
     result = CliRunner().invoke(
-        start.start_app, ["opencode", "--no-launch", "--mcp", "context7", "--mcp", "github"]
+        start.start_app, ["opencode", "--url", BASE, "--no-launch", "--mcp", "context7", "--mcp", "github"]
     )
     assert result.exit_code == 0, result.output
     config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
@@ -1152,7 +1150,7 @@ def test_connect_opencode_mcp_all_mounts_every_registry_server(fake_vllm, tmp_pa
     monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
     _opencode_user_global_mcp(tmp_path, monkeypatch)
     _mcp_registry()
-    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", "--mcp-all"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch", "--mcp-all"])
     assert result.exit_code == 0, result.output
     config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
     assert {name for name, entry in config["mcp"].items() if entry["enabled"]} == {
@@ -1164,7 +1162,7 @@ def test_connect_opencode_mcp_all_mounts_every_registry_server(fake_vllm, tmp_pa
 def test_connect_opencode_mcp_url_mounts_without_a_registry(fake_vllm, tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-empty"))
     result = CliRunner().invoke(
-        start.start_app, ["opencode", "--no-launch", "--mcp-url", "ev=http://127.0.0.1:18331/mcp"]
+        start.start_app, ["opencode", "--url", BASE, "--no-launch", "--mcp-url", "ev=http://127.0.0.1:18331/mcp"]
     )
     assert result.exit_code == 0, result.output
     config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
@@ -1180,7 +1178,7 @@ def test_connect_opencode_mcp_stdio_mounts_without_a_registry(fake_vllm, tmp_pat
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-empty"))
     result = CliRunner().invoke(
         start.start_app,
-        ["opencode", "--no-launch", "--mcp-stdio", "ev=npx -y @modelcontextprotocol/server-everything@2026.8.31"],
+        ["opencode", "--url", BASE, "--no-launch", "--mcp-stdio", "ev=npx -y @modelcontextprotocol/server-everything@2026.8.31"],
     )
     assert result.exit_code == 0, result.output
     config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
@@ -1198,7 +1196,7 @@ def test_connect_opencode_mcp_stdio_shell_form(fake_vllm, tmp_path, monkeypatch)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-empty"))
     result = CliRunner().invoke(
         start.start_app,
-        ["opencode", "--no-launch", "--mcp-stdio", 'ev="npx -y @modelcontextprotocol/server-everything@2026.8.31"'],
+        ["opencode", "--url", BASE, "--no-launch", "--mcp-stdio", 'ev="npx -y @modelcontextprotocol/server-everything@2026.8.31"'],
     )
     assert result.exit_code == 0, result.output
     config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
@@ -1212,7 +1210,7 @@ def test_connect_opencode_mcp_stdio_shell_form(fake_vllm, tmp_path, monkeypatch)
 
 def test_connect_opencode_without_mcp_flags_has_no_mcp_key(fake_vllm, tmp_path, monkeypatch):
     _opencode_user_global_mcp(tmp_path, monkeypatch)
-    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
     assert "mcp" not in config
@@ -1222,11 +1220,11 @@ def test_opencode_mcp_state_cleared_on_rerun_without_flags(fake_vllm, tmp_path, 
     # A --no-launch session config is reused, so the next run must not keep the earlier mount.
     monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
     _mcp_registry()
-    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", "--mcp", "context7"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch", "--mcp", "context7"])
     assert result.exit_code == 0, result.output
     config_path = tmp_path / "agents" / "opencode" / "opencode.json"
     assert "mcp" in json.loads(config_path.read_text())
-    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     assert "mcp" not in json.loads(config_path.read_text())
 
@@ -1238,7 +1236,7 @@ def test_opencode_unparseable_global_config_warns_and_continues(fake_vllm, tmp_p
     (global_dir / "opencode.json").write_text("{ this is not json")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     _mcp_registry()
-    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", "--mcp", "context7"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch", "--mcp", "context7"])
     assert result.exit_code == 0, result.output
     assert "couldn't parse" in result.output
     config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
@@ -1255,7 +1253,7 @@ def test_opencode_commented_jsonc_global_mcp_is_disabled(fake_vllm, tmp_path, mo
     )
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     _mcp_registry()
-    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", "--mcp", "context7"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch", "--mcp", "context7"])
     assert result.exit_code == 0, result.output
     config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
     assert config["mcp"]["user-server"] == {
@@ -1277,7 +1275,7 @@ def test_opencode_global_mcp_from_two_files_both_disabled(fake_vllm, tmp_path, m
     )
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     _mcp_registry()
-    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", "--mcp", "context7"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch", "--mcp", "context7"])
     assert result.exit_code == 0, result.output
     config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
     assert config["mcp"]["old-server"] == {"type": "local", "command": ["true"], "enabled": False}
@@ -1297,7 +1295,7 @@ def test_opencode_jsonc_comment_marker_in_string_survives(fake_vllm, tmp_path, m
     )
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     _mcp_registry()
-    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", "--mcp", "context7"])
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch", "--mcp", "context7"])
     assert result.exit_code == 0, result.output
     config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
     assert config["mcp"]["odd-server"] == {
@@ -1310,7 +1308,64 @@ def test_opencode_jsonc_comment_marker_in_string_survives(fake_vllm, tmp_path, m
 def test_opencode_mcp_with_as_subagent_fails(fake_vllm):
     _mcp_registry()
     result = CliRunner().invoke(
-        start.start_app, ["opencode", "--as-subagent", "--no-launch", "--mcp", "context7"]
+        start.start_app, ["opencode", "--url", BASE, "--as-subagent", "--no-launch", "--mcp", "context7"]
     )
     assert result.exit_code == 1
     assert "--mcp/--mcp-all/--mcp-url/--mcp-oauth-url/--mcp-header/--mcp-stdio/--mcp-env cannot be combined with --as-subagent" in result.output
+
+
+# ── Native launch (no --url/--provider) ──────────────────────────────
+
+
+def _native_no_connect(monkeypatch):
+    set_start_attr(monkeypatch, "_connect",
+        lambda *args, **kwargs: pytest.fail("native launch must not connect"),
+    )
+
+
+def test_native_opencode_bare_sets_no_config(fake_vllm, monkeypatch):
+    _native_no_connect(monkeypatch)
+    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
+    assert result.exit_code == 0, result.output
+    assert _launch_command(result.output) == ["opencode"]
+    assert "OPENCODE_CONFIG" not in result.output
+
+
+def test_native_opencode_config_holds_only_mcp(fake_vllm, tmp_path, monkeypatch):
+    _native_no_connect(monkeypatch)
+    result = CliRunner().invoke(
+        start.start_app, ["opencode", "--no-launch", "--mcp-stdio", "ev=npx everything"]
+    )
+    assert result.exit_code == 0, result.output
+    config_path = tmp_path / "agents" / "opencode-native" / "opencode.json"
+    _assert_env_set(result.output, "OPENCODE_CONFIG", str(config_path))
+    config = json.loads(config_path.read_text())
+    assert set(config) == {"$schema", "mcp"}
+    assert config["mcp"] == {
+        "ev": {"type": "local", "command": ["npx", "everything"], "environment": {}, "enabled": True}
+    }
+
+
+def test_native_opencode_yolo_routes_to_auto(fake_vllm, monkeypatch):
+    _native_no_connect(monkeypatch)
+    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", "--yolo"])
+    assert result.exit_code == 0, result.output
+    assert _launch_command(result.output) == ["opencode", "--auto"]
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        ["--model", "org/model"],
+        ["--max-tokens", "4096"],
+        ["--top-p", "0.9"],
+        ["--no-model-load"],
+        ["--as-subagent"],
+        ["--persist"],
+    ],
+)
+def test_native_opencode_refuses_local_only_flags(fake_vllm, monkeypatch, flag):
+    _native_no_connect(monkeypatch)
+    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", *flag])
+    assert result.exit_code == 1
+    assert "needs --url or --provider" in result.output

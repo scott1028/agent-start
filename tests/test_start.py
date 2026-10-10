@@ -69,14 +69,14 @@ _NATIVE_YOLO = {
 
 @pytest.mark.parametrize("agent, native", sorted(_NATIVE_YOLO.items()))
 def test_yolo_routes_to_native_flag(fake_vllm, agent, native):
-    result = CliRunner().invoke(start.start_app, [agent, "--yolo", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, [agent, "--url", BASE, "--yolo", "--no-launch"])
     assert result.exit_code == 0, result.output
     assert native in result.output
 
 
 @pytest.mark.parametrize("agent, native", sorted(_NATIVE_YOLO.items()))
 def test_no_yolo_omits_native_flag(fake_vllm, agent, native):
-    result = CliRunner().invoke(start.start_app, [agent, "--no-launch"])
+    result = CliRunner().invoke(start.start_app, [agent, "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     # pi's --approve is a real flag only added under --yolo; assert it's absent here.
     command = _launch_command(result.output)
@@ -90,20 +90,20 @@ def test_no_yolo_omits_native_flag(fake_vllm, agent, native):
 )
 def test_yolo_aliases_are_interchangeable(fake_vllm, alias):
     # Any spelling on any agent routes to that agent's own flag, even the "wrong" one.
-    claude = CliRunner().invoke(start.start_app, ["claude", alias, "--no-launch"])
+    claude = CliRunner().invoke(start.start_app, ["claude", "--url", BASE, alias, "--no-launch"])
     assert claude.exit_code == 0, claude.output
     assert "--dangerously-skip-permissions" in claude.output
     # The codex spelling must not leak through to Claude's command line.
     assert "--dangerously-bypass-approvals-and-sandbox" not in claude.output
 
-    codex = CliRunner().invoke(start.start_app, ["codex", alias, "--no-launch"])
+    codex = CliRunner().invoke(start.start_app, ["codex", "--url", BASE, alias, "--no-launch"])
     assert codex.exit_code == 0, codex.output
     assert "--dangerously-bypass-approvals-and-sandbox" in codex.output
     assert "--dangerously-skip-permissions" not in codex.output
 
     opencode = CliRunner().invoke(
         start.start_app,
-        ["opencode", alias, "--no-launch", "run", "hello"],
+        ["opencode", "--url", BASE, alias, "--no-launch", "run", "hello"],
     )
     assert opencode.exit_code == 0, opencode.output
     assert _launch_command(opencode.output) == ["opencode", "run", "hello", "--auto"]
@@ -114,7 +114,7 @@ def test_yolo_config_fallbacks_add_no_legacy_command_flag(fake_vllm):
     # OpenCode's append-safe bare recipe uses its config fallback, so it must not leak a legacy
     # yolo/dangerous alias onto argv.
     for agent in ("opencode",):
-        result = CliRunner().invoke(start.start_app, [agent, "--yolo", "--no-launch"])
+        result = CliRunner().invoke(start.start_app, [agent, "--url", BASE, "--yolo", "--no-launch"])
         assert result.exit_code == 0, result.output
         command = _launch_command(result.output)
         assert command and command[0] == agent, result.output
@@ -126,7 +126,7 @@ def test_resume_persists_agent_home_to_stable_dir(agent, fake_vllm, tmp_path, mo
     monkeypatch.setattr(shutil, "which", lambda name, path = None: f"/usr/local/bin/{agent}")
     if agent == "dsh":
         set_start_attr(monkeypatch, "is_deepseek_harness_executable", lambda _: True)
-    captured = _capture_launch(monkeypatch, [agent, "--persist"])
+    captured = _capture_launch(monkeypatch, [agent, "--url", BASE, "--persist"])
     stable = tmp_path / "agents" / agent
     assert captured["env"][_RESUME_ENV_VAR[agent]] == str(stable)
     # The stable dir survives the agent exit, so the session can be resumed.
@@ -139,7 +139,7 @@ def test_resume_persist_only_agents_have_no_resume_token(fake_vllm, monkeypatch)
         monkeypatch.setattr(shutil, "which", lambda _, a = agent: f"/usr/local/bin/{a}")
         if agent == "dsh":
             set_start_attr(monkeypatch, "is_deepseek_harness_executable", lambda _: True)
-        captured = _capture_launch(monkeypatch, [agent, "--persist"])
+        captured = _capture_launch(monkeypatch, [agent, "--url", BASE, "--persist"])
         assert "resume" not in captured["command"]
         assert "--continue" not in captured["command"]
 
@@ -160,6 +160,6 @@ def test_launch_drops_provider_credentials(agent, unset, fake_vllm, monkeypatch)
     monkeypatch.setattr(shutil, "which", lambda name, path = None: f"/usr/local/bin/{agent}")
     for name in unset:
         monkeypatch.setenv(name, "sk-stale")
-    captured = _capture_launch(monkeypatch, [agent])
+    captured = _capture_launch(monkeypatch, [agent, "--url", BASE])
     for name in unset:
         assert name not in captured["env"]

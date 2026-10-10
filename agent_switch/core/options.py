@@ -89,8 +89,8 @@ _URL_OPTION = typer.Option(
     None,
     "--url",
     rich_help_panel = _PANEL_SERVER,
-    help = "Model server URL, e.g. http://127.0.0.1:11434. Default: the one Ollama, LM Studio, "
-    "llama-server or vLLM server answering on its usual local port.",
+    help = "Model server URL, e.g. http://127.0.0.1:11434. Without --url or --provider the "
+    "agent runs natively: its own model, login and config, plus only the shared flags.",
 )
 
 
@@ -508,6 +508,59 @@ def _consume_positional_model(model: Optional[str], args: list) -> tuple:
 def _fail(message: str) -> NoReturn:
     typer.echo(message, err = True)
     raise typer.Exit(code = 1)
+
+
+def _refuse_local_only(
+    *,
+    model: Optional[str] = None,
+    max_seq_length: int = 0,
+    max_tokens: Optional[int] = None,
+    reasoning: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
+    min_p: Optional[float] = None,
+    repetition_penalty: Optional[float] = None,
+    presence_penalty: Optional[float] = None,
+    compact_at: Optional[float] = None,
+    api_key: Optional[str] = None,
+    header: Optional[list] = None,
+    model_load: bool = True,
+    as_subagent: bool = False,
+    persist: Optional[bool] = False,
+    persist_default: Optional[bool] = False,
+) -> None:
+    """Fail naming the first flag that only makes sense with a local model server.
+
+    Each value is compared against that option's real default, so only a flag the user
+    actually gave is refused; dsh's --persist defaults to None, so both of its spellings
+    count there. --api-key also arrives through AGENT_SWITCH_API_KEY, which is not the user
+    typing the flag, so a value equal to that env var does not count.
+    """
+    given = (
+        ("--model", model is not None),
+        ("--context-length", max_seq_length != 0),
+        ("--max-tokens", max_tokens is not None),
+        ("--reasoning", reasoning is not None),
+        ("--reasoning-effort", reasoning_effort is not None),
+        ("--temperature", temperature is not None),
+        ("--top-p", top_p is not None),
+        ("--top-k", top_k is not None),
+        ("--min-p", min_p is not None),
+        ("--repetition-penalty", repetition_penalty is not None),
+        ("--presence-penalty", presence_penalty is not None),
+        ("--compact-at", compact_at is not None),
+        ("--api-key", api_key not in (None, os.environ.get("AGENT_SWITCH_API_KEY"))),
+        ("--header", bool(header)),
+        ("--no-model-load", not model_load),
+        ("--as-subagent", as_subagent),
+        ("--persist", persist is True),
+        ("--no-persist", persist is False and persist_default is not False),
+    )
+    for flag, was_given in given:
+        if was_given:
+            _fail(f"{flag} needs --url or --provider.")
 
 
 _HF_REPO_ID_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")

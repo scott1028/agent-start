@@ -166,6 +166,77 @@ def _launch(
 _active_target: Optional[Target] = None
 
 
+# Set by the group in start.py when the invoked name is an agent alias like `claude-personal`:
+# the user's own shell name, and the agent kind it was matched to. Click shares ctx.meta with
+# child contexts, so the command function reads both.
+_ALIAS_META = "agent_switch.alias"
+
+
+_ALIAS_KIND_META = "agent_switch.alias_kind"
+
+
+# The alias name goes into a `bash -ic` string, so it must stay shell-word safe.
+_ALIAS_NAME = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def _agent_command(alias: Optional[str], agent: str, args: list, unset_env: tuple = ()) -> list:
+    """The agent's argv; an alias replaces only argv[0], and the env still reaches the bash process."""
+    if alias is None:
+        return [agent, *args]
+    script = f'{alias} "$@"'
+    if unset_env:
+        # bash -ic re-reads the shell config, which could re-export what the session cleared.
+        script = "unset " + " ".join(unset_env) + "; " + script
+    # `agent-switch` is $0, so "$@" is exactly the agent's arguments. No exec: bash cannot exec a function.
+    return ["bash", "-ic", script, "agent-switch", *args]
+
+
+def _check_alias(alias: str) -> None:
+    """Fail unless bash can name and start the user's own function, alias or script."""
+    if os.name == "nt":
+        _fail(
+            f"`{alias}` is an agent alias, which agent-switch starts through bash; "
+            "Windows is not supported."
+        )
+    if shutil.which("bash") is None:
+        _fail(f"`{alias}` is an agent alias, which needs `bash` on PATH.")
+    if not _ALIAS_NAME.fullmatch(alias):
+        _fail(f"`{alias}` carries characters an agent alias name cannot have.")
+    probed = subprocess.run(
+        ["bash", "-ic", f"type -t {alias}"],
+        capture_output = True,
+        text = True,
+    )
+    kind = probed.stdout.strip()
+    if kind not in ("function", "alias", "file"):
+        _fail(
+            f"`{alias}` is not a bash function, alias or file in `bash -ic`'s shell; define it "
+            'in your shell config forwarding "$@" to the agent, or use the plain subcommand.'
+        )
+    if kind == "file":
+        path = subprocess.run(
+            ["bash", "-ic", f"command -v {alias}"],
+            capture_output = True,
+            text = True,
+        ).stdout.strip()
+        try:
+            definition = Path(path).read_text(encoding = "utf-8", errors = "replace")
+        except OSError:
+            definition = ""
+    else:
+        printer = "declare -f" if kind == "function" else "alias"
+        definition = subprocess.run(
+            ["bash", "-ic", f"{printer} {alias}"],
+            capture_output = True,
+            text = True,
+        ).stdout
+    if "agent-switch" in definition:
+        _fail(
+            f"`{alias}` runs agent-switch itself, so `agent-switch {alias}` would recurse; "
+            "run what its definition runs instead."
+        )
+
+
 _REQUEST_FLAGS = {
     **{name: "--" + name.replace("_", "-") for name in _SAMPLING_FIELDS},
     "enable_thinking": "--reasoning",
@@ -179,8 +250,8 @@ def _resolve_target(
     provider: Optional[str],
     api_key: Optional[str] = None,
     headers: Optional[dict] = None,
-) -> Target:
-    """The server to use: --url/--provider, else the one server answering on a usual local port."""
+) -> Optional[Target]:
+    """The server named by --url/--provider; None when neither was given, which means native launch."""
     global _active_target
     if url and not api_key:
         api_key = next(iter(_cached_keys(_provider_key_cache_path(), providers.root_url(url))), None)
@@ -188,20 +259,6 @@ def _resolve_target(
         target = providers.resolve_target(url, provider, api_key, headers)
     except ProviderError as exc:
         _fail(str(exc))
-    if target is None:
-        # The scan never sends the --header pairs; only the server it picks gets them.
-        found = providers.scan_local_servers()
-        if not found:
-            _fail(
-                "No model server found on the usual Ollama, LM Studio, llama-server or vLLM port. "
-                "Start one, or pass its address with --url (or its type with --provider)."
-            )
-        if len(found) > 1:
-            listed = "\n".join(f"  {providers.label(t.name)} at {t.base}" for t in found)
-            _fail(f"Found several model servers:\n{listed}\nPick one with --url (or --provider).")
-        target = found[0]
-        if headers:
-            target = target._replace(headers = headers)
     _active_target = target
     return target
 
@@ -281,5 +338,39 @@ def _run(
     )
     if code:
         # A failed session must not end silently behind the agent's own output.
+        typer.echo(f"The agent exited with code {code}.")
+    raise typer.Exit(code = code)
+
+
+def _run_native(
+    agent: str,
+    env: dict,
+    command: list,
+    *,
+    launch: bool,
+    install_hint: str,
+    unset_env: tuple = (),
+    clear_screen: bool = False,
+) -> None:
+    """Native launch: the agent keeps its own model, login and config; only shared flags were added."""
+    if launch and clear_screen:
+        click.clear()
+    typer.echo(f"{agent} runs with its own model, login and config.")
+    if not launch:
+        env, wsl_env_bridge = _wsl_shim_env(command, env, unset_env)
+        _print_env(
+            env,
+            command,
+            unset_env = unset_env,
+            wsl_env_bridge = wsl_env_bridge,
+        )
+        return
+    code = _launch(
+        command,
+        env,
+        install_hint = install_hint,
+        unset_env = unset_env,
+    )
+    if code:
         typer.echo(f"The agent exited with code {code}.")
     raise typer.Exit(code = code)

@@ -81,19 +81,6 @@ def resolve_target(
     return None
 
 
-def scan_local_servers() -> list:
-    """Servers answering on their usual local ports."""
-    found = []
-    # Convenience discovery on the known local ports, whatever server answers there; a server
-    # anywhere else needs an explicit --url.
-    for name in ("ollama", "lmstudio", "llamacpp", "vllm"):
-        base = _MODULES[name].DEFAULT_URL
-        detected = detect(base)
-        if detected is not None:
-            found.append(Target(detected, base))
-    return found
-
-
 def _same_model(entry: dict, wanted: str, module) -> bool:
     canonical = getattr(module, "canonical", lambda value: value)
     for name in (entry["id"], *entry.get("aliases", [])):

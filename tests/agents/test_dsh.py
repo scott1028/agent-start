@@ -39,12 +39,11 @@ from tests.start_split import set_start_attr
 @pytest.mark.parametrize("agent", ["dsh"])
 @pytest.mark.parametrize("flag", ["--as-subagent", "--as-subagent=true", "--as-subagent=false"])
 def test_unsupported_agents_reject_as_subagent(agent, flag):
-    result = CliRunner().invoke(start.start_app, [agent, flag])
+    result = CliRunner().invoke(start.start_app, [agent, "--url", BASE, flag])
     assert result.exit_code == 1
     assert f"--as-subagent is not supported for {agent}." in result.output
 
 
-@pytest.mark.usefixtures("one_local_server")
 def test_dsh_rejects_an_unrelated_executable_before_connect(monkeypatch):
     set_start_attr(monkeypatch, "_which_with_install_dirs", lambda _: "/usr/bin/dsh")
     set_start_attr(monkeypatch, "is_deepseek_harness_executable", lambda _: False)
@@ -53,7 +52,7 @@ def test_dsh_rejects_an_unrelated_executable_before_connect(monkeypatch):
         lambda *args, **kwargs: pytest.fail("the wrong dsh must be rejected before connection"),
     )
 
-    result = CliRunner().invoke(start.start_app, ["dsh"])
+    result = CliRunner().invoke(start.start_app, ["dsh", "--provider", "vllm"])
 
     assert result.exit_code == 1
     assert "`/usr/bin/dsh` is not DeepSeek Harness" in result.output
@@ -92,7 +91,7 @@ def test_dsh_resolver_searches_past_an_unrelated_earlier_path_entry(monkeypatch,
 def test_dsh_carries_reasoning_and_warns_about_sampling(fake_vllm, tmp_path, monkeypatch):
     yaml = pytest.importorskip("yaml")
     monkeypatch.chdir(tmp_path)
-    result = CliRunner().invoke(start.start_app, ["dsh", "--no-launch", *_SESSION_FLAGS])
+    result = CliRunner().invoke(start.start_app, ["dsh", "--url", BASE, "--no-launch", *_SESSION_FLAGS])
     assert result.exit_code == 0, result.output
     assert "can't send --temperature, --top-k itself" in result.output
     assert "--reasoning" not in result.output
@@ -206,7 +205,7 @@ def test_dsh_command_places_the_patch_where_dsh_parses_it(args, expected):
 
 def test_connect_dsh_no_launch(fake_vllm, tmp_path):
     yaml = pytest.importorskip("yaml")
-    result = CliRunner().invoke(start.start_app, ["dsh", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["dsh", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     _assert_env_set(result.output, "AGENT_SWITCH_API_KEY", KEY)
     home = tmp_path / "agents" / "dsh"
@@ -234,19 +233,19 @@ def test_dsh_under_wsl_gets_the_windows_patch_path(fake_vllm, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda _: shim)
     set_start_attr(monkeypatch, "is_deepseek_harness_executable", lambda _: True)
     monkeypatch.setattr(subprocess, "check_output", lambda *args, **kwargs: windows_path)
-    captured = _capture_launch(monkeypatch, ["dsh", "--profile", "headless", "hi"])
+    captured = _capture_launch(monkeypatch, ["dsh", "--url", BASE, "--profile", "headless", "hi"])
     command = captured["command"]
     assert command[command.index("--patch") + 1] == windows_path, command
 
 
 def test_dsh_yolo_sets_permission_mode(fake_vllm):
-    result = CliRunner().invoke(start.start_app, ["dsh", "--yolo", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["dsh", "--url", BASE, "--yolo", "--no-launch"])
     assert result.exit_code == 0, result.output
     _assert_env_set(result.output, "DSH_PERMISSION_MODE", "danger-full-access")
 
 
 def test_dsh_without_yolo_pins_the_safe_permission_mode(fake_vllm):
-    result = CliRunner().invoke(start.start_app, ["dsh", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["dsh", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     _assert_env_set(result.output, "DSH_PERMISSION_MODE", "workspace-write")
 
@@ -254,8 +253,8 @@ def test_dsh_without_yolo_pins_the_safe_permission_mode(fake_vllm):
 @pytest.mark.parametrize(
     ("argv", "expected"),
     [
-        (["dsh"], "workspace-write"),
-        (["dsh", "--yolo"], "danger-full-access"),
+        (["dsh", "--url", BASE], "workspace-write"),
+        (["dsh", "--url", BASE, "--yolo"], "danger-full-access"),
     ],
 )
 def test_dsh_permission_mode_overrides_an_inherited_bypass(
@@ -291,7 +290,7 @@ def test_start_dsh_forwards_reasoning_effort(fake_vllm, monkeypatch):
 
     result = CliRunner().invoke(
         start.start_app,
-        ["dsh", "--model", MODEL["id"], "--reasoning-effort", "high"],
+        ["dsh", "--url", BASE, "--model", MODEL["id"], "--reasoning-effort", "high"],
     )
     assert result.exit_code == 0, result.output
     assert "--reasoning-effort" not in captured["command"]
@@ -521,7 +520,7 @@ def test_dsh_no_launch_links_user_resources_into_the_session(fake_vllm, tmp_path
     (source / "skills" / "my-skill").mkdir(parents = True)
     (source / "AGENTS.md").write_text("user instructions\n")
 
-    result = CliRunner().invoke(start.start_app, ["dsh", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["dsh", "--url", BASE, "--no-launch"])
 
     assert result.exit_code == 0, result.output
     dsh_home = tmp_path / "agents" / "dsh"
@@ -543,7 +542,7 @@ def test_connect_dsh_mcp_inserts_one_row_per_server(fake_vllm, tmp_path, monkeyp
     monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
     _mcp_registry()
     result = CliRunner().invoke(
-        start.start_app, ["dsh", "--no-launch", "--mcp", "context7", "--mcp", "github"]
+        start.start_app, ["dsh", "--url", BASE, "--no-launch", "--mcp", "context7", "--mcp", "github"]
     )
     assert result.exit_code == 0, result.output
     rows = _dsh_mcp_rows(tmp_path / "agents" / "dsh" / dsh_agent._DSH_PATCH_FILE)
@@ -568,7 +567,7 @@ def test_connect_dsh_mcp_inserts_one_row_per_server(fake_vllm, tmp_path, monkeyp
 def test_connect_dsh_mcp_all_mounts_every_registry_server(fake_vllm, tmp_path, monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
     _mcp_registry()
-    result = CliRunner().invoke(start.start_app, ["dsh", "--no-launch", "--mcp-all"])
+    result = CliRunner().invoke(start.start_app, ["dsh", "--url", BASE, "--no-launch", "--mcp-all"])
     assert result.exit_code == 0, result.output
     rows = _dsh_mcp_rows(tmp_path / "agents" / "dsh" / dsh_agent._DSH_PATCH_FILE)
     assert set(rows) == {"mcp-context7", "mcp-github"}
@@ -576,7 +575,7 @@ def test_connect_dsh_mcp_all_mounts_every_registry_server(fake_vllm, tmp_path, m
 
 def test_connect_dsh_mcp_url_mounts_without_a_registry(fake_vllm, tmp_path):
     result = CliRunner().invoke(
-        start.start_app, ["dsh", "--no-launch", "--mcp-url", "ev=http://127.0.0.1:18331/mcp"]
+        start.start_app, ["dsh", "--url", BASE, "--no-launch", "--mcp-url", "ev=http://127.0.0.1:18331/mcp"]
     )
     assert result.exit_code == 0, result.output
     rows = _dsh_mcp_rows(tmp_path / "agents" / "dsh" / dsh_agent._DSH_PATCH_FILE)
@@ -591,7 +590,7 @@ def test_connect_dsh_mcp_url_mounts_without_a_registry(fake_vllm, tmp_path):
 def test_connect_dsh_mcp_stdio_mounts_without_a_registry(fake_vllm, tmp_path):
     result = CliRunner().invoke(
         start.start_app,
-        ["dsh", "--no-launch", "--mcp-stdio", "ev=npx -y @modelcontextprotocol/server-everything@2026.8.31"],
+        ["dsh", "--url", BASE, "--no-launch", "--mcp-stdio", "ev=npx -y @modelcontextprotocol/server-everything@2026.8.31"],
     )
     assert result.exit_code == 0, result.output
     rows = _dsh_mcp_rows(tmp_path / "agents" / "dsh" / dsh_agent._DSH_PATCH_FILE)
@@ -609,7 +608,7 @@ def test_connect_dsh_mcp_stdio_shell_form(fake_vllm, tmp_path, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda name, path = None: "/bin/bash" if name == "bash" else None)
     result = CliRunner().invoke(
         start.start_app,
-        ["dsh", "--no-launch", "--mcp-stdio", 'ev="npx -y @modelcontextprotocol/server-everything@2026.8.31"'],
+        ["dsh", "--url", BASE, "--no-launch", "--mcp-stdio", 'ev="npx -y @modelcontextprotocol/server-everything@2026.8.31"'],
     )
     assert result.exit_code == 0, result.output
     rows = _dsh_mcp_rows(tmp_path / "agents" / "dsh" / dsh_agent._DSH_PATCH_FILE)
@@ -623,7 +622,7 @@ def test_connect_dsh_mcp_stdio_shell_form(fake_vllm, tmp_path, monkeypatch):
 
 
 def test_connect_dsh_without_mcp_flags_has_no_insert_row(fake_vllm, tmp_path):
-    result = CliRunner().invoke(start.start_app, ["dsh", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["dsh", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     patch = tmp_path / "agents" / "dsh" / dsh_agent._DSH_PATCH_FILE
     assert _dsh_mcp_rows(patch) == {}
@@ -633,11 +632,11 @@ def test_dsh_mcp_state_cleared_on_rerun_without_flags(fake_vllm, tmp_path, monke
     # The patch is rewritten whole, so a run without MCP flags drops the insert row again.
     monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
     _mcp_registry()
-    result = CliRunner().invoke(start.start_app, ["dsh", "--no-launch", "--mcp", "context7"])
+    result = CliRunner().invoke(start.start_app, ["dsh", "--url", BASE, "--no-launch", "--mcp", "context7"])
     assert result.exit_code == 0, result.output
     patch = tmp_path / "agents" / "dsh" / dsh_agent._DSH_PATCH_FILE
     assert _dsh_mcp_rows(patch)
-    result = CliRunner().invoke(start.start_app, ["dsh", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["dsh", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     assert _dsh_mcp_rows(patch) == {}
 
@@ -645,7 +644,63 @@ def test_dsh_mcp_state_cleared_on_rerun_without_flags(fake_vllm, tmp_path, monke
 def test_dsh_mcp_with_as_subagent_fails(fake_vllm):
     _mcp_registry()
     result = CliRunner().invoke(
-        start.start_app, ["dsh", "--no-launch", "--mcp", "context7", "--as-subagent"]
+        start.start_app, ["dsh", "--url", BASE, "--no-launch", "--mcp", "context7", "--as-subagent"]
     )
     assert result.exit_code == 1
     assert "--as-subagent is not supported for dsh." in result.output
+
+
+# ── Native launch (no --url/--provider) ──────────────────────────────
+
+
+def _native_no_connect_dsh(monkeypatch):
+    set_start_attr(monkeypatch, "_connect",
+        lambda *args, **kwargs: pytest.fail("native launch must not connect"),
+    )
+
+
+def test_native_dsh_bare_passes_no_patch(fake_vllm, monkeypatch):
+    _native_no_connect_dsh(monkeypatch)
+    result = CliRunner().invoke(start.start_app, ["dsh", "--no-launch"])
+    assert result.exit_code == 0, result.output
+    assert _launch_command(result.output) == ["dsh", "web"]
+    assert "DSH_HOME" not in result.output
+
+
+def test_native_dsh_mcp_patch_holds_only_the_insert_row(fake_vllm, tmp_path, monkeypatch):
+    _native_no_connect_dsh(monkeypatch)
+    result = CliRunner().invoke(
+        start.start_app, ["dsh", "--no-launch", "--mcp-stdio", "ev=npx everything"]
+    )
+    assert result.exit_code == 0, result.output
+    patch = tmp_path / "agents" / "dsh-native" / "agent-switch.patch.yml"
+    assert _launch_command(result.output) == ["dsh", "web", "--patch", str(patch)]
+    rows = _dsh_mcp_rows(patch)
+    assert list(rows) == ["mcp-ev"]
+    assert rows["mcp-ev"]["config"]["command"] == "npx"
+    assert "DSH_HOME" not in result.output
+
+
+def test_native_dsh_yolo_sets_only_the_permission_mode(fake_vllm, monkeypatch):
+    _native_no_connect_dsh(monkeypatch)
+    result = CliRunner().invoke(start.start_app, ["dsh", "--no-launch", "--yolo"])
+    assert result.exit_code == 0, result.output
+    _assert_env_set(result.output, "DSH_PERMISSION_MODE", "danger-full-access")
+    assert "DSH_HOME" not in result.output
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        ["--model", "org/model"],
+        ["--compact-at", "0.8"],
+        ["--no-persist"],
+        ["--persist"],
+        ["--max-tokens", "4096"],
+    ],
+)
+def test_native_dsh_refuses_local_only_flags(fake_vllm, monkeypatch, flag):
+    _native_no_connect_dsh(monkeypatch)
+    result = CliRunner().invoke(start.start_app, ["dsh", "--no-launch", *flag])
+    assert result.exit_code == 1
+    assert "needs --url or --provider" in result.output

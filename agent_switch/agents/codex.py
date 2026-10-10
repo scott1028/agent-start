@@ -6,6 +6,7 @@
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -21,7 +22,15 @@ from agent_switch.core.install import (
     _require_agent_for_launch,
     _which_with_install_dirs,
 )
-from agent_switch.core.launch import _connect, _resolve_target, _run
+from agent_switch.core.launch import (
+    _ALIAS_META,
+    _agent_command,
+    _check_alias,
+    _connect,
+    _resolve_target,
+    _run,
+    _run_native,
+)
 from agent_switch.core.mcp import load_mcp_servers
 from agent_switch.core.options import (
     LoadOptions,
@@ -59,6 +68,7 @@ from agent_switch.core.options import (
     _check_compact_at,
     _consume_positional_model,
     _fail,
+    _refuse_local_only,
     _yolo_command_flags,
     parse_headers,
 )
@@ -180,6 +190,44 @@ def _codex_mcp_tables(servers: Optional[dict]) -> str:
                 )
                 tables += f"http_headers = {{ {pairs} }}\n"
     return tables
+
+
+def _codex_native_mcp_flags(config: Path, servers: dict, env: dict) -> list:
+    """-c mcp_servers.<name>=<inline table> flags for native launch; env is filled with header secrets.
+
+    Nothing is written into the user's CODEX_HOME, so each server rides its own -c flag. A
+    stdio env would land in argv if inlined, so it goes into a private 0700 wrapper script
+    that becomes the command instead; an http header value goes into a uniquely named
+    process env var that env_http_headers names.
+    """
+    flags = []
+    header_count = 0
+    for name, server in servers.items():
+        if server["transport"] == "stdio":
+            command, args = server["command"], server["args"]
+            if server["env"]:
+                script = config / f"mcp-{name}.sh"
+                lines = [f"export {key}={shlex.quote(value)}" for key, value in server["env"].items()]
+                lines.append("exec " + " ".join(shlex.quote(arg) for arg in (command, *args)))
+                _write_private_text(script, "#!/bin/sh\n" + "\n".join(lines) + "\n")
+                script.chmod(0o700)
+                command, args = str(script), []
+            table = f"{{command = {json.dumps(command)}"
+            if args:
+                table += f", args = {json.dumps(args)}"
+            flags += ["-c", f"mcp_servers.{name}={table}}}"]
+        else:
+            table = f"{{url = {json.dumps(server['url'])}"
+            if server["headers"]:
+                pairs = []
+                for header_name, value in server["headers"].items():
+                    header_count += 1
+                    env_name = f"AGENT_SWITCH_MCP_HDR_{header_count}"
+                    env[env_name] = value
+                    pairs.append(f"{json.dumps(header_name)} = {json.dumps(env_name)}")
+                table += f", env_http_headers = {{ {', '.join(pairs)} }}"
+            flags += ["-c", f"mcp_servers.{name}={table}}}"]
+    return flags
 
 
 def _merge_codex_config(
@@ -581,8 +629,59 @@ def codex(
         as_subagent = as_subagent,
     )
     target = _resolve_target(url, provider, api_key, headers)
+    if target is None:
+        _refuse_local_only(
+            model = model,
+            max_seq_length = max_seq_length,
+            reasoning = reasoning,
+            reasoning_effort = reasoning_effort,
+            temperature = temperature,
+            top_p = top_p,
+            top_k = top_k,
+            min_p = min_p,
+            repetition_penalty = repetition_penalty,
+            presence_penalty = presence_penalty,
+            compact_at = compact_at,
+            api_key = api_key,
+            header = header,
+            model_load = model_load,
+            as_subagent = as_subagent,
+            persist = persist,
+        )
+    alias = ctx.meta.get(_ALIAS_META)
+    if alias and as_subagent:
+        _fail("--as-subagent is not supported for agent aliases.")
+    if alias and target is not None:
+        # The function sets its own CODEX_HOME, which outranks the session env, so the session
+        # config with the local provider and key would be silently ignored.
+        _fail(
+            "codex aliases run natively only: the alias sets its own CODEX_HOME, so --url cannot "
+            "route it; drop --url/--provider or use `agent-switch codex`."
+        )
     install_hint = _npm_install_hint("@openai/codex")
-    _require_agent_for_launch("codex", install_hint, launch)
+    if alias:
+        _check_alias(alias)
+    else:
+        _require_agent_for_launch("codex", install_hint, launch)
+    if target is None:
+        # Native launch: codex keeps its own model, login and ~/.codex config (no --oss, no
+        # --profile, CODEX_HOME untouched); each mounted server rides its own -c flag.
+        with _session_config("codex-native", launch) as config:
+            env = {}
+            mcp_flags = _codex_native_mcp_flags(config, mcp_servers or {}, env)
+            command = _agent_command(
+                alias,
+                "codex",
+                [*mcp_flags, *_yolo_command_flags("codex", yolo), *ctx.args],
+            )
+            _run_native(
+                alias or "codex",
+                env,
+                command,
+                launch = launch,
+                install_hint = install_hint,
+            )
+        return
     codex_effort = _codex_reasoning_effort(reasoning, reasoning_effort)
     if codex_effort and not _agent_version_at_least("codex", _CODEX_REASONING_REQUEST_MIN_VERSION):
         codex_effort = None

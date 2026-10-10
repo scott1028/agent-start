@@ -11,7 +11,6 @@ import pytest
 import agent_switch.providers.utils as provider_utils
 from agent_switch import providers
 from agent_switch.core import storage as core_storage
-from agent_switch.providers.types import Target
 from tests.cli_support import BASE, KEY, MODEL
 from tests.start_split import set_start_attr
 
@@ -35,21 +34,14 @@ def _plain_cli_output(monkeypatch):
 
 @pytest.fixture(autouse = True)
 def _no_local_servers(monkeypatch, tmp_path):
-    """No test may probe the developer's real local ports or write their ~/.agent-switch."""
-    monkeypatch.setattr(providers, "scan_local_servers", lambda: [])
+    """No test may write the developer's real ~/.agent-switch."""
     set_start_attr(monkeypatch, "_active_target", None)
     monkeypatch.setenv("AGENT_SWITCH_HOME", str(tmp_path / "agent-switch-home"))
 
 
 @pytest.fixture()
-def one_local_server(monkeypatch):
-    """The no-url scan finds one server; enough for tests that stop before connecting."""
-    monkeypatch.setattr(providers, "scan_local_servers", lambda: [Target("vllm", BASE)])
-
-
-@pytest.fixture()
 def fake_vllm(tmp_path, monkeypatch):
-    """A vLLM-shaped server at BASE that the no-url scan finds, holding a key given before."""
+    """A vLLM-shaped server at BASE that --url tests reach through the request stub."""
     calls = []
 
     def request_json(method, url, key = None, payload = None, timeout = 10, headers = None):
@@ -64,7 +56,6 @@ def fake_vllm(tmp_path, monkeypatch):
 
     monkeypatch.setattr(provider_utils, "request_json", request_json)
     monkeypatch.setattr(providers, "request_json", request_json)
-    monkeypatch.setattr(providers, "scan_local_servers", lambda: [Target("vllm", BASE)])
     core_storage._remember_key(core_storage._provider_key_cache_path(), BASE, KEY)
     # --no-launch session configs land under tmp instead of the real agent-switch dir.
     set_start_attr(monkeypatch, "_agents_config_root", lambda: tmp_path / "agents")

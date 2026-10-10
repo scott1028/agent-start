@@ -8,6 +8,7 @@ import json
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -433,7 +434,7 @@ def test_agent_config_path_translates_for_windows_agent(monkeypatch, tmp_path):
 
 
 def test_connect_codex_no_launch(fake_vllm, tmp_path):
-    result = CliRunner().invoke(start.start_app, ["codex", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     for name in codex_agent._CODEX_ENV_UNSET:
         _assert_env_unset(result.output, name)
@@ -456,7 +457,7 @@ def test_connect_codex_as_subagent_preserves_cloud_parent(fake_vllm, tmp_path, m
     result = CliRunner().invoke(
         start.start_app,
         [
-            "codex",
+            "codex", "--url", BASE,
             "--as-subagent",
             "--no-launch",
             "--model",
@@ -503,7 +504,7 @@ def test_connect_codex_matches_requested_model_case_insensitively(fake_vllm, tmp
     result = CliRunner().invoke(
         start.start_app,
         [
-            "codex",
+            "codex", "--url", BASE,
             "--no-launch",
             "--model",
             "org/gemma-4-26b-a4b-it-gguf",
@@ -527,7 +528,7 @@ def test_connect_codex_launch_uses_ephemeral_home(fake_vllm, monkeypatch):
         return SimpleNamespace(returncode = 0)
 
     monkeypatch.setattr(subprocess, "run", run)
-    result = CliRunner().invoke(start.start_app, ["codex"])
+    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE])
     assert result.exit_code == 0, result.output
     home = Path(captured["home"])
     assert captured["config_present"]  # config existed while codex ran
@@ -544,7 +545,7 @@ def test_no_launch_output_is_parseable(fake_vllm):
     # Mirror the #6547 CI parser: status lines, then `export`/`unset`, then exactly
     # one launch command on the last line (now an inline-env one-liner, so the parser
     # matches by substring rather than prefix).
-    result = CliRunner().invoke(start.start_app, ["codex", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     lines = [ln for ln in result.output.splitlines() if ln.strip()]
     skip = ("export ", "unset ", "vLLM ", "Updated ", "Disabled ", "Warning", "Loading")
@@ -557,7 +558,7 @@ def test_no_launch_last_line_is_self_contained(fake_vllm, tmp_path):
     # People copy just the last line. A bare `codex` there would run against the user's
     # real ~/.codex (e.g. a pre-existing damaged state DB) with zero isolation, so the
     # last line must inline every session env var ahead of the command.
-    result = CliRunner().invoke(start.start_app, ["codex", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     last = [ln for ln in result.output.splitlines() if ln.strip()][-1]
     parts = shlex.split(last)
@@ -577,7 +578,7 @@ def test_no_launch_last_line_is_self_contained(fake_vllm, tmp_path):
 def test_start_separator_preserves_model_shaped_agent_argument(fake_vllm):
     result = CliRunner().invoke(
         start.start_app,
-        ["codex", "--no-launch", "--", "owner/repo"],
+        ["codex", "--url", BASE, "--no-launch", "--", "owner/repo"],
     )
 
     assert result.exit_code == 0, result.output
@@ -586,7 +587,7 @@ def test_start_separator_preserves_model_shaped_agent_argument(fake_vllm):
 
     result = CliRunner().invoke(
         start.start_app,
-        ["codex", "--no-launch", MODEL["id"], "--", "--continue"],
+        ["codex", "--url", BASE, "--no-launch", MODEL["id"], "--", "--continue"],
     )
     assert result.exit_code == 0, result.output
     command = _launch_command(result.output)
@@ -595,13 +596,13 @@ def test_start_separator_preserves_model_shaped_agent_argument(fake_vllm):
 
 def test_codex_carries_reasoning_and_warns_about_sampling(fake_vllm, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    result = CliRunner().invoke(start.start_app, ["codex", "--no-launch", *_SESSION_FLAGS])
+    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE, "--no-launch", *_SESSION_FLAGS])
     assert result.exit_code == 0, result.output
     profile = (tmp_path / "agents" / "codex" / f"{codex_agent._CODEX_PROFILE}.config.toml").read_text()
     assert 'model_reasoning_effort = "none"' in profile
     assert "can't send --temperature, --top-k itself" in result.output
     assert "--reasoning" not in result.output
-    result = CliRunner().invoke(start.start_app, ["codex", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     profile = (tmp_path / "agents" / "codex" / f"{codex_agent._CODEX_PROFILE}.config.toml").read_text()
     assert "model_reasoning_effort" not in profile
@@ -609,7 +610,7 @@ def test_codex_carries_reasoning_and_warns_about_sampling(fake_vllm, tmp_path, m
 
 def test_codex_warns_about_reasoning_it_cannot_express(fake_vllm, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    result = CliRunner().invoke(start.start_app, ["codex", "--no-launch", "--reasoning", "on"])
+    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE, "--no-launch", "--reasoning", "on"])
     assert result.exit_code == 0, result.output
     assert "can't send --reasoning itself" in result.output
     profile = (tmp_path / "agents" / "codex" / f"{codex_agent._CODEX_PROFILE}.config.toml").read_text()
@@ -625,7 +626,7 @@ def test_agent_too_old_to_send_the_flags_warns_and_ignores(
     set_start_attr(monkeypatch, "_which_with_install_dirs", lambda name: f"/bin/{name}")
     set_start_attr(monkeypatch, "_codex_executable_version", lambda executable: version)
     set_start_attr(monkeypatch, "_launch", lambda *args, **kwargs: None)
-    result = CliRunner().invoke(start.start_app, [agent, mode, *_SESSION_FLAGS])
+    result = CliRunner().invoke(start.start_app, [agent, "--url", BASE, mode, *_SESSION_FLAGS])
     assert result.exit_code == 0, result.output
     assert "can't send --temperature, --top-k, --reasoning itself" in result.output
     if agent == "pi":
@@ -704,7 +705,7 @@ def test_persist_bare_codex_launch_has_no_resume_token(fake_vllm, monkeypatch):
     # resume token, or the very first launch (no session yet) would send codex down its
     # no-session error path. The user resumes explicitly: `agent-switch codex --persist resume`.
     monkeypatch.setattr(shutil, "which", lambda name, path = None: "/usr/local/bin/codex")
-    captured = _capture_launch(monkeypatch, ["codex", "--persist"])
+    captured = _capture_launch(monkeypatch, ["codex", "--url", BASE, "--persist"])
     assert "resume" not in captured["command"]
     # command[0] is the resolved executable path; assert the argv after it.
     assert captured["command"][1:] == ["--oss", "--profile", codex_agent._CODEX_PROFILE]
@@ -714,14 +715,14 @@ def test_resume_with_passthrough_does_not_auto_append(fake_vllm, monkeypatch):
     # When the caller drives their own subcommand, --persist only persists the dir; it
     # must not inject a resume token that would collide with the user's command.
     monkeypatch.setattr(shutil, "which", lambda name, path = None: "/usr/local/bin/codex")
-    captured = _capture_launch(monkeypatch, ["codex", "--persist", "exec", "hello"])
+    captured = _capture_launch(monkeypatch, ["codex", "--url", BASE, "--persist", "exec", "hello"])
     assert "resume" not in captured["command"]
     assert captured["command"][-2:] == ["exec", "hello"]
 
 
 def test_default_launch_has_no_resume_token(fake_vllm, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda name, path = None: "/usr/local/bin/codex")
-    captured = _capture_launch(monkeypatch, ["codex"])
+    captured = _capture_launch(monkeypatch, ["codex", "--url", BASE])
     assert "resume" not in captured["command"]
 
 
@@ -732,7 +733,7 @@ def test_connect_codex_mcp_writes_mcp_server_tables(fake_vllm, tmp_path, monkeyp
     monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
     _mcp_registry()
     result = CliRunner().invoke(
-        start.start_app, ["codex", "--no-launch", "--mcp", "context7", "--mcp", "github"]
+        start.start_app, ["codex", "--url", BASE, "--no-launch", "--mcp", "context7", "--mcp", "github"]
     )
     assert result.exit_code == 0, result.output
     config = _parse_toml((tmp_path / "agents" / "codex" / "config.toml").read_text())
@@ -751,7 +752,7 @@ def test_connect_codex_mcp_writes_mcp_server_tables(fake_vllm, tmp_path, monkeyp
 def test_connect_codex_mcp_all_mounts_every_registry_server(fake_vllm, tmp_path, monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
     _mcp_registry()
-    result = CliRunner().invoke(start.start_app, ["codex", "--no-launch", "--mcp-all"])
+    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE, "--no-launch", "--mcp-all"])
     assert result.exit_code == 0, result.output
     config = _parse_toml((tmp_path / "agents" / "codex" / "config.toml").read_text())
     assert set(config["mcp_servers"]) == {"context7", "github"}
@@ -759,7 +760,7 @@ def test_connect_codex_mcp_all_mounts_every_registry_server(fake_vllm, tmp_path,
 
 def test_connect_codex_mcp_url_mounts_without_a_registry(fake_vllm, tmp_path):
     result = CliRunner().invoke(
-        start.start_app, ["codex", "--no-launch", "--mcp-url", "ev=http://127.0.0.1:18331/mcp"]
+        start.start_app, ["codex", "--url", BASE, "--no-launch", "--mcp-url", "ev=http://127.0.0.1:18331/mcp"]
     )
     assert result.exit_code == 0, result.output
     config = _parse_toml((tmp_path / "agents" / "codex" / "config.toml").read_text())
@@ -769,7 +770,7 @@ def test_connect_codex_mcp_url_mounts_without_a_registry(fake_vllm, tmp_path):
 def test_connect_codex_mcp_stdio_mounts_without_a_registry(fake_vllm, tmp_path):
     result = CliRunner().invoke(
         start.start_app,
-        ["codex", "--no-launch", "--mcp-stdio", "ev=npx -y @modelcontextprotocol/server-everything@2026.8.31"],
+        ["codex", "--url", BASE, "--no-launch", "--mcp-stdio", "ev=npx -y @modelcontextprotocol/server-everything@2026.8.31"],
     )
     assert result.exit_code == 0, result.output
     config = _parse_toml((tmp_path / "agents" / "codex" / "config.toml").read_text())
@@ -784,7 +785,7 @@ def test_connect_codex_mcp_stdio_shell_form(fake_vllm, tmp_path, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda name, path = None: "/bin/bash" if name == "bash" else None)
     result = CliRunner().invoke(
         start.start_app,
-        ["codex", "--no-launch", "--mcp-stdio", 'ev="npx -y @modelcontextprotocol/server-everything@2026.8.31"'],
+        ["codex", "--url", BASE, "--no-launch", "--mcp-stdio", 'ev="npx -y @modelcontextprotocol/server-everything@2026.8.31"'],
     )
     assert result.exit_code == 0, result.output
     config = _parse_toml((tmp_path / "agents" / "codex" / "config.toml").read_text())
@@ -795,7 +796,7 @@ def test_connect_codex_mcp_stdio_shell_form(fake_vllm, tmp_path, monkeypatch):
 
 
 def test_connect_codex_without_mcp_flags_has_no_mcp_servers(fake_vllm, tmp_path):
-    result = CliRunner().invoke(start.start_app, ["codex", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     config = _parse_toml((tmp_path / "agents" / "codex" / "config.toml").read_text())
     assert "mcp_servers" not in config
@@ -805,11 +806,11 @@ def test_codex_mcp_state_cleared_on_rerun_without_flags(fake_vllm, tmp_path, mon
     # A --no-launch CODEX_HOME is reused, so the next run must not keep the earlier mount.
     monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
     _mcp_registry()
-    result = CliRunner().invoke(start.start_app, ["codex", "--no-launch", "--mcp", "context7"])
+    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE, "--no-launch", "--mcp", "context7"])
     assert result.exit_code == 0, result.output
     config_path = tmp_path / "agents" / "codex" / "config.toml"
     assert "mcp_servers" in _parse_toml(config_path.read_text())
-    result = CliRunner().invoke(start.start_app, ["codex", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     assert "mcp_servers" not in _parse_toml(config_path.read_text())
 
@@ -819,7 +820,93 @@ def test_codex_mcp_with_as_subagent_fails(fake_vllm):
     # there would modify the user's own config.
     _mcp_registry()
     result = CliRunner().invoke(
-        start.start_app, ["codex", "--as-subagent", "--no-launch", "--mcp", "context7"]
+        start.start_app, ["codex", "--url", BASE, "--as-subagent", "--no-launch", "--mcp", "context7"]
     )
     assert result.exit_code == 1
     assert "--mcp/--mcp-all/--mcp-url/--mcp-oauth-url/--mcp-header/--mcp-stdio/--mcp-env cannot be combined with --as-subagent" in result.output
+
+
+# ── Native launch (no --url/--provider) ──────────────────────────────
+
+
+def _native_no_connect(monkeypatch):
+    set_start_attr(monkeypatch, "_connect",
+        lambda *args, **kwargs: pytest.fail("native launch must not connect"),
+    )
+
+
+def test_native_codex_bare_adds_nothing(fake_vllm, monkeypatch):
+    _native_no_connect(monkeypatch)
+    result = CliRunner().invoke(start.start_app, ["codex", "--no-launch"])
+    assert result.exit_code == 0, result.output
+    assert _launch_command(result.output) == ["codex"]
+    assert "CODEX_HOME" not in result.output
+
+
+def test_native_codex_stdio_env_rides_a_0700_wrapper(fake_vllm, tmp_path, monkeypatch):
+    _native_no_connect(monkeypatch)
+    result = CliRunner().invoke(
+        start.start_app,
+        [
+            "codex", "--no-launch",
+            "--mcp-stdio", "ev=npx everything",
+            "--mcp-env", "ev:API_KEY=s3cret",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    wrapper = tmp_path / "agents" / "codex-native" / "mcp-ev.sh"
+    assert stat.S_IMODE(wrapper.stat().st_mode) == 0o700
+    assert wrapper.read_text() == "#!/bin/sh\nexport API_KEY=s3cret\nexec npx everything\n"
+    command = _launch_command(result.output)
+    assert command == ["codex", "-c", f'mcp_servers.ev={{command = "{wrapper}"}}']
+    assert "s3cret" not in " ".join(command)
+
+
+def test_native_codex_stdio_without_env_stays_inline(fake_vllm, monkeypatch):
+    _native_no_connect(monkeypatch)
+    result = CliRunner().invoke(
+        start.start_app, ["codex", "--no-launch", "--mcp-stdio", "ev=npx everything"]
+    )
+    assert result.exit_code == 0, result.output
+    assert _launch_command(result.output) == [
+        "codex", "-c", 'mcp_servers.ev={command = "npx", args = ["everything"]}'
+    ]
+
+
+def test_native_codex_http_headers_ride_process_env(fake_vllm, monkeypatch):
+    _native_no_connect(monkeypatch)
+    result = CliRunner().invoke(
+        start.start_app,
+        [
+            "codex", "--no-launch",
+            "--mcp-url", "api=http://127.0.0.1:9/mcp",
+            "--mcp-header", "api:X-Api-Key=tok123",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    command = _launch_command(result.output)
+    assert command == [
+        "codex", "-c",
+        'mcp_servers.api={url = "http://127.0.0.1:9/mcp", '
+        'env_http_headers = { "X-Api-Key" = "AGENT_SWITCH_MCP_HDR_1" }}',
+    ]
+    _assert_env_set(result.output, "AGENT_SWITCH_MCP_HDR_1", "tok123")
+    assert "tok123" not in " ".join(command)
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        ["--model", "org/model"],
+        ["--reasoning-effort", "high"],
+        ["--compact-at", "0.8"],
+        ["--api-key", "sk-x"],
+        ["--as-subagent"],
+        ["--persist"],
+    ],
+)
+def test_native_codex_refuses_local_only_flags(fake_vllm, monkeypatch, flag):
+    _native_no_connect(monkeypatch)
+    result = CliRunner().invoke(start.start_app, ["codex", "--no-launch", *flag])
+    assert result.exit_code == 1
+    assert "needs --url or --provider" in result.output

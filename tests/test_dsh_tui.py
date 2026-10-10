@@ -19,6 +19,7 @@ from typer.testing import CliRunner
 
 import agent_switch.start as start
 from tests.cli_support import (
+    BASE,
     KEY,
     MODEL,
     _assert_env_set,
@@ -76,7 +77,7 @@ def _tui_row(text: str) -> dict:
 
 @pytest.mark.parametrize("agent", ["dsh-tui", "dst"])
 def test_aliases_share_one_isolated_home(agent, fake_vllm, tmp_path):
-    result = _invoke(agent, "--no-launch")
+    result = _invoke(agent, "--url", BASE, "--no-launch")
     assert result.exit_code == 0, result.output
     home = _home(tmp_path)
     _assert_env_set(result.output, "HOME", str(home))
@@ -93,7 +94,7 @@ def test_aliases_share_one_isolated_home(agent, fake_vllm, tmp_path):
 
 
 def test_patch_pins_route_model_and_backend_in_the_tui_row(fake_vllm, tmp_path):
-    result = _invoke("dsh-tui", "--no-launch", "--header", "X-Test=1", "--reasoning-effort", "low")
+    result = _invoke("dsh-tui", "--url", BASE, "--no-launch", "--header", "X-Test=1", "--reasoning-effort", "low")
     assert result.exit_code == 0, result.output
     text = (_home(tmp_path) / dsh_agent._DSH_PATCH_FILE).read_text()
     ids = [dict((k.value, v) for k, v in row.value)["id"].value for row in yaml.compose(text).value]
@@ -118,7 +119,7 @@ def test_patch_pins_route_model_and_backend_in_the_tui_row(fake_vllm, tmp_path):
 
 
 def test_env_pins_backend_and_clears_launcher_handoff(fake_vllm):
-    result = _invoke("dsh-tui", "--no-launch")
+    result = _invoke("dsh-tui", "--url", BASE, "--no-launch")
     assert result.exit_code == 0, result.output
     command = _launch_command(result.output)
     for name in _HANDOFF_ENV:
@@ -134,7 +135,7 @@ def test_env_pins_backend_and_clears_launcher_handoff(fake_vllm):
 def test_pnpm_store_and_cache_stay_in_the_session_home(fake_vllm, tmp_path, monkeypatch):
     monkeypatch.setenv("PNPM_HOME", "/real/pnpm")
     monkeypatch.setenv("pnpm_config_store_dir", "/real/store")
-    result = _invoke("dsh-tui", "--no-launch")
+    result = _invoke("dsh-tui", "--url", BASE, "--no-launch")
     assert result.exit_code == 0, result.output
     home = _home(tmp_path)
     pnpm_home = home / ".local" / "share" / "pnpm"
@@ -146,11 +147,11 @@ def test_pnpm_store_and_cache_stay_in_the_session_home(fake_vllm, tmp_path, monk
 
 def test_first_run_gates_are_seeded_once_in_the_session_home(fake_vllm, tmp_path):
     state = _home(tmp_path) / ".dsh-tui"
-    assert _invoke("dsh-tui", "--no-launch").exit_code == 0
+    assert _invoke("dsh-tui", "--url", BASE, "--no-launch").exit_code == 0
     assert json.loads((state / "onboarding.json").read_text()) == {"completed": True, "version": 1}
     assert json.loads((state / "home.json").read_text()) == {"seen": True}
     (state / "home.json").write_text('{"seen": true, "kept": 1}')
-    assert _invoke("dst", "--no-launch").exit_code == 0
+    assert _invoke("dst", "--url", BASE, "--no-launch").exit_code == 0
     assert json.loads((state / "home.json").read_text()) == {"seen": True, "kept": 1}
 
 
@@ -176,7 +177,7 @@ def test_first_run_gates_are_seeded_once_in_the_session_home(fake_vllm, tmp_path
     ],
 )
 def test_rejected_before_any_server_traffic(args, message, fake_vllm):
-    result = _invoke("dsh-tui", "--no-launch", *args)
+    result = _invoke("dsh-tui", "--url", BASE, "--no-launch", *args)
     assert result.exit_code == 1, result.output
     assert message in result.output
     assert fake_vllm == []
@@ -194,7 +195,7 @@ def test_rejected_before_any_server_traffic(args, message, fake_vllm):
     ],
 )
 def test_session_arguments_follow_our_patch_unchanged(args, fake_vllm, tmp_path):
-    result = _invoke("dsh-tui", "--no-launch", *args)
+    result = _invoke("dsh-tui", "--url", BASE, "--no-launch", *args)
     assert result.exit_code == 0, result.output
     patch = str(_home(tmp_path) / dsh_agent._DSH_PATCH_FILE)
     assert _tui_command(result.output) == ["dsh-tui", "--patch", patch, *args]
@@ -202,7 +203,7 @@ def test_session_arguments_follow_our_patch_unchanged(args, fake_vllm, tmp_path)
 
 
 def test_caller_patch_follows_ours_and_warns_once(fake_vllm, tmp_path):
-    result = _invoke("dsh-tui", "--no-launch", "--patch", "mine.yml", "--patch=two.yml")
+    result = _invoke("dsh-tui", "--url", BASE, "--no-launch", "--patch", "mine.yml", "--patch=two.yml")
     assert result.exit_code == 0, result.output
     patch = str(_home(tmp_path) / dsh_agent._DSH_PATCH_FILE)
     assert _tui_command(result.output) == [
@@ -213,11 +214,11 @@ def test_caller_patch_follows_ours_and_warns_once(fake_vllm, tmp_path):
 
 def test_native_windows_requires_yolo(fake_vllm, monkeypatch, tmp_path):
     _simulate_windows(monkeypatch)
-    refused = _invoke("dsh-tui", "--no-launch")
+    refused = _invoke("dsh-tui", "--url", BASE, "--no-launch")
     assert refused.exit_code == 1, refused.output
     assert "--yolo" in refused.output
     assert fake_vllm == []
-    accepted = _invoke("dsh-tui", "--no-launch", "--yolo")
+    accepted = _invoke("dsh-tui", "--url", BASE, "--no-launch", "--yolo")
     assert accepted.exit_code == 0, accepted.output
     home = _home(tmp_path)
     assert f'$env:USERPROFILE = "{home}"' in accepted.output
@@ -233,7 +234,7 @@ def test_wsl_windows_tui_is_refused(args, fake_vllm, monkeypatch):
     monkeypatch.setattr(
         shutil, "which", lambda name, path = None: shim if name == "dsh-tui" else None
     )
-    result = _invoke("dsh-tui", "--no-launch", *args)
+    result = _invoke("dsh-tui", "--url", BASE, "--no-launch", *args)
     assert result.exit_code == 1, result.output
     assert "WSL" in result.output
     assert fake_vllm == []
@@ -243,7 +244,7 @@ def test_launch_without_a_terminal_is_refused_before_server_traffic(fake_vllm, m
     monkeypatch.setattr(
         subprocess, "run", lambda *args, **kwargs: pytest.fail("must not launch")
     )
-    result = _invoke("dsh-tui")
+    result = _invoke("dsh-tui", "--url", BASE)
     assert result.exit_code == 1, result.output
     assert "terminal" in result.output
     assert fake_vllm == []
@@ -300,7 +301,7 @@ def test_launch_uses_the_real_tui_past_a_foreign_shadow(
     monkeypatch.setenv("DSH_PERMISSION_MODE", "danger-full-access")
     monkeypatch.setenv("DSH_TUI_BACKEND_HANDOFF", "claude")
     monkeypatch.setenv("DSH_TUI_WORKSPACE_TARGET", "/elsewhere")
-    result, captured = _launch(monkeypatch, [agent, "--no-persist"], returncode)
+    result, captured = _launch(monkeypatch, [agent, "--url", BASE, "--no-persist"], returncode)
     assert result.exit_code == returncode, result.output
     command, env = captured["command"], captured["env"]
     assert command[:2] == [str(dst), "--patch"]
@@ -323,7 +324,7 @@ def test_launch_keeps_the_session_home_by_default(agent, fake_vllm, short_root, 
     _stub(real, "dst", _TUI_MARKER)
     _stub(real, "dsh", _HARNESS_MARKER)
     _launchable(monkeypatch, tmp_path, real)
-    result, captured = _launch(monkeypatch, [agent])
+    result, captured = _launch(monkeypatch, [agent, "--url", BASE])
     assert result.exit_code == 0, result.output
     home = short_root / "agents" / "dsh-tui"
     assert captured["env"]["HOME"] == str(home)
@@ -334,7 +335,7 @@ def test_launch_keeps_the_session_home_by_default(agent, fake_vllm, short_root, 
     (home / ".dsh" / "settings.yaml").write_text("theme: dark\n")
     (home / ".dsh-tui").mkdir(parents = True, exist_ok = True)
     (home / ".dsh-tui" / "theme.json").write_text('{"theme": "dark"}\n')
-    result, captured = _launch(monkeypatch, [agent])
+    result, captured = _launch(monkeypatch, [agent, "--url", BASE])
     assert result.exit_code == 0, result.output
     assert captured["env"]["HOME"] == str(home)
     assert (home / ".dsh" / "settings.yaml").read_text() == "theme: dark\n"
@@ -347,7 +348,7 @@ def test_no_persist_launch_uses_a_throwaway_home(fake_vllm, short_root, monkeypa
     _stub(real, "dsh-tui", _TUI_MARKER)
     _stub(real, "dsh", _HARNESS_MARKER)
     _launchable(monkeypatch, tmp_path, real)
-    result, captured = _launch(monkeypatch, ["dsh-tui", "--no-persist"])
+    result, captured = _launch(monkeypatch, ["dsh-tui", "--url", BASE, "--no-persist"])
     assert result.exit_code == 0, result.output
     home = Path(captured["env"]["HOME"])
     assert home.parent == short_root / "agents" / ".tmp"
@@ -362,7 +363,7 @@ def test_persist_launch_still_keeps_the_home(fake_vllm, short_root, monkeypatch,
     _stub(real, "dsh-tui", _TUI_MARKER)
     _stub(real, "dsh", _HARNESS_MARKER)
     _launchable(monkeypatch, tmp_path, real)
-    result, captured = _launch(monkeypatch, ["dsh-tui", "--persist"])
+    result, captured = _launch(monkeypatch, ["dsh-tui", "--url", BASE, "--persist"])
     assert result.exit_code == 0, result.output
     home = short_root / "agents" / "dsh-tui"
     assert captured["env"]["HOME"] == str(home)
@@ -376,7 +377,7 @@ def test_foreign_tui_alone_is_refused(fake_vllm, short_root, monkeypatch, tmp_pa
     _stub(shadow, "dsh", _HARNESS_MARKER)
     _launchable(monkeypatch, tmp_path, shadow)
     set_start_attr(monkeypatch, "_install_agent", lambda *args: None)
-    result, captured = _launch(monkeypatch, ["dsh-tui"])
+    result, captured = _launch(monkeypatch, ["dsh-tui", "--url", BASE])
     assert result.exit_code == 1, result.output
     assert "is not the DeepSeek Harness TUI" in result.output
     assert captured == {}
@@ -391,7 +392,7 @@ def test_nested_dsh_shadow_is_bypassed_through_the_child_path(fake_vllm, monkeyp
     harness = _stub(real, "dsh", _HARNESS_MARKER)
     _launchable(monkeypatch, tmp_path, shadow, real)
     original_path = os.environ["PATH"]
-    result, captured = _launch(monkeypatch, ["dsh-tui", "--persist", "--resume", "abc"])
+    result, captured = _launch(monkeypatch, ["dsh-tui", "--url", BASE, "--persist", "--resume", "abc"])
     assert result.exit_code == 0, result.output
     env = captured["env"]
     home = _home(tmp_path)
@@ -410,7 +411,7 @@ def test_path_is_left_alone_when_the_first_dsh_is_the_harness(
     _stub(real, "dsh-tui", _TUI_MARKER)
     _stub(real, "dsh", _HARNESS_MARKER)
     _launchable(monkeypatch, tmp_path, real)
-    result, captured = _launch(monkeypatch, ["dsh-tui"])
+    result, captured = _launch(monkeypatch, ["dsh-tui", "--url", BASE])
     assert result.exit_code == 0, result.output
     assert captured["env"]["PATH"] == os.environ["PATH"]
 
@@ -434,7 +435,7 @@ def test_wsl_windows_dsh_under_a_linux_tui_is_refused(fake_vllm, short_root, mon
     monkeypatch.setenv("PATH", "/usr/local/bin:/mnt/c/npm")
     set_start_attr(monkeypatch, "get_is_deepseek_harness_tui_executable", lambda *_: True)
     set_start_attr(monkeypatch, "is_deepseek_harness_executable", lambda *_: True)
-    result, captured = _launch(monkeypatch, ["dsh-tui"])
+    result, captured = _launch(monkeypatch, ["dsh-tui", "--url", BASE])
     assert result.exit_code == 1, result.output
     assert "inside WSL" in result.output
     assert captured == {}
@@ -442,7 +443,7 @@ def test_wsl_windows_dsh_under_a_linux_tui_is_refused(fake_vllm, short_root, mon
 
 
 def test_dsh_keeps_its_own_home_and_no_tui_env(fake_vllm, tmp_path):
-    result = _invoke("dsh", "--no-launch")
+    result = _invoke("dsh", "--url", BASE, "--no-launch")
     assert result.exit_code == 0, result.output
     assert "export HOME=" not in result.output
     assert "DSH_TUI" not in result.output
@@ -462,7 +463,7 @@ def test_user_resources_are_linked_and_agents_skills_stays_out(fake_vllm, tmp_pa
     (source / "skills" / "my-skill").mkdir(parents = True)
     (source / "AGENTS.md").write_text("user instructions\n")
 
-    result = _invoke("dsh-tui", "--no-launch")
+    result = _invoke("dsh-tui", "--url", BASE, "--no-launch")
 
     assert result.exit_code == 0, result.output
     home = _home(tmp_path)
@@ -489,11 +490,11 @@ def _padded_root(tmp_path, char: str, home_bytes: int) -> Path:
 def test_deep_session_home_is_refused_before_server_traffic(fake_vllm, monkeypatch, tmp_path):
     deep = tmp_path / ("d" * 80) / "agents"
     set_start_attr(monkeypatch, "_agents_config_root", lambda: deep)
-    recipe = _invoke("dsh-tui", "--no-launch")
+    recipe = _invoke("dsh-tui", "--url", BASE, "--no-launch")
     assert recipe.exit_code == 1, recipe.output
     assert "AGENT_SWITCH_HOME" in recipe.output
     set_start_attr(monkeypatch, "_get_has_terminal", lambda: True)
-    launch = _invoke("dst")
+    launch = _invoke("dst", "--url", BASE)
     assert launch.exit_code == 1, launch.output
     assert "AGENT_SWITCH_HOME" in launch.output
     assert fake_vllm == []
@@ -507,7 +508,7 @@ def test_socket_bound_counts_bytes_not_characters(fake_vllm, monkeypatch, tmp_pa
     root = _padded_root(tmp_path, "é", 90)
     assert len(str(root / "dsh-tui")) < 89 < len(os.fsencode(str(root / "dsh-tui")))
     set_start_attr(monkeypatch, "_agents_config_root", lambda: root)
-    result = _invoke("dsh-tui", "--no-launch")
+    result = _invoke("dsh-tui", "--url", BASE, "--no-launch")
     assert result.exit_code == 1, result.output
     assert "AGENT_SWITCH_HOME" in result.output
 
@@ -518,14 +519,14 @@ def test_socket_bound_follows_the_platform(platform, accepted, fake_vllm, monkey
     monkeypatch.setattr(sys, "platform", platform)
     root = _padded_root(tmp_path, "h", 87)
     set_start_attr(monkeypatch, "_agents_config_root", lambda: root)
-    result = _invoke("dsh-tui", "--no-launch")
+    result = _invoke("dsh-tui", "--url", BASE, "--no-launch")
     assert (result.exit_code == 0) is accepted, result.output
 
 
 def test_windows_named_pipe_needs_no_home_bound(fake_vllm, monkeypatch, tmp_path):
     _simulate_windows(monkeypatch)
     set_start_attr(monkeypatch, "_agents_config_root", lambda: tmp_path / ("d" * 80) / "agents")
-    result = _invoke("dsh-tui", "--no-launch", "--yolo")
+    result = _invoke("dsh-tui", "--url", BASE, "--no-launch", "--yolo")
     assert result.exit_code == 0, result.output
 
 
@@ -553,7 +554,7 @@ def test_linux_child_env_drops_upper_and_mixed_case_cache_selectors(
     monkeypatch.setenv("PNPM_CONFIG_STORE_DIR", "/real/store")
     monkeypatch.setenv("Pnpm_Config_Cache_Dir", "/real/cache")
     monkeypatch.setenv("NPM_CONFIG_STORE_DIR", "/real/npm-store")
-    result, captured = _launch(monkeypatch, ["dsh-tui", "--persist"])
+    result, captured = _launch(monkeypatch, ["dsh-tui", "--url", BASE, "--persist"])
     assert result.exit_code == 0, result.output
     env = captured["env"]
     # Compare names only: a failing repr of the child env would print the caller's secrets.
@@ -574,7 +575,7 @@ def test_windows_child_env_keeps_the_cache_pins_after_node_normalization(
     for name in ("PNPM_CONFIG_STORE_DIR", "PNPM_CONFIG_CACHE_DIR", "NPM_CONFIG_STORE_DIR"):
         monkeypatch.setenv(name, "C:/real")
     _simulate_windows(monkeypatch)
-    result, captured = _launch(monkeypatch, ["dsh-tui", "--persist", "--yolo"])
+    result, captured = _launch(monkeypatch, ["dsh-tui", "--url", BASE, "--persist", "--yolo"])
     assert result.exit_code == 0, result.output
     seen = _node_windows_env(captured["env"])
     home = short_root / "agents" / "dsh-tui"
@@ -591,7 +592,7 @@ def test_posix_recipe_removes_handoff_vars_instead_of_emptying_them(
     fake_vllm, monkeypatch, tmp_path
 ):
     monkeypatch.setenv("PNPM_CONFIG_STORE_DIR", "/real/store")
-    result = _invoke("dsh-tui", "--no-launch", "--resume", "abc")
+    result = _invoke("dsh-tui", "--url", BASE, "--no-launch", "--resume", "abc")
     assert result.exit_code == 0, result.output
     stub = _stub(tmp_path / "bin", "dsh-tui")
     stub.write_text('#!/bin/sh\nenv\necho "--argv--"\nprintf "%s\\n" "$@"\n')
@@ -618,7 +619,7 @@ def test_recipe_clears_uppercase_cache_selectors_a_later_shell_sets(fake_vllm, m
     # set them after generation, so the last line clears them even when absent while generating.
     for name in ("PNPM_CONFIG_STORE_DIR", "PNPM_CONFIG_CACHE_DIR", "NPM_CONFIG_STORE_DIR", "NPM_CONFIG_CACHE_DIR"):
         monkeypatch.delenv(name, raising = False)
-    result = _invoke("dsh-tui", "--no-launch")
+    result = _invoke("dsh-tui", "--url", BASE, "--no-launch")
     assert result.exit_code == 0, result.output
     stub = _stub(tmp_path / "bin", "dsh-tui")
     stub.write_text("#!/bin/sh\nenv\n")
@@ -650,7 +651,7 @@ def test_recipe_clears_uppercase_cache_selectors_a_later_shell_sets(fake_vllm, m
 
 def test_windows_recipe_removes_handoff_vars(fake_vllm, monkeypatch):
     _simulate_windows(monkeypatch)
-    result = _invoke("dsh-tui", "--no-launch", "--yolo")
+    result = _invoke("dsh-tui", "--url", BASE, "--no-launch", "--yolo")
     assert result.exit_code == 0, result.output
     for name in _HANDOFF_ENV:
         assert f"Remove-Item Env:{name}" in result.output
@@ -669,7 +670,7 @@ def test_windows_recipe_removes_handoff_vars(fake_vllm, monkeypatch):
     ],
 )
 def test_host_option_values_are_raw_tokens(args, fake_vllm):
-    result = _invoke("dst", "--no-launch", *args)
+    result = _invoke("dst", "--url", BASE, "--no-launch", *args)
     assert result.exit_code == 0, result.output
     assert _launch_command(result.output)[-len(args):] == args
     assert result.output.count("replaces whole config blocks") == 1
@@ -685,7 +686,7 @@ def test_host_option_values_are_raw_tokens(args, fake_vllm):
     ],
 )
 def test_prompt_text_is_never_refused(args, fake_vllm):
-    result = _invoke("dsh-tui", "--no-launch", *args)
+    result = _invoke("dsh-tui", "--url", BASE, "--no-launch", *args)
     assert result.exit_code == 0, result.output
     assert _launch_command(result.output)[-len(args):] == args
 
@@ -694,6 +695,38 @@ def test_prompt_text_is_never_refused(args, fake_vllm):
 def test_genuine_disallowed_flags_are_still_refused(args, fake_vllm, tmp_path):
     # An existing path is the launcher's workspace target, so options after it stay launcher options.
     args = [str(tmp_path) if arg == "WORKSPACE" else arg for arg in args]
-    result = _invoke("dsh-tui", "--no-launch", *args)
+    result = _invoke("dsh-tui", "--url", BASE, "--no-launch", *args)
     assert result.exit_code == 1, result.output
     assert fake_vllm == []
+
+# ── Native launch (no --url/--provider) ──────────────────────────────
+
+
+def test_native_dsh_tui_bare_names_the_launcher_without_a_patch(fake_vllm, monkeypatch):
+    set_start_attr(monkeypatch, "_connect",
+        lambda *a, **k: pytest.fail("native launch must not connect"),
+    )
+    result = _invoke("dsh-tui", "--no-launch")
+    assert result.exit_code == 0, result.output
+    assert _launch_command(result.output) == ["dsh-tui"]
+
+
+def test_native_dsh_tui_patch_goes_first(fake_vllm, tmp_path, monkeypatch):
+    set_start_attr(monkeypatch, "_connect",
+        lambda *a, **k: pytest.fail("native launch must not connect"),
+    )
+    result = _invoke("dsh-tui", "--no-launch", "--mcp-stdio", "ev=npx everything")
+    assert result.exit_code == 0, result.output
+    patch = tmp_path / "agents" / "dsh-tui-native" / "agent-switch.patch.yml"
+    assert _launch_command(result.output) == ["dsh-tui", "--patch", str(patch)]
+    yaml = pytest.importorskip("yaml")
+    entries = yaml.safe_load(patch.read_text())
+    assert [list(entry) for entry in entries] == [["insert"]]
+
+
+def test_native_dsh_tui_refuses_local_only_flags(fake_vllm):
+    # --compact-at gets the native message, not the local-mode preset one.
+    result = _invoke("dsh-tui", "--no-launch", "--compact-at", "0.8")
+    assert result.exit_code == 1
+    assert "needs --url or --provider" in result.output
+    assert "agent presets" not in result.output

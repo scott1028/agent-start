@@ -15,8 +15,7 @@ import pytest
 import typer
 
 from agent_switch.providers import utils as provider_utils
-from agent_switch import providers
-from agent_switch.core import launch as core_launch, options as core_options
+from agent_switch.core import options as core_options
 from agent_switch.agents import claude as claude_agent, codex as codex_agent, opencode as opencode_agent, pi as pi_agent
 from tests.start_split import set_start_attr
 
@@ -215,16 +214,6 @@ def test_write_codex_config_headers_are_replaced_on_rerun(tmp_path, monkeypatch)
     provider = tomllib.loads((tmp_path / "config.toml").read_text())["model_providers"]["agent_switch"]
     assert "http_headers" not in provider
     assert provider["env_key"] == "AGENT_SWITCH_AUTH_TOKEN"
-
-
-def test_scanned_target_carries_headers(monkeypatch):
-    from agent_switch.providers.types import Target
-
-    monkeypatch.setattr(
-        providers, "scan_local_servers", lambda: [Target("vllm", "http://127.0.0.1:8000")]
-    )
-    target = core_launch._resolve_target(None, None, None, {"X-Foo": "bar"})
-    assert target.headers == {"X-Foo": "bar"}
 
 
 def test_claude_subagent_child_gets_custom_headers(monkeypatch, tmp_path):

@@ -1,9 +1,11 @@
 # agent-switch
 
-Launch Claude Code, Codex, OpenCode, Pi or DeepSeek Harness (dsh, or its TUI dsh-tui) against a
-local model server: Ollama, LM Studio, llama-server, vLLM or any OpenAI-compatible server. The agent
-gets a throwaway, session-only configuration; your own `~/.claude`, `~/.codex`, `~/.dsh`,
-`~/.dsh-tui`, OpenCode and Pi settings are not modified.
+Launch Claude Code, Codex, OpenCode, Pi or DeepSeek Harness (dsh, or its TUI dsh-tui): with
+`--url`/`--provider` the agent runs against that local model server (Ollama, LM Studio,
+llama-server, vLLM or any OpenAI-compatible server) with a throwaway, session-only configuration;
+without them it runs natively, on its own model, login and config, and only the shared flags (MCP
+mounting, `--yolo`) are added. Either way your own `~/.claude`, `~/.codex`, `~/.dsh`, `~/.dsh-tui`,
+OpenCode and Pi settings are not modified.
 
 ## Tested Strata version
 
@@ -43,12 +45,13 @@ agent-switch claude --url http://127.0.0.1:8080
 agent-switch codex --url http://127.0.0.1:8080
 ```
 
-`--url` can be left out while Strata is the only server answering on a usual local port.
+Leaving out `--url` and `--provider` launches the agent natively (see [Native launch](#native-launch));
+the `--url` above is what points it at Strata.
 
 ## Use
 
 ```sh
-agent-switch claude                                  # the one server found on a usual local port
+agent-switch claude                                  # native: Claude's own model and login (see Native launch)
 agent-switch codex --url http://127.0.0.1:11434      # Ollama; provider detected from the URL
 agent-switch opencode --provider lmstudio -m qwen/qwen3-8b --context-length 32768
 agent-switch pi --url http://127.0.0.1:8000/v1 --no-launch   # print the env and command instead
@@ -58,10 +61,9 @@ agent-switch dsh --profile headless "fix the failing test"   # one task, print t
 agent-switch dsh-tui --url http://127.0.0.1:8080     # DeepSeek Harness TUI (alias: dst)
 ```
 
-Without `--url` or `--provider`, agent-switch checks the usual local ports (Ollama 11434, LM Studio
-1234, llama-server 8080, vLLM 8000) and uses the one server it finds; when it finds none or several
-it stops and asks for `--url` (or `--provider`). `--provider` without `--url` uses that server's
-usual port; `--provider openai` always needs `--url`.
+Without `--url` or `--provider`, agent-switch launches the agent natively: it keeps its own model,
+login and config, and agent-switch only adds the shared flags (see [Native launch](#native-launch)).
+`--provider` without `--url` uses that server's usual port; `--provider openai` always needs `--url`.
 
 `--api-key` (or `AGENT_SWITCH_API_KEY`) is sent as `Bearer <api-key>` and remembered per server in
 `~/.agent-switch/api_keys.json`, so later runs against that server can leave it out.
@@ -121,8 +123,7 @@ last line clears the TUI's inherited handoff variables with `env -u` on Linux an
 model server, e.g. for a gateway that needs its own auth:
 `agent-switch codex --url https://gateway.example/v1 --header "Authorization=...gateway token..."`.
 An `Authorization` header there replaces the built-in `Bearer <api-key>`.
-A server that only answers when they are present must be named with `--url` (or `--provider`):
-they are never sent while agent-switch probes the usual local ports for an unnamed server.
+They go only to the server named with `--url` (or `--provider`).
 
 Arguments agent-switch does not know are passed to the agent unchanged, e.g.
 `agent-switch claude -p "..."` or `agent-switch codex exec "..."`.
@@ -141,6 +142,65 @@ leaving it unset keeps each agent's own behavior. Claude Code applies the fracti
 effective window (the window minus its output reserve), so there it can only pull the built-in
 trigger earlier, never later. DeepSeek Harness applies it only to its headless profile
 (`--profile headless`): its web profile ignores it, and agent-switch warns before starting it.
+
+## Native launch
+
+Without `--url` or `--provider`, agent-switch launches the agent natively: the agent keeps its own
+model, login and config, and agent-switch writes nothing into the agent's own config. Only the
+shared flags apply: the MCP flags and `--yolo`. Flags that only make sense with a local model
+server (`--model` and a positional model, `--context-length`, `--max-tokens`, `--reasoning`,
+`--reasoning-effort`, `--temperature`, `--top-p`, `--top-k`, `--min-p`, `--repetition-penalty`,
+`--presence-penalty`, `--compact-at`, `--api-key`, `--header`, `--no-model-load`, `--as-subagent`,
+`--persist`/`--no-persist`) fail with "needs --url or --provider"; other arguments still go to the
+agent unchanged.
+
+```sh
+agent-switch claude
+agent-switch opencode --mcp-stdio 'blender="uv run --directory ~/workspace/blender-mcp blender-mcp"' --mcp-env 'blender:BLENDER_MCP_PORT=9876'
+```
+
+There MCP is ADDITIVE: the agent keeps its own MCP servers and the mounted ones are added. Each
+agent receives them through its own mechanism, and agent-switch writes only into its own session
+dir:
+
+| Agent | How the mounted MCP servers arrive |
+|---|---|
+| Claude Code | `--mcp-config=<session>/mcp.json` (the `=` form, no `--strict-mcp-config`) |
+| Codex | `-c mcp_servers.<name>=<inline table>` per server; a stdio `env` rides a private 0700 wrapper script, an http header value a uniquely named `AGENT_SWITCH_MCP_HDR_<n>` process env var, so no secret reaches argv |
+| OpenCode | `OPENCODE_CONFIG=<session>/opencode.json` holding only `$schema` and `mcp` |
+| Pi | `--mcp-config <session>/mcp.json` |
+| dsh, dsh-tui, dst | `--patch <session>/agent-switch.patch.yml` with only the MCP `insert` row; without MCP flags, no patch at all |
+
+Native launch always uses an ephemeral session dir; `--no-launch` uses a stable
+`~/.agent-switch/agents/<agent>-native` dir and prints the env and command instead of starting
+the agent.
+
+## Agent aliases
+
+`agent-switch <agent>-<x>` runs your own shell function, alias or script named `<agent>-<x>` as
+that agent, with the shared flags: the MCP flags, `--yolo`, and `--url`/`--provider` where they
+work. Resolution order: the exact subcommands (`claude`, `codex`, `opencode`, `pi`, `dsh`,
+`dsh-tui`, `dst`) always win; otherwise `dsh-tui-<x>` is dsh-tui, `dsh-<x>` is dsh, and
+`claude-<x>`, `codex-<x>`, `opencode-<x>`, `pi-<x>` are that agent. Anything else stays
+"No such command".
+
+```sh
+agent-switch claude-personal
+agent-switch codex-personal --mcp-stdio 'blender="uv run --directory ~/workspace/blender-mcp blender-mcp"'
+```
+
+The alias replaces only argv[0] of the agent command: agent-switch starts it as
+`bash -ic '<name> "$@"' agent-switch <agent args>`, so the function must forward `"$@"` to the
+agent, and the env agent-switch builds still reaches it. The name must match `[A-Za-z0-9._-]+`,
+`bash` must be on PATH (aliases are not supported on Windows), and the name must exist in
+`bash -ic`'s shell as a function, alias or file. An alias whose definition mentions
+`agent-switch` is refused: it would recurse.
+
+Native mode (no `--url`/`--provider`) works for every alias kind. Local model mode works only
+for `claude-*` and `opencode-*`, whose session settings travel as env vars and flags that a
+forwarding function keeps; `codex-*` (the function sets its own CODEX_HOME), `pi-*`
+(PI_CODING_AGENT_DIR) and `dsh-*`/`dsh-tui-*` (DSH_HOME/HOME) are refused with
+`--url`/`--provider`. `--as-subagent` is refused for aliases.
 
 ## MCP servers
 
@@ -202,7 +262,8 @@ agent-switch claude --mcp-stdio 'blender="uv run --directory ~/workspace/blender
 agent-switch codex  --mcp-stdio 'ctx7=npx -y @upstash/context7-mcp' --mcp-env 'ctx7:API_KEY=${CTX7_KEY}'
 ```
 
-The mounted servers replace the agent's own MCP servers for the session: Claude Code gets
+With `--url`/`--provider` the mounted servers replace the agent's own MCP servers for the session
+(native launch adds to them instead, see [Native launch](#native-launch)): Claude Code gets
 `--strict-mcp-config --mcp-config=<session file>`, and Codex, OpenCode, Pi and dsh take them through
 their isolated session config (OpenCode additionally copies your global config's unmounted servers
 with `enabled: false`). MCP config inside the project you launch from may still load: OpenCode's

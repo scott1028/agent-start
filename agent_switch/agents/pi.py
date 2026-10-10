@@ -15,7 +15,15 @@ from agent_switch.core.install import (
     _npm_install_hint,
     _require_agent_for_launch,
 )
-from agent_switch.core.launch import _connect, _resolve_target, _run
+from agent_switch.core.launch import (
+    _ALIAS_META,
+    _agent_command,
+    _check_alias,
+    _connect,
+    _resolve_target,
+    _run,
+    _run_native,
+)
 from agent_switch.core.mcp import load_mcp_servers
 from agent_switch.core.options import (
     LoadOptions,
@@ -55,6 +63,7 @@ from agent_switch.core.options import (
     _consume_positional_model,
     _fail,
     _get_compaction_reserve,
+    _refuse_local_only,
     _yolo_command_flags,
     parse_headers,
 )
@@ -172,6 +181,27 @@ def write_pi_compaction(agent_dir: Path, model: dict, compact_at: Optional[float
             settings.pop("compaction", None)
     if json.dumps(settings, sort_keys = True) != before:
         _write_private_json(path, settings)
+
+
+def _write_pi_mcp_config(path: Path, servers: dict) -> None:
+    """The mounted MCP servers in pi's mcp.json shape."""
+    _write_private_json(
+        path,
+        {
+            "mcpServers": {
+                name: (
+                    {
+                        "command": server["command"],
+                        "args": server["args"],
+                        "env": server["env"],
+                    }
+                    if server["transport"] == "stdio"
+                    else {"url": server["url"], "headers": server["headers"]}
+                )
+                for name, server in servers.items()
+            }
+        },
+    )
 
 
 def _link_user_dir(source: Path, target: Path) -> bool:
@@ -501,13 +531,72 @@ def pi(
         as_subagent = as_subagent,
     )
     target = _resolve_target(url, provider, api_key, headers)
+    if target is None:
+        _refuse_local_only(
+            model = model,
+            max_seq_length = max_seq_length,
+            max_tokens = max_tokens,
+            reasoning = reasoning,
+            reasoning_effort = reasoning_effort,
+            temperature = temperature,
+            top_p = top_p,
+            top_k = top_k,
+            min_p = min_p,
+            repetition_penalty = repetition_penalty,
+            presence_penalty = presence_penalty,
+            compact_at = compact_at,
+            api_key = api_key,
+            header = header,
+            model_load = model_load,
+            as_subagent = as_subagent,
+            persist = persist,
+        )
+    alias = ctx.meta.get(_ALIAS_META)
+    if alias and as_subagent:
+        _fail("--as-subagent is not supported for agent aliases.")
+    if alias and target is not None:
+        # The function sets its own PI_CODING_AGENT_DIR, which outranks the session env, so the
+        # session models.json with the local provider and key would be silently ignored.
+        _fail(
+            "pi aliases run natively only: the alias sets its own PI_CODING_AGENT_DIR, so --url "
+            "cannot route it; drop --url/--provider or use `agent-switch pi`."
+        )
     install_hint = _npm_install_hint(
         "@earendil-works/pi-coding-agent",
         ignore_scripts = True,
     )
     if as_subagent and not _PI_SUBAGENT_EXTENSION.is_file():
         _fail(f"Missing Pi subagent extension: {_PI_SUBAGENT_EXTENSION}")
-    _require_agent_for_launch("pi", install_hint, launch)
+    if alias:
+        _check_alias(alias)
+    else:
+        _require_agent_for_launch("pi", install_hint, launch)
+    if target is None:
+        # Native launch: pi keeps its own model, login and config (HOME and
+        # PI_CODING_AGENT_DIR untouched); mounted servers only ride --mcp-config, which pi
+        # adds to its own servers rather than replacing.
+        with _session_config("pi-native", launch) as config:
+            mcp_path = config / "mcp.json"
+            mcp_flags = []
+            if mcp_servers:
+                _write_pi_mcp_config(mcp_path, mcp_servers)
+                mcp_flags = ["--mcp-config", str(mcp_path)]
+            else:
+                mcp_path.unlink(missing_ok = True)
+            command = _agent_command(
+                alias,
+                "pi",
+                [*mcp_flags, *_yolo_command_flags("pi", yolo), *ctx.args],
+            )
+            _run_native(
+                alias or "pi",
+                {},
+                command,
+                launch = launch,
+                install_hint = install_hint,
+                clear_screen = True,
+            )
+        return
     server_options = ServerOptions(
         reasoning = reasoning,
         reasoning_effort = reasoning_effort,
@@ -603,23 +692,7 @@ def pi(
         # persisted session keeps no earlier mount.
         mcp_path = pi_agent_dir / "mcp.json"
         if mcp_servers:
-            _write_private_json(
-                mcp_path,
-                {
-                    "mcpServers": {
-                        name: (
-                            {
-                                "command": server["command"],
-                                "args": server["args"],
-                                "env": server["env"],
-                            }
-                            if server["transport"] == "stdio"
-                            else {"url": server["url"], "headers": server["headers"]}
-                        )
-                        for name, server in mcp_servers.items()
-                    }
-                },
-            )
+            _write_pi_mcp_config(mcp_path, mcp_servers)
         else:
             mcp_path.unlink(missing_ok = True)
         env = {"HOME": str(home), "PI_CODING_AGENT_DIR": str(pi_agent_dir)}

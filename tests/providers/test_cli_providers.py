@@ -12,7 +12,6 @@ from typer.testing import CliRunner
 
 import agent_switch.start as start
 from agent_switch import providers
-from agent_switch.providers.types import Target
 import shutil
 from agent_switch.agents import codex as codex_agent, opencode as opencode_agent, pi as pi_agent
 from tests.start_split import set_start_attr
@@ -156,37 +155,14 @@ def test_codex_needs_the_responses_endpoint(cli, fake_server):
     assert "/v1/responses" in result.output
 
 
-def test_no_url_uses_the_only_local_server_found(cli, fake_server, monkeypatch):
-    _ollama(fake_server)
-    monkeypatch.setattr(providers, "scan_local_servers", lambda: [Target("ollama", fake_server.base)])
+def test_no_url_launches_the_agent_natively(cli, monkeypatch):
+    # Without --url/--provider nothing is probed: the agent keeps its own model and login.
+    monkeypatch.setattr(
+        urllib.request.OpenerDirector, "open", lambda *a, **k: pytest.fail("no server may be probed")
+    )
     result = cli("claude", "--no-launch")
     assert result.exit_code == 0, result.output
-    assert _exports(result.output)["ANTHROPIC_BASE_URL"] == fake_server.base
-
-
-def test_no_url_with_several_local_servers_asks_which(cli, monkeypatch):
-    monkeypatch.setattr(
-        providers,
-        "scan_local_servers",
-        lambda: [Target("ollama", "http://127.0.0.1:11434"), Target("vllm", "http://127.0.0.1:8000")],
-    )
-    result = cli("claude", "--no-launch")
-    assert result.exit_code == 1
-    assert "Ollama at http://127.0.0.1:11434" in result.output
-    assert "vLLM at http://127.0.0.1:8000" in result.output
-    assert "--url" in result.output
-
-
-@pytest.mark.parametrize("agent", ["claude", "codex", "opencode", "pi", "dsh"])
-def test_no_url_without_a_local_server_says_how_to_name_one(cli, monkeypatch, agent):
-    # The usual-port scan (empty here) is the only default: no other server is probed.
-    monkeypatch.setattr(
-        urllib.request.OpenerDirector, "open", lambda *a, **k: pytest.fail("no other server may be probed")
-    )
-    result = cli(agent, "--no-launch")
-    assert result.exit_code == 1
-    assert "No model server found" in result.output
-    assert "--url" in result.output
+    assert "runs with its own model, login and config" in result.output
     assert "Unsloth" not in result.output
 
 

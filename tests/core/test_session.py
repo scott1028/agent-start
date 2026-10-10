@@ -17,7 +17,7 @@ import pytest
 from agent_switch.core import (
     session as core_session,
 )
-from tests.cli_support import _RESUME_ENV_VAR, _capture_launch, _simulate_windows
+from tests.cli_support import BASE, _RESUME_ENV_VAR, _capture_launch, _simulate_windows
 from tests.start_split import set_start_attr
 
 
@@ -158,7 +158,7 @@ def test_default_launch_home_is_ephemeral(agent, fake_vllm, tmp_path, monkeypatc
     monkeypatch.setattr(shutil, "which", lambda name, path = None: f"/usr/local/bin/{agent}")
     if agent == "dsh":
         set_start_attr(monkeypatch, "is_deepseek_harness_executable", lambda _: True)
-    captured = _capture_launch(monkeypatch, [agent])
+    captured = _capture_launch(monkeypatch, [agent, "--url", BASE])
     home = captured["env"][_RESUME_ENV_VAR[agent]]
     parent = core_session._ephemeral_session_parent(agent)
     assert core_session._ephemeral_session_prefix(agent, parent) in home

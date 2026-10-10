@@ -35,7 +35,6 @@ from tests.cli_support import (
 from tests.start_split import set_start_attr
 
 
-@pytest.mark.usefixtures("one_local_server")
 def test_missing_pi_subagent_extension_fails_before_install_or_connect(monkeypatch, tmp_path):
     set_start_attr(monkeypatch, "_PI_SUBAGENT_EXTENSION", tmp_path / "missing.ts")
     set_start_attr(monkeypatch, "_require_agent_for_launch",
@@ -47,7 +46,7 @@ def test_missing_pi_subagent_extension_fails_before_install_or_connect(monkeypat
         ),
     )
 
-    result = CliRunner().invoke(start.start_app, ["pi", "--as-subagent"])
+    result = CliRunner().invoke(start.start_app, ["pi", "--provider", "vllm", "--as-subagent"])
 
     assert result.exit_code == 1
     assert "Missing Pi subagent extension" in result.output
@@ -80,7 +79,7 @@ def test_session_flags_ride_in_the_agent_config_on_a_running_server(
     agent, fake_vllm, tmp_path, monkeypatch
 ):
     monkeypatch.chdir(tmp_path)
-    result = CliRunner().invoke(start.start_app, [agent, "--no-launch", *_SESSION_FLAGS])
+    result = CliRunner().invoke(start.start_app, [agent, "--url", BASE, "--no-launch", *_SESSION_FLAGS])
     assert result.exit_code == 0, result.output
     assert "already running" not in result.output
     assert _session_request_body(agent, tmp_path, result.output) == _SESSION_BODY
@@ -89,7 +88,10 @@ def test_session_flags_ride_in_the_agent_config_on_a_running_server(
 @pytest.mark.parametrize("agent", ["pi", "opencode", "claude"])
 def test_session_flags_from_an_earlier_run_do_not_stick(agent, fake_vllm, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    for argv in ([agent, "--no-launch", *_SESSION_FLAGS], [agent, "--no-launch"]):
+    for argv in (
+        [agent, "--url", BASE, "--no-launch", *_SESSION_FLAGS],
+        [agent, "--url", BASE, "--no-launch"],
+    ):
         result = CliRunner().invoke(start.start_app, argv)
         assert result.exit_code == 0, result.output
     assert not _session_request_body(agent, tmp_path, result.output)
@@ -98,7 +100,7 @@ def test_session_flags_from_an_earlier_run_do_not_stick(agent, fake_vllm, tmp_pa
 def test_pi_subagent_carries_the_session_flags(fake_vllm, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     result = CliRunner().invoke(
-        start.start_app, ["pi", "--as-subagent", "--no-launch", *_SESSION_FLAGS]
+        start.start_app, ["pi", "--url", BASE, "--as-subagent", "--no-launch", *_SESSION_FLAGS]
     )
     assert result.exit_code == 0, result.output
     assert "already running" not in result.output
@@ -152,7 +154,7 @@ def test_connect_pi_no_launch(fake_vllm, tmp_path, monkeypatch):
     (user_agent_dir / "extensions").mkdir()
     (user_agent_dir / "extensions" / "mine.ts").write_text("export default () => {};\n")
     (user_agent_dir / "settings.json").write_text(json.dumps({"packages": ["npm:pi-mine"]}))
-    result = CliRunner().invoke(start.start_app, ["pi", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["pi", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     # Pi resolves its config dir from PI_CODING_AGENT_DIR first, so pin it at the session
     # dir (and relocate HOME) to keep the user's real ~/.pi untouched and their own
@@ -534,13 +536,15 @@ def test_pi_local_entry_leaves_degenerate_entries_alone(tmp_path, entry):
 def test_connect_pi_as_subagent_preserves_cloud_parent(fake_vllm, tmp_path, yolo):
     args = [
         "pi",
+        "--url",
+        BASE,
         "--as-subagent",
         "--no-launch",
         "--model",
         MODEL["id"],
     ]
     if yolo:
-        args.insert(2, "--yolo")
+        args.insert(3, "--yolo")
     result = CliRunner().invoke(
         start.start_app,
         args,
@@ -579,7 +583,7 @@ def _pi_generated_model(tmp_path, as_subagent):
 
 @pytest.mark.parametrize("as_subagent", [False, True])
 def test_connect_pi_output_limit(fake_vllm, tmp_path, as_subagent):
-    args = ["pi", "--no-launch", "--max-tokens", "40000"]
+    args = ["pi", "--url", BASE, "--no-launch", "--max-tokens", "40000"]
     if as_subagent:
         args.append("--as-subagent")
     # Each launch regenerates the config, so the second run must honour the flag too.
@@ -594,7 +598,7 @@ def test_connect_pi_output_limit(fake_vllm, tmp_path, as_subagent):
 
 @pytest.mark.parametrize("as_subagent", [False, True])
 def test_connect_pi_output_limit_capped_at_half_window(fake_vllm, tmp_path, as_subagent):
-    args = ["pi", "--no-launch", "--max-tokens", "200000"]
+    args = ["pi", "--url", BASE, "--no-launch", "--max-tokens", "200000"]
     if as_subagent:
         args.append("--as-subagent")
     result = CliRunner().invoke(start.start_app, args)
@@ -605,7 +609,7 @@ def test_connect_pi_output_limit_capped_at_half_window(fake_vllm, tmp_path, as_s
 
 @pytest.mark.parametrize("value", ["0", "-1", "abc"])
 def test_connect_pi_invalid_output_limit(fake_vllm, tmp_path, value):
-    result = CliRunner().invoke(start.start_app, ["pi", "--no-launch", "--max-tokens", value])
+    result = CliRunner().invoke(start.start_app, ["pi", "--url", BASE, "--no-launch", "--max-tokens", value])
     assert result.exit_code != 0
     assert "--max-tokens" in result.output
     assert not list((tmp_path / "agents").rglob("models.json"))
@@ -630,7 +634,7 @@ def test_connect_pi_no_launch_windows_relocates_userprofile(fake_vllm, tmp_path,
     # Avoid pathlib selecting WindowsPath on this POSIX runner.
     monkeypatch.setattr(Path, "home", lambda: user_home)
     _simulate_windows(monkeypatch)
-    result = CliRunner().invoke(start.start_app, ["pi", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["pi", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     home = tmp_path / "agents" / "pi"
     assert f'$env:HOME = "{home}"' in result.output
@@ -650,7 +654,7 @@ def test_pi_launch_clears_screen_first(fake_vllm, monkeypatch):
         return SimpleNamespace(returncode = 0)
 
     monkeypatch.setattr(subprocess, "run", run)
-    result = CliRunner().invoke(start.start_app, ["pi"])
+    result = CliRunner().invoke(start.start_app, ["pi", "--url", BASE])
     assert result.exit_code == 0, result.output
     assert calls == ["clear", "exec"]
 
@@ -659,7 +663,7 @@ def test_pi_no_launch_does_not_clear(fake_vllm, monkeypatch):
     # The --no-launch recipe is meant to be read (and piped); never wipe it.
     calls = []
     monkeypatch.setattr(click, "clear", lambda: calls.append("clear"))
-    result = CliRunner().invoke(start.start_app, ["pi", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["pi", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     assert calls == []
 
@@ -679,7 +683,7 @@ def test_connect_pi_wsl_windows_shim_relocates_userprofile(fake_vllm, monkeypatc
         return SimpleNamespace(returncode = 0)
 
     monkeypatch.setattr(subprocess, "run", run)
-    result = CliRunner().invoke(start.start_app, ["pi"])
+    result = CliRunner().invoke(start.start_app, ["pi", "--url", BASE])
     assert result.exit_code == 0, result.output
     home = captured["env"]["HOME"]
     # A Windows pi shim resolves ~/.pi via USERPROFILE, so it must match the session
@@ -698,7 +702,7 @@ def test_connect_pi_mcp_writes_agent_mcp_json(fake_vllm, tmp_path, monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
     _mcp_registry()
     result = CliRunner().invoke(
-        start.start_app, ["pi", "--no-launch", "--mcp", "context7", "--mcp", "github"]
+        start.start_app, ["pi", "--url", BASE, "--no-launch", "--mcp", "context7", "--mcp", "github"]
     )
     assert result.exit_code == 0, result.output
     # Pi 1.1.0's built-in MCP reads <agentDir>/mcp.json; PI_CODING_AGENT_DIR is the session's.
@@ -722,7 +726,7 @@ def test_connect_pi_mcp_all_mounts_every_registry_server(fake_vllm, tmp_path, mo
     _pi_user_agent_dir(tmp_path, monkeypatch)
     monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
     _mcp_registry()
-    result = CliRunner().invoke(start.start_app, ["pi", "--no-launch", "--mcp-all"])
+    result = CliRunner().invoke(start.start_app, ["pi", "--url", BASE, "--no-launch", "--mcp-all"])
     assert result.exit_code == 0, result.output
     mcp_path = tmp_path / "agents" / "pi" / ".pi" / "agent" / "mcp.json"
     assert set(json.loads(mcp_path.read_text())["mcpServers"]) == {"context7", "github"}
@@ -731,7 +735,7 @@ def test_connect_pi_mcp_all_mounts_every_registry_server(fake_vllm, tmp_path, mo
 def test_connect_pi_mcp_url_mounts_without_a_registry(fake_vllm, tmp_path, monkeypatch):
     _pi_user_agent_dir(tmp_path, monkeypatch)
     result = CliRunner().invoke(
-        start.start_app, ["pi", "--no-launch", "--mcp-url", "ev=http://127.0.0.1:18331/mcp"]
+        start.start_app, ["pi", "--url", BASE, "--no-launch", "--mcp-url", "ev=http://127.0.0.1:18331/mcp"]
     )
     assert result.exit_code == 0, result.output
     mcp_path = tmp_path / "agents" / "pi" / ".pi" / "agent" / "mcp.json"
@@ -743,7 +747,7 @@ def test_connect_pi_mcp_stdio_mounts_without_a_registry(fake_vllm, tmp_path, mon
     _pi_user_agent_dir(tmp_path, monkeypatch)
     result = CliRunner().invoke(
         start.start_app,
-        ["pi", "--no-launch", "--mcp-stdio", "ev=npx -y @modelcontextprotocol/server-everything@2026.8.31"],
+        ["pi", "--url", BASE, "--no-launch", "--mcp-stdio", "ev=npx -y @modelcontextprotocol/server-everything@2026.8.31"],
     )
     assert result.exit_code == 0, result.output
     mcp_path = tmp_path / "agents" / "pi" / ".pi" / "agent" / "mcp.json"
@@ -763,7 +767,7 @@ def test_connect_pi_mcp_stdio_shell_form(fake_vllm, tmp_path, monkeypatch):
     _pi_user_agent_dir(tmp_path, monkeypatch)
     result = CliRunner().invoke(
         start.start_app,
-        ["pi", "--no-launch", "--mcp-stdio", 'ev="npx -y @modelcontextprotocol/server-everything@2026.8.31"'],
+        ["pi", "--url", BASE, "--no-launch", "--mcp-stdio", 'ev="npx -y @modelcontextprotocol/server-everything@2026.8.31"'],
     )
     assert result.exit_code == 0, result.output
     mcp_path = tmp_path / "agents" / "pi" / ".pi" / "agent" / "mcp.json"
@@ -779,7 +783,7 @@ def test_connect_pi_mcp_stdio_shell_form(fake_vllm, tmp_path, monkeypatch):
 
 def test_connect_pi_without_mcp_flags_writes_no_mcp_json(fake_vllm, tmp_path, monkeypatch):
     _pi_user_agent_dir(tmp_path, monkeypatch)
-    result = CliRunner().invoke(start.start_app, ["pi", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["pi", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     assert not (tmp_path / "agents" / "pi" / ".pi" / "agent" / "mcp.json").exists()
 
@@ -789,11 +793,11 @@ def test_pi_mcp_state_cleared_on_rerun_without_flags(fake_vllm, tmp_path, monkey
     _pi_user_agent_dir(tmp_path, monkeypatch)
     monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
     _mcp_registry()
-    result = CliRunner().invoke(start.start_app, ["pi", "--no-launch", "--mcp", "context7"])
+    result = CliRunner().invoke(start.start_app, ["pi", "--url", BASE, "--no-launch", "--mcp", "context7"])
     assert result.exit_code == 0, result.output
     mcp_path = tmp_path / "agents" / "pi" / ".pi" / "agent" / "mcp.json"
     assert mcp_path.exists()
-    result = CliRunner().invoke(start.start_app, ["pi", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["pi", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     assert not mcp_path.exists()
 
@@ -801,7 +805,58 @@ def test_pi_mcp_state_cleared_on_rerun_without_flags(fake_vllm, tmp_path, monkey
 def test_pi_mcp_with_as_subagent_fails(fake_vllm):
     _mcp_registry()
     result = CliRunner().invoke(
-        start.start_app, ["pi", "--as-subagent", "--no-launch", "--mcp", "context7"]
+        start.start_app, ["pi", "--url", BASE, "--as-subagent", "--no-launch", "--mcp", "context7"]
     )
     assert result.exit_code == 1
     assert "--mcp/--mcp-all/--mcp-url/--mcp-oauth-url/--mcp-header/--mcp-stdio/--mcp-env cannot be combined with --as-subagent" in result.output
+
+
+# ── Native launch (no --url/--provider) ──────────────────────────────
+
+
+def _native_no_connect_pi(monkeypatch):
+    set_start_attr(monkeypatch, "_connect",
+        lambda *args, **kwargs: pytest.fail("native launch must not connect"),
+    )
+
+
+def test_native_pi_bare_adds_nothing(fake_vllm, monkeypatch):
+    _native_no_connect_pi(monkeypatch)
+    result = CliRunner().invoke(start.start_app, ["pi", "--no-launch"])
+    assert result.exit_code == 0, result.output
+    assert _launch_command(result.output) == ["pi"]
+    assert "PI_CODING_AGENT_DIR" not in result.output
+    assert "export HOME=" not in result.output
+
+
+def test_native_pi_adds_mcp_config_without_moving_home(fake_vllm, tmp_path, monkeypatch):
+    _native_no_connect_pi(monkeypatch)
+    result = CliRunner().invoke(
+        start.start_app, ["pi", "--no-launch", "--mcp-stdio", "ev=npx everything"]
+    )
+    assert result.exit_code == 0, result.output
+    mcp_path = tmp_path / "agents" / "pi-native" / "mcp.json"
+    assert _launch_command(result.output) == ["pi", "--mcp-config", str(mcp_path)]
+    assert json.loads(mcp_path.read_text()) == {
+        "mcpServers": {"ev": {"command": "npx", "args": ["everything"], "env": {}}}
+    }
+    assert "PI_CODING_AGENT_DIR" not in result.output
+    assert "export HOME=" not in result.output
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        ["--model", "org/model"],
+        ["--max-tokens", "4096"],
+        ["--min-p", "0.1"],
+        ["--no-model-load"],
+        ["--as-subagent"],
+        ["--persist"],
+    ],
+)
+def test_native_pi_refuses_local_only_flags(fake_vllm, monkeypatch, flag):
+    _native_no_connect_pi(monkeypatch)
+    result = CliRunner().invoke(start.start_app, ["pi", "--no-launch", *flag])
+    assert result.exit_code == 1
+    assert "needs --url or --provider" in result.output

@@ -179,7 +179,6 @@ def test_claude_flags_probes_npm_install_dir_on_windows(monkeypatch, tmp_path):
     ]
 
 
-@pytest.mark.usefixtures("one_local_server")
 @pytest.mark.parametrize(
     "agent", ["claude", "codex", "opencode", "pi", "dsh"]
 )
@@ -201,13 +200,12 @@ def test_launch_preflights_agent_before_connect(agent, monkeypatch):
     set_start_attr(monkeypatch, "_require_agent_for_launch", require)
     set_start_attr(monkeypatch, "_connect", connect)
 
-    result = CliRunner().invoke(start.start_app, [agent])
+    result = CliRunner().invoke(start.start_app, [agent, "--provider", "vllm"])
 
     assert result.exit_code == 1
     assert events == ["agent", "connect"]
 
 
-@pytest.mark.usefixtures("one_local_server")
 @pytest.mark.parametrize(
     "agent", ["claude", "codex", "opencode", "pi"]
 )
@@ -222,13 +220,12 @@ def test_noninteractive_missing_agent_stops_before_connect(agent, monkeypatch):
         lambda *args, **kwargs: pytest.fail("missing agent must stop before connection"),
     )
 
-    result = CliRunner().invoke(start.start_app, [agent])
+    result = CliRunner().invoke(start.start_app, [agent, "--provider", "vllm"])
 
     assert result.exit_code == 1
     assert f"`{agent}` not found on PATH" in result.output
 
 
-@pytest.mark.usefixtures("one_local_server")
 @pytest.mark.parametrize("agent", ["claude", "codex", "pi", "dsh"])
 def test_no_launch_skips_agent_resolution(agent, monkeypatch):
     set_start_attr(monkeypatch, "_which_with_install_dirs",
@@ -243,14 +240,14 @@ def test_no_launch_skips_agent_resolution(agent, monkeypatch):
 
     set_start_attr(monkeypatch, "_connect", stop_at_connect)
 
-    result = CliRunner().invoke(start.start_app, [agent, "--no-launch"])
+    result = CliRunner().invoke(start.start_app, [agent, "--provider", "vllm", "--no-launch"])
 
     assert result.exit_code == 1
     assert isinstance(result.exception, RuntimeError)
 
 
 def test_connect_claude_no_launch(fake_vllm):
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["claude", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     for name in claude_agent._CLAUDE_ENV_UNSET:
         _assert_env_unset(result.output, name)
@@ -290,7 +287,7 @@ def test_connect_claude_session_settings_follow_forwarded_settings(fake_vllm):
     forwarded = json.dumps({"env": {"CLAUDE_CODE_USE_FOUNDRY": "1"}})
     result = CliRunner().invoke(
         start.start_app,
-        ["claude", "--no-launch", "--settings", forwarded],
+        ["claude", "--url", BASE, "--no-launch", "--settings", forwarded],
     )
     assert result.exit_code == 0, result.output
     command = _launch_command(result.output)
@@ -311,7 +308,7 @@ def test_connect_claude_session_settings_precede_subcommand(fake_vllm, settings_
     forwarded = json.dumps({"env": {"CLAUDE_CODE_USE_FOUNDRY": "1"}})
     result = CliRunner().invoke(
         start.start_app,
-        ["claude", "--no-launch", "mcp", "list", *settings_arg(forwarded)],
+        ["claude", "--url", BASE, "--no-launch", "mcp", "list", *settings_arg(forwarded)],
     )
     assert result.exit_code == 0, result.output
     command = _launch_command(result.output)
@@ -330,7 +327,7 @@ def test_connect_claude_session_settings_precede_forwarded_delimiter(fake_vllm):
     forwarded = json.dumps({"env": {"CLAUDE_CODE_USE_FOUNDRY": "1"}})
     result = CliRunner().invoke(
         start.start_app,
-        ["claude", "--no-launch", "--", "--settings", forwarded],
+        ["claude", "--url", BASE, "--no-launch", "--", "--settings", forwarded],
     )
     assert result.exit_code == 0, result.output
     command = _launch_command(result.output)
@@ -344,7 +341,7 @@ def test_connect_claude_as_subagent_preserves_cloud_parent(fake_vllm, tmp_path):
     result = CliRunner().invoke(
         start.start_app,
         [
-            "claude",
+            "claude", "--url", BASE,
             "--as-subagent",
             "--no-launch",
             "--model",
@@ -461,7 +458,7 @@ def test_connect_claude_launch_scrubs_conflicting_auth_env(fake_vllm, monkeypatc
         return SimpleNamespace(returncode = 0)
 
     monkeypatch.setattr(subprocess, "run", run)
-    result = CliRunner().invoke(start.start_app, ["claude"])
+    result = CliRunner().invoke(start.start_app, ["claude", "--url", BASE])
 
     assert result.exit_code == 0, result.output
     assert captured["command"] == ["/usr/local/bin/claude", "--model", MODEL["id"]]
@@ -501,7 +498,7 @@ def test_connect_claude_windows_shim_from_wsl_bridges_env(fake_vllm, monkeypatch
         return SimpleNamespace(returncode = 0)
 
     monkeypatch.setattr(subprocess, "run", run)
-    result = CliRunner().invoke(start.start_app, ["claude"])
+    result = CliRunner().invoke(start.start_app, ["claude", "--url", BASE])
 
     assert result.exit_code == 0, result.output
     assert captured["command"] == [
@@ -547,7 +544,7 @@ def test_connect_claude_no_launch_windows_shim_from_wsl_prints_wslenv(
     )
     set_start_attr(monkeypatch, "_wsl_windows_path", lambda _: windows_settings)
 
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["claude", "--url", BASE, "--no-launch"])
 
     assert result.exit_code == 0, result.output
     for name in claude_agent._CLAUDE_ENV_UNSET:
@@ -566,7 +563,7 @@ def test_connect_claude_no_launch_windows_shim_from_wsl_prints_wslenv(
 def test_no_launch_claude_last_line_blanks_conflicting_auth(fake_vllm):
     # The unset vars must be neutralized inline too, or a partial copy would send the
     # user's own ANTHROPIC_API_KEY to the local base.
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["claude", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     last = [ln for ln in result.output.splitlines() if ln.strip()][-1]
     for name in claude_agent._CLAUDE_ENV_UNSET:
@@ -577,9 +574,9 @@ def test_no_launch_claude_last_line_blanks_conflicting_auth(fake_vllm):
 def test_connect_explicit_key_remembered_for_keyless_runs(fake_vllm, tmp_path):
     CliRunner().invoke(
         start.start_app,
-        ["claude", "--no-launch", "--api-key", "sk-test-deadbeefdeadbeef"],
+        ["claude", "--url", BASE, "--no-launch", "--api-key", "sk-test-deadbeefdeadbeef"],
     )
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["claude", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     # Reused ahead of the key the server was given before.
     _assert_env_set(result.output, "ANTHROPIC_AUTH_TOKEN", "sk-test-deadbeefdeadbeef")
@@ -596,7 +593,7 @@ def test_launch_prints_the_ready_line_and_exits_with_the_agent(fake_vllm, monkey
         lambda command, env: SimpleNamespace(returncode = 0),
     )
 
-    result = CliRunner().invoke(start.start_app, ["claude"])
+    result = CliRunner().invoke(start.start_app, ["claude", "--url", BASE])
 
     assert result.exit_code == 0, result.output
     assert f"vLLM ready at {BASE} · model {MODEL['id']}\n" in result.output
@@ -612,7 +609,7 @@ def test_nonzero_agent_exit_notes_code(fake_vllm, monkeypatch):
         lambda command, env: SimpleNamespace(returncode = 3),
     )
 
-    result = CliRunner().invoke(start.start_app, ["claude"])
+    result = CliRunner().invoke(start.start_app, ["claude", "--url", BASE])
 
     assert result.exit_code == 3
     assert "The agent exited with code 3." in result.output
@@ -621,7 +618,7 @@ def test_nonzero_agent_exit_notes_code(fake_vllm, monkeypatch):
 def test_connect_explicit_api_key_wins_over_a_saved_one(fake_vllm):
     result = CliRunner().invoke(
         start.start_app,
-        ["claude", "--no-launch", "--api-key", "sk-test-deadbeefdeadbeef"],
+        ["claude", "--url", BASE, "--no-launch", "--api-key", "sk-test-deadbeefdeadbeef"],
     )
     assert result.exit_code == 0, result.output
     _assert_env_set(result.output, "ANTHROPIC_AUTH_TOKEN", "sk-test-deadbeefdeadbeef")
@@ -632,7 +629,7 @@ def test_claude_subagent_allowed_tools_precede_forwarded_delimiter(fake_vllm):
     # must be parsed as an option, so it rides before ctx.args.
     result = CliRunner().invoke(
         start.start_app,
-        ["claude", "--as-subagent", "--no-launch", "--", "--resume", "abc123"],
+        ["claude", "--url", BASE, "--as-subagent", "--no-launch", "--", "--resume", "abc123"],
     )
     assert result.exit_code == 0, result.output
     command = _launch_command(result.output)
@@ -644,7 +641,7 @@ def test_claude_subagent_forwards_positional_prompt(fake_vllm):
     # --allowedTools is variadic: a detached value would consume the prompt.
     result = CliRunner().invoke(
         start.start_app,
-        ["claude", "--as-subagent", "--no-launch", "fix the failing test"],
+        ["claude", "--url", BASE, "--as-subagent", "--no-launch", "fix the failing test"],
     )
     assert result.exit_code == 0, result.output
     command = _launch_command(result.output)
@@ -671,7 +668,7 @@ def test_claude_launch_does_not_clear(fake_vllm, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/claude")
     set_start_attr(monkeypatch, "_claude_flags", lambda *a, **k: [])
     monkeypatch.setattr(subprocess, "run", lambda command, env: SimpleNamespace(returncode = 0))
-    result = CliRunner().invoke(start.start_app, ["claude"])
+    result = CliRunner().invoke(start.start_app, ["claude", "--url", BASE])
     assert result.exit_code == 0, result.output
     assert calls == []
 
@@ -679,7 +676,7 @@ def test_claude_launch_does_not_clear(fake_vllm, monkeypatch):
 def test_persist_bare_claude_launch_has_no_resume_token(fake_vllm, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/claude")
     set_start_attr(monkeypatch, "_claude_flags", lambda *a, **k: [])
-    captured = _capture_launch(monkeypatch, ["claude", "--persist"])
+    captured = _capture_launch(monkeypatch, ["claude", "--url", BASE, "--persist"])
     assert "--continue" not in captured["command"]
     assert captured["command"][1:] == ["--model", MODEL["id"]]
 
@@ -690,7 +687,7 @@ def test_native_resume_flag_passes_through_unchanged(fake_vllm, monkeypatch):
     # through to the agent verbatim and is not swallowed as an agent-switch option.
     monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/claude")
     set_start_attr(monkeypatch, "_claude_flags", lambda *a, **k: [])
-    captured = _capture_launch(monkeypatch, ["claude", "--resume", "some-session-guid"])
+    captured = _capture_launch(monkeypatch, ["claude", "--url", BASE, "--resume", "some-session-guid"])
     resume = captured["command"].index("--resume")
     assert captured["command"][resume : resume + 2] == ["--resume", "some-session-guid"]
     assert captured["command"].index("--model") < resume
@@ -707,7 +704,7 @@ def test_connect_claude_mcp_writes_private_config_and_flags(fake_vllm, tmp_path,
     _mcp_registry()
     result = CliRunner().invoke(
         start.start_app,
-        ["claude", "--no-launch", "--mcp", "context7", "--mcp", "github", "hello"],
+        ["claude", "--url", BASE, "--no-launch", "--mcp", "context7", "--mcp", "github", "hello"],
     )
     assert result.exit_code == 0, result.output
     command = _launch_command(result.output)
@@ -738,7 +735,7 @@ def test_connect_claude_mcp_writes_private_config_and_flags(fake_vllm, tmp_path,
 def test_connect_claude_mcp_all_mounts_every_registry_server(fake_vllm, tmp_path, monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
     _mcp_registry()
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch", "--mcp-all"])
+    result = CliRunner().invoke(start.start_app, ["claude", "--url", BASE, "--no-launch", "--mcp-all"])
     assert result.exit_code == 0, result.output
     command = _launch_command(result.output)
     mcp_arg = next(arg for arg in command if arg.startswith("--mcp-config="))
@@ -748,7 +745,7 @@ def test_connect_claude_mcp_all_mounts_every_registry_server(fake_vllm, tmp_path
 
 def test_connect_claude_mcp_url_mounts_without_a_registry(fake_vllm, tmp_path):
     result = CliRunner().invoke(
-        start.start_app, ["claude", "--no-launch", "--mcp-url", "ev=http://127.0.0.1:18331/mcp"]
+        start.start_app, ["claude", "--url", BASE, "--no-launch", "--mcp-url", "ev=http://127.0.0.1:18331/mcp"]
     )
     assert result.exit_code == 0, result.output
     command = _launch_command(result.output)
@@ -760,7 +757,7 @@ def test_connect_claude_mcp_url_mounts_without_a_registry(fake_vllm, tmp_path):
 def test_connect_claude_mcp_stdio_mounts_without_a_registry(fake_vllm, tmp_path):
     result = CliRunner().invoke(
         start.start_app,
-        ["claude", "--no-launch", "--mcp-stdio", "ev=npx -y @modelcontextprotocol/server-everything@2026.8.31"],
+        ["claude", "--url", BASE, "--no-launch", "--mcp-stdio", "ev=npx -y @modelcontextprotocol/server-everything@2026.8.31"],
     )
     assert result.exit_code == 0, result.output
     command = _launch_command(result.output)
@@ -781,7 +778,7 @@ def test_connect_claude_mcp_stdio_shell_form(fake_vllm, tmp_path, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda name, path = None: "/bin/bash" if name == "bash" else None)
     result = CliRunner().invoke(
         start.start_app,
-        ["claude", "--no-launch", "--mcp-stdio", 'ev="npx -y @modelcontextprotocol/server-everything@2026.8.31"'],
+        ["claude", "--url", BASE, "--no-launch", "--mcp-stdio", 'ev="npx -y @modelcontextprotocol/server-everything@2026.8.31"'],
     )
     assert result.exit_code == 0, result.output
     command = _launch_command(result.output)
@@ -798,7 +795,7 @@ def test_connect_claude_mcp_stdio_shell_form(fake_vllm, tmp_path, monkeypatch):
 
 
 def test_connect_claude_without_mcp_flags_writes_no_mcp_config(fake_vllm, tmp_path):
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["claude", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     command = _launch_command(result.output)
     assert "--strict-mcp-config" not in command
@@ -810,10 +807,10 @@ def test_claude_mcp_flags_cleared_on_rerun_without_them(fake_vllm, tmp_path, mon
     # A --no-launch session dir is reused, so the next run must not keep the earlier mount's flags.
     monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
     _mcp_registry()
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch", "--mcp", "context7"])
+    result = CliRunner().invoke(start.start_app, ["claude", "--url", BASE, "--no-launch", "--mcp", "context7"])
     assert result.exit_code == 0, result.output
     assert "--mcp-config=" in result.output
-    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["claude", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     command = _launch_command(result.output)
     assert "--strict-mcp-config" not in command
@@ -825,7 +822,79 @@ def test_claude_mcp_flags_cleared_on_rerun_without_them(fake_vllm, tmp_path, mon
 def test_claude_mcp_with_as_subagent_fails(fake_vllm):
     _mcp_registry()
     result = CliRunner().invoke(
-        start.start_app, ["claude", "--as-subagent", "--no-launch", "--mcp", "context7"]
+        start.start_app, ["claude", "--url", BASE, "--as-subagent", "--no-launch", "--mcp", "context7"]
     )
     assert result.exit_code == 1
     assert "--mcp/--mcp-all/--mcp-url/--mcp-oauth-url/--mcp-header/--mcp-stdio/--mcp-env cannot be combined with --as-subagent" in result.output
+
+
+# ── Native launch (no --url/--provider) ──────────────────────────────
+
+
+def _native_no_connect(monkeypatch):
+    set_start_attr(monkeypatch, "_connect",
+        lambda *args, **kwargs: pytest.fail("native launch must not connect"),
+    )
+
+
+def test_native_claude_bare_adds_nothing(fake_vllm, monkeypatch):
+    _native_no_connect(monkeypatch)
+    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
+    assert result.exit_code == 0, result.output
+    assert "runs with its own model, login and config" in result.output
+    assert _launch_command(result.output) == ["claude"]
+    assert "ANTHROPIC" not in result.output
+
+
+def test_native_claude_adds_mcp_additively(fake_vllm, tmp_path, monkeypatch):
+    _native_no_connect(monkeypatch)
+    result = CliRunner().invoke(
+        start.start_app, ["claude", "--no-launch", "--mcp-stdio", "ev=npx everything"]
+    )
+    assert result.exit_code == 0, result.output
+    mcp_config = tmp_path / "agents" / "claude-native" / "mcp.json"
+    # The `=` form before the passthrough args: --mcp-config is variadic in claude.
+    assert _launch_command(result.output) == ["claude", f"--mcp-config={mcp_config}"]
+    assert json.loads(mcp_config.read_text()) == {
+        "mcpServers": {
+            "ev": {"type": "stdio", "command": "npx", "args": ["everything"], "env": {}}
+        }
+    }
+
+
+def test_native_claude_yolo_and_passthrough(fake_vllm, monkeypatch):
+    _native_no_connect(monkeypatch)
+    result = CliRunner().invoke(
+        start.start_app, ["claude", "--no-launch", "--yolo", "--print", "hi"]
+    )
+    assert result.exit_code == 0, result.output
+    assert _launch_command(result.output) == [
+        "claude", "--dangerously-skip-permissions", "--print", "hi"
+    ]
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        ["--model", "org/model"],
+        ["--context-length", "8192"],
+        ["--temperature", "0.5"],
+        ["--api-key", "sk-x"],
+        ["--header", "X-Foo=bar"],
+        ["--no-model-load"],
+        ["--as-subagent"],
+        ["--persist"],
+    ],
+)
+def test_native_claude_refuses_local_only_flags(fake_vllm, monkeypatch, flag):
+    _native_no_connect(monkeypatch)
+    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch", *flag])
+    assert result.exit_code == 1
+    assert "needs --url or --provider" in result.output
+
+
+def test_native_claude_refuses_a_positional_model(fake_vllm, monkeypatch):
+    _native_no_connect(monkeypatch)
+    result = CliRunner().invoke(start.start_app, ["claude", "--no-launch", "org/gemma-4-26B"])
+    assert result.exit_code == 1
+    assert "--model needs --url or --provider" in result.output

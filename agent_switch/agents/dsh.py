@@ -23,7 +23,16 @@ from agent_switch.core.install import (
     _resolve_or_install_agent,
     _which_with_install_dirs,
 )
-from agent_switch.core.launch import _connect, _resolve_target, _run
+from agent_switch.core.launch import (
+    _ALIAS_KIND_META,
+    _ALIAS_META,
+    _agent_command,
+    _check_alias,
+    _connect,
+    _resolve_target,
+    _run,
+    _run_native,
+)
 from agent_switch.core.mcp import load_mcp_servers
 from agent_switch.core.options import (
     LoadOptions,
@@ -61,6 +70,7 @@ from agent_switch.core.options import (
     _check_compact_at,
     _consume_positional_model,
     _fail,
+    _refuse_local_only,
     parse_headers,
 )
 from agent_switch.core.platform import (
@@ -432,6 +442,29 @@ def write_dsh_patch(
         typer.echo(f"Updated {path}")
 
 
+def _write_dsh_mcp_patch(path: Path, mcp_servers: dict) -> None:
+    """A native-mode patch carrying only the MCP insert row; the user's own profile stays put."""
+    import yaml
+
+    entries = [
+        {
+            "insert": [
+                {
+                    "id": f"mcp-{name}",
+                    "name": "@deepseek-ai/dsh-mcp-client",
+                    "config": _dsh_mcp_config(name, server),
+                }
+                for name, server in mcp_servers.items()
+            ]
+        }
+    ]
+    text = yaml.dump(entries, sort_keys = False)
+    if not path.exists() or path.read_text(encoding = "utf-8") != text:
+        # Private: a --header value may be a token.
+        _write_private_text(path, text)
+        typer.echo(f"Updated {path}")
+
+
 # Launcher handoff variables dsh-tui reads with ??, so an inherited one must be removed, not emptied.
 _DSH_TUI_ENV_UNSET = (
     "DSH_TUI_WORKSPACE_TARGET",
@@ -729,10 +762,108 @@ def dsh(
     """Point DeepSeek Harness (dsh) at a local model server and start it."""
     # One handler for dsh and the TUI: they share the server route and differ in launch and home.
     agent = ctx.info_name
-    is_tui = agent != "dsh"
+    alias = ctx.meta.get(_ALIAS_META)
+    # For an alias like dsh-tui-x, info_name is the alias itself; the group names the kind.
+    kind = ctx.meta.get(_ALIAS_KIND_META) or agent
+    is_tui = kind != "dsh"
+    raw_persist = persist
     # dsh-tui/dst keep their session home unless --no-persist; dsh stays throwaway unless --persist.
     persist = is_tui if persist is None else persist
     model, ctx.args[:] = _consume_positional_model(model, ctx.args)
+    if not url and not provider:
+        # Native launch: dsh keeps its real DSH_HOME, HOME and profile, so the guards that
+        # protect agent-switch's own routing (its --profile and patch placement) do not apply;
+        # only the MCP flags ride along, as a patch holding just the MCP insert row.
+        _refuse_local_only(
+            model = model,
+            max_seq_length = max_seq_length,
+            max_tokens = max_tokens,
+            reasoning = reasoning,
+            reasoning_effort = reasoning_effort,
+            temperature = temperature,
+            top_p = top_p,
+            top_k = top_k,
+            min_p = min_p,
+            repetition_penalty = repetition_penalty,
+            presence_penalty = presence_penalty,
+            compact_at = compact_at,
+            api_key = api_key,
+            header = header,
+            model_load = model_load,
+            persist = raw_persist,
+            persist_default = None,
+        )
+        install_hint = _npm_install_hint(_DSH_TUI_PACKAGE if is_tui else _DSH_PACKAGE)
+        if is_tui and launch and not _get_has_terminal():
+            _fail(
+                f"{agent} is a full-screen terminal app and needs an interactive terminal; "
+                "use --no-launch to print the command instead."
+            )
+        if not is_tui:
+            _reject_as_subagent("dsh", ctx.args)
+        if alias:
+            # The alias replaces the launcher, so the kind's own executable is not required.
+            _check_alias(alias)
+            launcher = None
+        elif is_tui:
+            launcher = (
+                _resolve_dsh_tui(install_hint)
+                if launch
+                # A recipe may run elsewhere, so name the launcher without requiring or probing it.
+                else next(
+                    (name for name in _DSH_TUI_COMMANDS if _which_with_install_dirs(name)),
+                    _DSH_TUI_AGENT,
+                )
+            )
+        else:
+            _require_agent_for_launch("dsh", install_hint, launch)
+        mcp_servers = load_mcp_servers(
+            mcp,
+            should_mount_all = mcp_all,
+            urls = mcp_url,
+            oauth_urls = mcp_oauth_url,
+            headers = mcp_header,
+            stdios = mcp_stdio,
+            envs = mcp_env,
+        )
+        with _session_config(f"{_DSH_TUI_AGENT if is_tui else 'dsh'}-native", launch) as home:
+            patch = home / _DSH_PATCH_FILE
+            patch_arg = None
+            if mcp_servers:
+                _write_dsh_mcp_patch(patch, mcp_servers)
+                probe = (launcher or _DSH_TUI_AGENT) if is_tui else "dsh"
+                patch_arg = _agent_config_path(patch, [probe])
+            else:
+                # Stable --no-launch dir: drop an earlier mount so a bare rerun passes no patch.
+                patch.unlink(missing_ok = True)
+            if is_tui:
+                # The launcher forwards only its leading options to dsh, so ours goes first.
+                command = _agent_command(
+                    alias,
+                    launcher,
+                    (["--patch", patch_arg] if patch_arg else []) + list(ctx.args),
+                )
+            else:
+                command = _dsh_command(ctx.args, patch_arg)
+                if alias:
+                    command = _agent_command(alias, "dsh", command[1:])
+            # Only --yolo touches the user's dsh, through its own permission-mode variable.
+            env = {"DSH_PERMISSION_MODE": _DSH_YOLO_PERMISSION_MODE} if yolo else {}
+            _run_native(
+                agent,
+                env,
+                command,
+                launch = launch,
+                install_hint = install_hint,
+            )
+        return
+    if alias:
+        # The alias sets its own DSH_HOME (and the TUI launcher its own HOME), which outrank
+        # the session env, so the session patch would be silently ignored.
+        _fail(
+            f"{kind} aliases run natively only: the alias sets its own DSH_HOME and HOME, so "
+            f"--url cannot route it; drop --url/--provider or use `agent-switch {kind}`."
+        )
     if is_tui:
         launcher, harness = _check_dsh_tui_start(
             agent, ctx.args, compact_at, yolo, launch, persist
