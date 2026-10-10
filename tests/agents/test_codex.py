@@ -757,6 +757,43 @@ def test_connect_codex_mcp_all_mounts_every_registry_server(fake_vllm, tmp_path,
     assert set(config["mcp_servers"]) == {"context7", "github"}
 
 
+def test_connect_codex_mcp_url_mounts_without_a_registry(fake_vllm, tmp_path):
+    result = CliRunner().invoke(
+        start.start_app, ["codex", "--no-launch", "--mcp-url", "ev=http://127.0.0.1:18331/mcp"]
+    )
+    assert result.exit_code == 0, result.output
+    config = _parse_toml((tmp_path / "agents" / "codex" / "config.toml").read_text())
+    assert config["mcp_servers"]["ev"] == {"url": "http://127.0.0.1:18331/mcp"}
+
+
+def test_connect_codex_mcp_stdio_mounts_without_a_registry(fake_vllm, tmp_path):
+    result = CliRunner().invoke(
+        start.start_app,
+        ["codex", "--no-launch", "--mcp-stdio", "ev=npx -y @modelcontextprotocol/server-everything@2026.8.31"],
+    )
+    assert result.exit_code == 0, result.output
+    config = _parse_toml((tmp_path / "agents" / "codex" / "config.toml").read_text())
+    assert config["mcp_servers"]["ev"] == {
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-everything@2026.8.31"],
+    }
+
+
+def test_connect_codex_mcp_stdio_shell_form(fake_vllm, tmp_path, monkeypatch):
+    # fake_vllm stubs shutil.which to None; the shell form needs bash found.
+    monkeypatch.setattr(shutil, "which", lambda name, path = None: "/bin/bash" if name == "bash" else None)
+    result = CliRunner().invoke(
+        start.start_app,
+        ["codex", "--no-launch", "--mcp-stdio", 'ev="npx -y @modelcontextprotocol/server-everything@2026.8.31"'],
+    )
+    assert result.exit_code == 0, result.output
+    config = _parse_toml((tmp_path / "agents" / "codex" / "config.toml").read_text())
+    assert config["mcp_servers"]["ev"] == {
+        "command": "bash",
+        "args": ["-ic", "exec npx -y @modelcontextprotocol/server-everything@2026.8.31"],
+    }
+
+
 def test_connect_codex_without_mcp_flags_has_no_mcp_servers(fake_vllm, tmp_path):
     result = CliRunner().invoke(start.start_app, ["codex", "--no-launch"])
     assert result.exit_code == 0, result.output
@@ -785,4 +822,4 @@ def test_codex_mcp_with_as_subagent_fails(fake_vllm):
         start.start_app, ["codex", "--as-subagent", "--no-launch", "--mcp", "context7"]
     )
     assert result.exit_code == 1
-    assert "--mcp/--mcp-all cannot be combined with --as-subagent" in result.output
+    assert "--mcp/--mcp-all/--mcp-url/--mcp-oauth-url/--mcp-header/--mcp-stdio/--mcp-env cannot be combined with --as-subagent" in result.output

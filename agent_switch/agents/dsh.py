@@ -36,7 +36,12 @@ from agent_switch.core.options import (
     _LAUNCH_OPTION,
     _MAX_TOKENS_OPTION,
     _MCP_ALL_OPTION,
+    _MCP_ENV_OPTION,
+    _MCP_HEADER_OPTION,
+    _MCP_OAUTH_URL_OPTION,
     _MCP_OPTION,
+    _MCP_STDIO_OPTION,
+    _MCP_URL_OPTION,
     _MIN_P_OPTION,
     _MODEL_LOAD_OPTION,
     _MODEL_OPTION,
@@ -715,6 +720,11 @@ def dsh(
     persist: Optional[bool] = _DSH_PERSIST_OPTION,
     mcp: Optional[list[str]] = _MCP_OPTION,
     mcp_all: bool = _MCP_ALL_OPTION,
+    mcp_url: Optional[list[str]] = _MCP_URL_OPTION,
+    mcp_oauth_url: Optional[list[str]] = _MCP_OAUTH_URL_OPTION,
+    mcp_header: Optional[list[str]] = _MCP_HEADER_OPTION,
+    mcp_stdio: Optional[list[str]] = _MCP_STDIO_OPTION,
+    mcp_env: Optional[list[str]] = _MCP_ENV_OPTION,
 ):
     """Point DeepSeek Harness (dsh) at a local model server and start it."""
     # One handler for dsh and the TUI: they share the server route and differ in launch and home.
@@ -731,7 +741,15 @@ def dsh(
         _reject_as_subagent("dsh", ctx.args)
     # Validate the MCP selection before _connect, so a registry error fails fast.
     # --as-subagent is refused for dsh above, so an MCP flag there fails with it already.
-    mcp_servers = load_mcp_servers(mcp, should_mount_all = mcp_all)
+    mcp_servers = load_mcp_servers(
+        mcp,
+        should_mount_all = mcp_all,
+        urls = mcp_url,
+        oauth_urls = mcp_oauth_url,
+        headers = mcp_header,
+        stdios = mcp_stdio,
+        envs = mcp_env,
+    )
     headers = parse_headers(header)
     target = _resolve_target(url, provider, api_key, headers)
     install_hint = _npm_install_hint(_DSH_TUI_PACKAGE if is_tui else _DSH_PACKAGE)

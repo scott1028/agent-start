@@ -171,6 +171,37 @@ agent-switch claude --mcp context7 --mcp github   # just these two, this session
 agent-switch codex --mcp-all                      # every server in the registry
 ```
 
+An http server another app already runs needs no registry entry: `--mcp-url [NAME=]URL` (repeat
+the flag), `--mcp-oauth-url` for one that signs in with oauth, and `--mcp-header
+[NAME:]HEADER=VALUE` for its headers. The name defaults to the URL's host and port
+(`http://127.0.0.1:8931/mcp` becomes `127-0-0-1-8931`). A command-line server mounts the same way:
+`--mcp-stdio [NAME=]COMMAND` splits the command like a shell would (so single-quote it), does not
+expand `~` (write `${HOME}`), and names itself from the command's last plain word
+(`uv run --directory /opt/blender-mcp blender-mcp` becomes `blender-mcp`); if the auto name is
+wrong, give `NAME=`. Double-quote the whole command to write it like in a terminal:
+`--mcp-stdio 'blender="uv run --directory ~/workspace/blender-mcp blender-mcp"'` runs it as
+`bash -ic 'exec uv run ...'`, so bash expands `~` and `${VAR}` itself (needs `bash` on PATH, and
+one command only: `;`, `&&`, `||`, `|` and `&` outside quotes are rejected — put multiple steps in
+a script). Pi and the dsh-tui/dst TUI move `HOME` to the session dir, so there `~` points at that
+dir — use an absolute path with them. `--mcp-env [NAME:]KEY=VALUE` sets its environment; put
+secrets in `--mcp-env`, not args: args are always visible in the server's process arguments. The
+`NAME:` of `--mcp-header`/`--mcp-env` may be omitted only when exactly one shortcut of that
+transport is given, and shortcuts combine with `--mcp`/`--mcp-all`. Single-quote the header and
+env values so agent-switch, not your shell, expands `${VAR}`; a literal `Authorization` value sits
+in the process list for the whole session, because agent-switch stays running until the agent
+exits, so prefer `'${VAR}'`.
+
+```sh
+agent-switch claude --mcp-url http://127.0.0.1:8931/mcp                    # name 127-0-0-1-8931
+agent-switch claude --mcp-url tools=http://127.0.0.1:8931/mcp
+agent-switch codex  --mcp-url api=http://127.0.0.1:9000/mcp --mcp-header 'api:Authorization=Bearer ${API_TOKEN}'
+agent-switch pi     --mcp-oauth-url https://mcp.example.com/mcp
+agent-switch opencode --mcp-all --mcp-url tools=http://127.0.0.1:8931/mcp
+agent-switch claude --mcp-stdio 'uv run --directory /opt/blender-mcp blender-mcp'  # name blender-mcp
+agent-switch claude --mcp-stdio 'blender="uv run --directory ~/workspace/blender-mcp blender-mcp"'  # through bash
+agent-switch codex  --mcp-stdio 'ctx7=npx -y @upstash/context7-mcp' --mcp-env 'ctx7:API_KEY=${CTX7_KEY}'
+```
+
 The mounted servers replace the agent's own MCP servers for the session: Claude Code gets
 `--strict-mcp-config --mcp-config=<session file>`, and Codex, OpenCode, Pi and dsh take them through
 their isolated session config (OpenCode additionally copies your global config's unmounted servers
@@ -179,7 +210,8 @@ project `opencode.json` outranks the session overlay, for example. An `oauth: tr
 mounted through the pinned `mcp-remote` (needs `npx`): it signs in with a browser on first use, keeps
 the tokens under `~/.agent-switch/mcp-auth/mcp-remote-v1/<url-hash>_tokens.json` (delete that file to
 sign in again), and takes its `headers` from a private `~/.agent-switch/mcp-auth/<name>.headers` file
-rather than the command line. `--mcp`/`--mcp-all` are not combined with `--as-subagent`. Each stdio
+rather than the command line. No MCP flag (`--mcp`, `--mcp-all`, `--mcp-url`, `--mcp-oauth-url`,
+`--mcp-header`, `--mcp-stdio`, `--mcp-env`) is combined with `--as-subagent`. Each stdio
 server starts once per session, when the agent spawns it, and stops when the session ends.
 
 ## Develop

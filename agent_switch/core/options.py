@@ -298,6 +298,63 @@ _MCP_ALL_OPTION = typer.Option(
 )
 
 
+_MCP_URL_OPTION = typer.Option(
+    None,
+    "--mcp-url",
+    metavar = "[NAME=]URL",
+    rich_help_panel = _PANEL_SESSION,
+    help = "Mount the http MCP server at URL for this session only, without a registry entry; "
+    "repeat the flag for more. The name defaults to the URL's host and port.",
+)
+
+
+_MCP_OAUTH_URL_OPTION = typer.Option(
+    None,
+    "--mcp-oauth-url",
+    metavar = "[NAME=]URL",
+    rich_help_panel = _PANEL_SESSION,
+    help = "Mount the http MCP server at URL that signs in with oauth (through mcp-remote).",
+)
+
+
+_MCP_HEADER_OPTION = typer.Option(
+    None,
+    "--mcp-header",
+    metavar = "[NAME:]HEADER=VALUE",
+    rich_help_panel = _PANEL_SESSION,
+    help = "Add the HTTP header HEADER=VALUE to the --mcp-url/--mcp-oauth-url server named NAME "
+    "(its NAME= there, or the URL's host and port); NAME: may be omitted only with a single such "
+    "server, and registry or stdio servers never take it. Single-quote the value so ${VAR} is "
+    "expanded by agent-switch, not your shell. Repeat the flag for more headers.",
+)
+
+
+_MCP_STDIO_OPTION = typer.Option(
+    None,
+    "--mcp-stdio",
+    metavar = "[NAME=]COMMAND",
+    rich_help_panel = _PANEL_SESSION,
+    help = "Mount the stdio MCP server this command starts for this session only, without a "
+    "registry entry; repeat the flag for more. Give NAME= when the auto name (the command's "
+    "last plain word) is wrong. Double-quote the whole command to run it through bash -ic "
+    "(needs bash, one command only): bash expands ~ and ${VAR} itself. Unquoted, the command "
+    "runs directly, so write ${HOME} rather than ~.",
+)
+
+
+_MCP_ENV_OPTION = typer.Option(
+    None,
+    "--mcp-env",
+    metavar = "[NAME:]KEY=VALUE",
+    rich_help_panel = _PANEL_SESSION,
+    help = "Set the environment variable KEY=VALUE on the --mcp-stdio server named NAME (its "
+    "NAME= there, or the command's last plain word); NAME: may be omitted only with a single "
+    "--mcp-stdio server, and registry or http servers never take it. Single-quote the value so "
+    "${VAR} is expanded by agent-switch, not your shell. Repeat the flag for more; for the same "
+    "KEY the later VALUE wins.",
+)
+
+
 _COMPACT_AT_OPTION = typer.Option(
     None,
     "--compact-at",

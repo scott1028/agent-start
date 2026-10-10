@@ -1161,6 +1161,55 @@ def test_connect_opencode_mcp_all_mounts_every_registry_server(fake_vllm, tmp_pa
     }
 
 
+def test_connect_opencode_mcp_url_mounts_without_a_registry(fake_vllm, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-empty"))
+    result = CliRunner().invoke(
+        start.start_app, ["opencode", "--no-launch", "--mcp-url", "ev=http://127.0.0.1:18331/mcp"]
+    )
+    assert result.exit_code == 0, result.output
+    config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
+    assert config["mcp"]["ev"] == {
+        "type": "remote",
+        "url": "http://127.0.0.1:18331/mcp",
+        "headers": {},
+        "enabled": True,
+    }
+
+
+def test_connect_opencode_mcp_stdio_mounts_without_a_registry(fake_vllm, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-empty"))
+    result = CliRunner().invoke(
+        start.start_app,
+        ["opencode", "--no-launch", "--mcp-stdio", "ev=npx -y @modelcontextprotocol/server-everything@2026.8.31"],
+    )
+    assert result.exit_code == 0, result.output
+    config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
+    assert config["mcp"]["ev"] == {
+        "type": "local",
+        "command": ["npx", "-y", "@modelcontextprotocol/server-everything@2026.8.31"],
+        "environment": {},
+        "enabled": True,
+    }
+
+
+def test_connect_opencode_mcp_stdio_shell_form(fake_vllm, tmp_path, monkeypatch):
+    # fake_vllm stubs shutil.which to None; the shell form needs bash found.
+    monkeypatch.setattr(shutil, "which", lambda name, path = None: "/bin/bash" if name == "bash" else None)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-empty"))
+    result = CliRunner().invoke(
+        start.start_app,
+        ["opencode", "--no-launch", "--mcp-stdio", 'ev="npx -y @modelcontextprotocol/server-everything@2026.8.31"'],
+    )
+    assert result.exit_code == 0, result.output
+    config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
+    assert config["mcp"]["ev"] == {
+        "type": "local",
+        "command": ["bash", "-ic", "exec npx -y @modelcontextprotocol/server-everything@2026.8.31"],
+        "environment": {},
+        "enabled": True,
+    }
+
+
 def test_connect_opencode_without_mcp_flags_has_no_mcp_key(fake_vllm, tmp_path, monkeypatch):
     _opencode_user_global_mcp(tmp_path, monkeypatch)
     result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
@@ -1264,4 +1313,4 @@ def test_opencode_mcp_with_as_subagent_fails(fake_vllm):
         start.start_app, ["opencode", "--as-subagent", "--no-launch", "--mcp", "context7"]
     )
     assert result.exit_code == 1
-    assert "--mcp/--mcp-all cannot be combined with --as-subagent" in result.output
+    assert "--mcp/--mcp-all/--mcp-url/--mcp-oauth-url/--mcp-header/--mcp-stdio/--mcp-env cannot be combined with --as-subagent" in result.output

@@ -34,7 +34,12 @@ from agent_switch.core.options import (
     _KEY_OPTION,
     _LAUNCH_OPTION,
     _MCP_ALL_OPTION,
+    _MCP_ENV_OPTION,
+    _MCP_HEADER_OPTION,
+    _MCP_OAUTH_URL_OPTION,
     _MCP_OPTION,
+    _MCP_STDIO_OPTION,
+    _MCP_URL_OPTION,
     _MIN_P_OPTION,
     _MODEL_LOAD_OPTION,
     _MODEL_OPTION,
@@ -52,7 +57,6 @@ from agent_switch.core.options import (
     _YOLO_OPTION,
     _check_compact_at,
     _consume_positional_model,
-    _fail,
     _yolo_command_flags,
     parse_headers,
 )
@@ -427,15 +431,27 @@ def claude(
     as_subagent: bool = _AS_SUBAGENT_OPTION,
     mcp: Optional[list[str]] = _MCP_OPTION,
     mcp_all: bool = _MCP_ALL_OPTION,
+    mcp_url: Optional[list[str]] = _MCP_URL_OPTION,
+    mcp_oauth_url: Optional[list[str]] = _MCP_OAUTH_URL_OPTION,
+    mcp_header: Optional[list[str]] = _MCP_HEADER_OPTION,
+    mcp_stdio: Optional[list[str]] = _MCP_STDIO_OPTION,
+    mcp_env: Optional[list[str]] = _MCP_ENV_OPTION,
 ):
     """Point Claude Code at a local model server and start it."""
     # Route a leading `org/name` positional to --model; forward the rest to the agent.
     model, ctx.args[:] = _consume_positional_model(model, ctx.args)
     headers = parse_headers(header)
-    if as_subagent and (mcp or mcp_all):
-        _fail("--mcp/--mcp-all cannot be combined with --as-subagent.")
     # Validate the MCP selection before _connect, so a registry error fails fast.
-    mcp_servers = load_mcp_servers(mcp, should_mount_all = mcp_all)
+    mcp_servers = load_mcp_servers(
+        mcp,
+        should_mount_all = mcp_all,
+        urls = mcp_url,
+        oauth_urls = mcp_oauth_url,
+        headers = mcp_header,
+        stdios = mcp_stdio,
+        envs = mcp_env,
+        as_subagent = as_subagent,
+    )
     target = _resolve_target(url, provider, api_key, headers)
     install_hint = (
         "irm https://claude.ai/install.ps1 | iex"

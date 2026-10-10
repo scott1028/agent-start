@@ -728,6 +728,55 @@ def test_connect_pi_mcp_all_mounts_every_registry_server(fake_vllm, tmp_path, mo
     assert set(json.loads(mcp_path.read_text())["mcpServers"]) == {"context7", "github"}
 
 
+def test_connect_pi_mcp_url_mounts_without_a_registry(fake_vllm, tmp_path, monkeypatch):
+    _pi_user_agent_dir(tmp_path, monkeypatch)
+    result = CliRunner().invoke(
+        start.start_app, ["pi", "--no-launch", "--mcp-url", "ev=http://127.0.0.1:18331/mcp"]
+    )
+    assert result.exit_code == 0, result.output
+    mcp_path = tmp_path / "agents" / "pi" / ".pi" / "agent" / "mcp.json"
+    servers = json.loads(mcp_path.read_text())["mcpServers"]
+    assert servers == {"ev": {"url": "http://127.0.0.1:18331/mcp", "headers": {}}}
+
+
+def test_connect_pi_mcp_stdio_mounts_without_a_registry(fake_vllm, tmp_path, monkeypatch):
+    _pi_user_agent_dir(tmp_path, monkeypatch)
+    result = CliRunner().invoke(
+        start.start_app,
+        ["pi", "--no-launch", "--mcp-stdio", "ev=npx -y @modelcontextprotocol/server-everything@2026.8.31"],
+    )
+    assert result.exit_code == 0, result.output
+    mcp_path = tmp_path / "agents" / "pi" / ".pi" / "agent" / "mcp.json"
+    servers = json.loads(mcp_path.read_text())["mcpServers"]
+    assert servers == {
+        "ev": {
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-everything@2026.8.31"],
+            "env": {},
+        }
+    }
+
+
+def test_connect_pi_mcp_stdio_shell_form(fake_vllm, tmp_path, monkeypatch):
+    # fake_vllm stubs shutil.which to None; the shell form needs bash found.
+    monkeypatch.setattr(shutil, "which", lambda name, path = None: "/bin/bash" if name == "bash" else None)
+    _pi_user_agent_dir(tmp_path, monkeypatch)
+    result = CliRunner().invoke(
+        start.start_app,
+        ["pi", "--no-launch", "--mcp-stdio", 'ev="npx -y @modelcontextprotocol/server-everything@2026.8.31"'],
+    )
+    assert result.exit_code == 0, result.output
+    mcp_path = tmp_path / "agents" / "pi" / ".pi" / "agent" / "mcp.json"
+    servers = json.loads(mcp_path.read_text())["mcpServers"]
+    assert servers == {
+        "ev": {
+            "command": "bash",
+            "args": ["-ic", "exec npx -y @modelcontextprotocol/server-everything@2026.8.31"],
+            "env": {},
+        }
+    }
+
+
 def test_connect_pi_without_mcp_flags_writes_no_mcp_json(fake_vllm, tmp_path, monkeypatch):
     _pi_user_agent_dir(tmp_path, monkeypatch)
     result = CliRunner().invoke(start.start_app, ["pi", "--no-launch"])
@@ -755,4 +804,4 @@ def test_pi_mcp_with_as_subagent_fails(fake_vllm):
         start.start_app, ["pi", "--as-subagent", "--no-launch", "--mcp", "context7"]
     )
     assert result.exit_code == 1
-    assert "--mcp/--mcp-all cannot be combined with --as-subagent" in result.output
+    assert "--mcp/--mcp-all/--mcp-url/--mcp-oauth-url/--mcp-header/--mcp-stdio/--mcp-env cannot be combined with --as-subagent" in result.output

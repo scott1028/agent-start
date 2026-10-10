@@ -28,8 +28,23 @@ _MCP_EPILOG = (
     "Mount them per session with --mcp NAME (repeatable) or --mcp-all; the mounted servers replace "
     "the agent's own MCP servers. An http server takes url, headers and oauth; ${VAR} in args, env, "
     "url and header values is expanded from your environment at launch.\n\n"
+    "An http server another app already runs needs no registry entry: --mcp-url [NAME=]URL, "
+    "--mcp-oauth-url for one that signs in with oauth, and --mcp-header [NAME:]HEADER=VALUE for its "
+    "headers; NAME defaults to the URL's host and port. A command-line server takes --mcp-stdio "
+    "[NAME=]COMMAND and --mcp-env [NAME:]KEY=VALUE; NAME defaults to the command's last plain "
+    "word. Double-quote COMMAND to run it through bash -ic, which expands ~ and ${VAR} (needs "
+    "bash, one command only); unquoted it runs directly, so write ${HOME} not ~.\n\n"
+    "Naming, for --mcp-env 'blender:BLENDER_MCP_PORT=9876':\n"
+    '  blender           the --mcp-stdio server it applies to (omit "blender:" with only one --mcp-stdio)\n'
+    "  BLENDER_MCP_PORT  the environment variable that server sees\n"
+    "  9876              its value; '${VAR}' is expanded by agent-switch at launch\n"
+    "--mcp-header works the same way for --mcp-url/--mcp-oauth-url servers.\n\n"
     "Examples: agent-switch claude --mcp context7\n"
-    "agent-switch codex --mcp-all"
+    "agent-switch codex --mcp-all\n"
+    "agent-switch claude --mcp-url tools=http://127.0.0.1:8931/mcp\n"
+    "agent-switch codex --mcp-url api=http://127.0.0.1:9000/mcp --mcp-header 'api:Authorization=Bearer ${API_TOKEN}'\n"
+    "agent-switch claude --mcp-stdio 'blender=\"uv run --directory ~/workspace/blender-mcp blender-mcp\"' \\\n"
+    "  --mcp-env 'blender:BLENDER_MCP_PORT=9876'"
 )
 
 # Registration order is the --help order; the old dsh decorators applied bottom-up (dsh, dsh-tui, dst).

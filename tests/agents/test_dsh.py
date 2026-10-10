@@ -574,6 +574,54 @@ def test_connect_dsh_mcp_all_mounts_every_registry_server(fake_vllm, tmp_path, m
     assert set(rows) == {"mcp-context7", "mcp-github"}
 
 
+def test_connect_dsh_mcp_url_mounts_without_a_registry(fake_vllm, tmp_path):
+    result = CliRunner().invoke(
+        start.start_app, ["dsh", "--no-launch", "--mcp-url", "ev=http://127.0.0.1:18331/mcp"]
+    )
+    assert result.exit_code == 0, result.output
+    rows = _dsh_mcp_rows(tmp_path / "agents" / "dsh" / dsh_agent._DSH_PATCH_FILE)
+    assert rows["mcp-ev"]["config"] == {
+        "transport": "streamable-http",
+        "serverName": "ev",
+        "url": "http://127.0.0.1:18331/mcp",
+        "headers": {},
+    }
+
+
+def test_connect_dsh_mcp_stdio_mounts_without_a_registry(fake_vllm, tmp_path):
+    result = CliRunner().invoke(
+        start.start_app,
+        ["dsh", "--no-launch", "--mcp-stdio", "ev=npx -y @modelcontextprotocol/server-everything@2026.8.31"],
+    )
+    assert result.exit_code == 0, result.output
+    rows = _dsh_mcp_rows(tmp_path / "agents" / "dsh" / dsh_agent._DSH_PATCH_FILE)
+    assert rows["mcp-ev"]["config"] == {
+        "transport": "stdio",
+        "serverName": "ev",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-everything@2026.8.31"],
+        "env": {},
+    }
+
+
+def test_connect_dsh_mcp_stdio_shell_form(fake_vllm, tmp_path, monkeypatch):
+    # fake_vllm stubs shutil.which to None; the shell form needs bash found.
+    monkeypatch.setattr(shutil, "which", lambda name, path = None: "/bin/bash" if name == "bash" else None)
+    result = CliRunner().invoke(
+        start.start_app,
+        ["dsh", "--no-launch", "--mcp-stdio", 'ev="npx -y @modelcontextprotocol/server-everything@2026.8.31"'],
+    )
+    assert result.exit_code == 0, result.output
+    rows = _dsh_mcp_rows(tmp_path / "agents" / "dsh" / dsh_agent._DSH_PATCH_FILE)
+    assert rows["mcp-ev"]["config"] == {
+        "transport": "stdio",
+        "serverName": "ev",
+        "command": "bash",
+        "args": ["-ic", "exec npx -y @modelcontextprotocol/server-everything@2026.8.31"],
+        "env": {},
+    }
+
+
 def test_connect_dsh_without_mcp_flags_has_no_insert_row(fake_vllm, tmp_path):
     result = CliRunner().invoke(start.start_app, ["dsh", "--no-launch"])
     assert result.exit_code == 0, result.output
